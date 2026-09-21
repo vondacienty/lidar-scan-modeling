@@ -18,8 +18,6 @@ python -m pip install -e .
 python -m pytest
 ```
 
-基线尚无测试用例，收集到 0 个用例属预期结果。
-
 ## 命令行入口
 
 安装后提供 `lidar-scan-modeling` 命令：
@@ -34,6 +32,7 @@ lidar-scan-modeling --help     # 打印用法
 - 命令行程序 `lidar-scan-modeling`
 - Python 包 `lidar_scan`，其 `__version__` 为当前版本号
 - `lidar_scan.voxel.fuse_voxels(points, voxel_size=1.0)`：按体素融合激光雷达点
+- `lidar_scan.las.iter_las(path)`：分块流式读取 LAS/LAZ 激光雷达文件
 
 ### `fuse_voxels`
 
@@ -52,7 +51,29 @@ fuse_voxels([(0.0, 0.0, 0.0, 0.0, 1.0),
 # ((0, 0, 0, 0.4, 0.4, 0.4, 8.0, 0.447214, 2),)
 ```
 
+### `iter_las`
+
+- `path` 只接受 `str`，且后缀大小写不敏感地必须是 `.las` 或 `.laz`
+- 返回一次性迭代器，按文件记录顺序产出 tuple 块；除末块外每块恰含 65536 点，末块为剩余点；空文件不产出任何块
+- 分块增量读取，不会整文件载入；正常耗尽、异常或迭代器被回收都会关闭文件句柄，再次迭代不会重开文件
+- 每点为五项 tuple `(x, y, z, intensity, sigma)`：
+  - `x/y/z = 原始整数 X/Y/Z × 各轴 scale + offset`
+  - `intensity` 取标准 LAS 字段并转 int
+  - 存在名为 `sigma` 的标量数值额外维度时取其（含额外字节 scale/offset 的）解码值，否则固定为 `1.0`
+- 坐标计算使用 `Decimal(str(v))`、精度 50、ROUND_HALF_EVEN；`x/y/z/sigma` 量化到六位小数后转 float，负零归一为正零
+- 参数错误在调用时抛出：`path` 非 `str` 抛 `TypeError`，后缀不支持抛 `ValueError`；文件无法打开统一抛 `OSError`，LAZ 解码器（lazrs）不可用抛 `RuntimeError`
+- 文件头或点记录不可解析、必需标准字段缺失、scale/offset 非有限、sigma 非有限或非正均抛 `ValueError`
+
+```python
+from lidar_scan import iter_las
+
+for block in iter_las("scan.laz"):
+    # 每个 block 是 65536 个 (x, y, z, intensity, sigma) tuple（末块除外）
+    for x, y, z, intensity, sigma in block:
+        ...
+```
+
 ## 限制
 
-- 除版本查询与体素融合外没有其他功能。
+- 除版本查询、LAS/LAZ 分块读取与体素融合外没有其他功能。
 - 其他输入输出格式、数据来源与算法均尚未定义。
