@@ -2,7 +2,8 @@
 
 __version__ = "0.1.0"
 
-from . import voxel
+from . import las, voxel
+from .las import iter_las
 from .voxel import fuse_voxels
 
-__all__ = ["__version__", "voxel", "fuse_voxels"]
+__all__ = ["__version__", "las", "voxel", "fuse_voxels", "iter_las"]
