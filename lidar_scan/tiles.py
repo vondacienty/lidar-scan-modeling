@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import math
 from collections.abc import Iterable
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, localcontext
@@ -9,6 +10,26 @@ from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, localcontext
 _PRECISION = 50
 _QUANTUM = Decimal("0.000001")
 _NUMERIC_TYPES = (int, float)
+
+
+def _is_non_bool_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+class _TileKeyView:
+    """Read-only ``(tx, ty)`` key view over a level tuple for binary search."""
+
+    __slots__ = ("_tiles",)
+
+    def __init__(self, tiles: tuple):
+        self._tiles = tiles
+
+    def __len__(self) -> int:
+        return len(self._tiles)
+
+    def __getitem__(self, index: int) -> tuple:
+        tile = self._tiles[index]
+        return tile[0], tile[1]
 
 
 def _as_decimal(value) -> Decimal:
@@ -205,3 +226,58 @@ def build_tile_pyramid(points: Iterable[tuple | list],
             pyramid.append(tuple(level_tiles))
 
     return tuple(pyramid)
+
+
+def query_tile_pyramid(pyramid: tuple, level: int, tx: int, ty: int) -> tuple | None:
+    """Look up the tile ``(tx, ty)`` at ``level`` of a built tile pyramid.
+
+    ``pyramid`` must be the outer tuple returned by
+    :func:`build_tile_pyramid`: one tuple per level, each holding strict
+    9-item ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` tuples sorted
+    lexicographically by ``(tx, ty)`` with no duplicate coordinates.
+
+    Returns the original tile tuple for an exact ``(level, tx, ty)`` match,
+    or ``None`` when that level has no such tile. The input is never modified
+    or reordered.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be the tuple returned by build_tile_pyramid")
+    if not _is_non_bool_int(level):
+        raise TypeError("level must be a non-bool int")
+    if not _is_non_bool_int(tx):
+        raise TypeError("tx must be a non-bool int")
+    if not _is_non_bool_int(ty):
+        raise TypeError("ty must be a non-bool int")
+    if level < 0 or level >= len(pyramid):
+        raise ValueError(f"level must be in [0, {len(pyramid)})")
+
+    level_tiles = pyramid[level]
+    if not isinstance(level_tiles, tuple):
+        raise ValueError("each pyramid level must be a tuple of tile tuples")
+
+    previous_key = None
+    for tile in level_tiles:
+        if not isinstance(tile, tuple) or len(tile) != 9:
+            raise ValueError("each tile must be a 9-item tuple "
+                             "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)")
+        for index in (0, 1, 2, 3, 4, 5, 8):
+            if not _is_non_bool_int(tile[index]):
+                raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and count "
+                                 "must be non-bool ints")
+        for index in (6, 7):
+            value = tile[index]
+            if isinstance(value, bool) or not isinstance(value, float) \
+                    or not math.isfinite(value):
+                raise ValueError("zmin and zmax must be finite floats")
+
+        key = (tile[0], tile[1])
+        if previous_key is not None and key <= previous_key:
+            raise ValueError("level tiles must be sorted lexicographically "
+                             "by (tx, ty) with no duplicates")
+        previous_key = key
+
+    index = bisect.bisect_left(_TileKeyView(level_tiles), (tx, ty))
+    if index < len(level_tiles) \
+            and level_tiles[index][0] == tx and level_tiles[index][1] == ty:
+        return level_tiles[index]
+    return None
