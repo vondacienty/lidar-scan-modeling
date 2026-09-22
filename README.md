@@ -33,6 +33,7 @@ lidar-scan-modeling --help     # 打印用法
 - Python 包 `lidar_scan`，其 `__version__` 为当前版本号
 - `lidar_scan.voxel.fuse_voxels(points, voxel_size=1.0)`：按体素融合激光雷达点
 - `lidar_scan.las.iter_las(path)`：分块流式读取 LAS/LAZ 激光雷达文件
+- `lidar_scan.ply.iter_ply(path, chunk_size=65536)`：分块流式读取 PLY 激光雷达文件
 
 ### `fuse_voxels`
 
@@ -73,7 +74,31 @@ for block in iter_las("scan.laz"):
         ...
 ```
 
+### `iter_ply`
+
+- `path` 只接受 `str`，且后缀大小写不敏感地必须是 `.ply`
+- `chunk_size` 只接受非 bool 的 `int` 且必须为正，默认 65536；`path` 类型错误或 `chunk_size` 类型/取值错误在调用时抛出
+- 返回一次性迭代器，按文件记录顺序产出 tuple 块；除末块外每块恰含 `chunk_size` 点，末块为剩余点；空文件不产出任何块
+- 分块增量读取，不会整文件载入；正常耗尽、异常或迭代器被回收都会关闭文件句柄，再次迭代不会重开文件
+- 仅支持 `format ascii 1.0` 与 `format binary_little_endian 1.0`（不支持 big endian）
+- 头部必须恰好有一个非负的 `element vertex N`，不能有任何其他 element；属性仅允许标量 `x/y/z` 及可选 `intensity/sigma`
+- 属性类型限 `char/uchar/short/ushort/int/uint/float/double`；list 属性、未知或重复属性、缺少 `x/y/z`、声明数量与记录数不符均抛 `ValueError`
+- 按属性声明顺序解析，但每点严格输出五项 tuple `(x, y, z, intensity, sigma)`：
+  - `x/y/z` 为数值；`intensity` 必须为整数（浮点属性中也必须是整数值），缺省为 `0`，转 int
+  - `sigma` 为数值，必须有限且为正，缺省为 `1.0`
+- 坐标与 sigma 经 `Decimal(str(v))`（精度 50、ROUND_HALF_EVEN）量化到六位小数后转 float，负零归一为正零
+- 文件无法打开统一抛 `OSError`；头部或点记录非法/截断、坐标非有限、intensity 非整数、sigma 非有限或非正均抛 `ValueError`
+
+```python
+from lidar_scan import iter_ply
+
+for block in iter_ply("scan.ply", chunk_size=65536):
+    # 每个 block 是 chunk_size 个 (x, y, z, intensity, sigma) tuple（末块除外）
+    for x, y, z, intensity, sigma in block:
+        ...
+```
+
 ## 限制
 
-- 除版本查询、LAS/LAZ 分块读取与体素融合外没有其他功能。
+- 除版本查询、LAS/LAZ 分块读取、PLY 分块读取与体素融合外没有其他功能。
 - 其他输入输出格式、数据来源与算法均尚未定义。
