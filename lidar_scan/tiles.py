@@ -360,6 +360,72 @@ def _validate_pyramid(pyramid) -> None:
             prev_key = key
 
 
+def _validate_pyramid_stats(pyramid) -> None:
+    """Validate the structure of a tile pyramid with z statistics.
+
+    Like :func:`_validate_pyramid` but each tile must be an 11-tuple
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)`` where
+    the four statistics are finite floats and ``zsigma`` is positive.
+    """
+    for level_tiles in pyramid:
+        if not isinstance(level_tiles, tuple):
+            raise ValueError("each pyramid level must be a tuple")
+        prev_key = None
+        for tile in level_tiles:
+            if not isinstance(tile, tuple) or len(tile) != 11:
+                raise ValueError(
+                    "each tile must be an 11-tuple "
+                    "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)"
+                )
+            for value in tile[0:6] + (tile[10],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and count must be "
+                                     "non-bool ints")
+            for value in tile[6:10]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("zmin, zmax, zmean and zsigma must be finite "
+                                     "floats")
+            if tile[9] <= 0:
+                raise ValueError("zsigma must be positive")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("each pyramid level must be sorted by (tx, ty) "
+                                 "with no duplicate coordinates")
+            prev_key = key
+
+
+def query_tile_pyramid_stats(pyramid: tuple, level: int,
+                             tx: int, ty: int) -> tuple | None:
+    """Look up the tile ``(tx, ty)`` at ``level`` of a tile pyramid with stats.
+
+    ``pyramid`` must be an outer tuple as produced by
+    :func:`build_tile_pyramid_stats`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)``
+    11-tuples sorted lexicographically by ``(tx, ty)``, where the first six
+    fields and ``count`` are non-bool ints, the four statistics are finite
+    floats and ``zsigma`` is positive. ``level``, ``tx`` and ``ty`` must be
+    non-bool ints and ``level`` must satisfy ``0 <= level < len(pyramid)``.
+
+    Returns the stored 11-tuple for the exact ``(tx, ty)`` match at that
+    level, or ``None`` if no such tile exists. The input is never modified or
+    reordered.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    for name, value in (("level", level), ("tx", tx), ("ty", ty)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a non-bool int")
+    if level < 0 or level >= len(pyramid):
+        raise ValueError("level out of range")
+
+    _validate_pyramid_stats(pyramid)
+
+    for tile in pyramid[level]:
+        if tile[0] == tx and tile[1] == ty:
+            return tile
+    return None
+
+
 def query_tile_pyramid(pyramid: tuple, level: int, tx: int, ty: int) -> tuple | None:
     """Look up the tile ``(tx, ty)`` at ``level`` of a tile pyramid.
 
