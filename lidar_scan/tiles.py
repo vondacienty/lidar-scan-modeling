@@ -257,3 +257,40 @@ def query_tile_pyramid(pyramid: tuple, level: int, tx: int, ty: int) -> tuple | 
         if tile[0] == tx and tile[1] == ty:
             return tile
     return None
+
+
+def query_tile_region(pyramid: tuple, level: int,
+                      tx_min: int, ty_min: int,
+                      tx_max: int, ty_max: int) -> tuple:
+    """Select all tiles within a ``(tx, ty)`` rectangle at ``level``.
+
+    ``pyramid`` must be an outer tuple as produced by
+    :func:`build_tile_pyramid`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples sorted
+    lexicographically by ``(tx, ty)``. ``level`` and the four bounds must be
+    non-bool ints; ``level`` must satisfy ``0 <= level < len(pyramid)`` and
+    the bounds must satisfy ``tx_min <= tx_max`` and ``ty_min <= ty_max``.
+
+    Returns a tuple of the stored 9-tuples at that level with
+    ``tx_min <= tx <= tx_max`` and ``ty_min <= ty <= ty_max``, preserving the
+    level's existing order; an empty region match returns ``()``. The input is
+    never modified.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    for name, value in (("level", level), ("tx_min", tx_min), ("ty_min", ty_min),
+                        ("tx_max", tx_max), ("ty_max", ty_max)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a non-bool int")
+    if level < 0 or level >= len(pyramid):
+        raise ValueError("level out of range")
+    if tx_min > tx_max or ty_min > ty_max:
+        raise ValueError("region bounds must satisfy tx_min <= tx_max and "
+                         "ty_min <= ty_max")
+
+    _validate_pyramid(pyramid)
+
+    return tuple(
+        tile for tile in pyramid[level]
+        if tx_min <= tile[0] <= tx_max and ty_min <= tile[1] <= ty_max
+    )
