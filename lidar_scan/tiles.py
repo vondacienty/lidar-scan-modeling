@@ -343,6 +343,72 @@ def encode_tile_pyramid(pyramid: tuple) -> str:
     return "".join(parts)
 
 
+def encode_tile_region(pyramid: tuple, level: int,
+                       tx_min: int, ty_min: int,
+                       tx_max: int, ty_max: int) -> str:
+    """Serialize the tiles of a ``(tx, ty)`` rectangle at one pyramid level.
+
+    ``pyramid`` must be the outer tuple as produced by
+    :func:`build_tile_pyramid`: each level is a tuple of 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` with the first six
+    fields and ``count`` non-bool ints, ``zmin``/``zmax`` finite floats, and
+    tiles sorted by ``(tx, ty)`` without duplicates. ``level`` and the four
+    bounds must be non-bool ints; ``level`` must satisfy
+    ``0 <= level < len(pyramid)`` and the bounds must satisfy
+    ``tx_min <= tx_max`` and ``ty_min <= ty_max``.
+
+    Returns a canonical compact JSON string with the fixed top-level key order
+    ``level``, ``tx_min``, ``ty_min``, ``tx_max``, ``ty_max``, ``tiles``; the
+    first five values echo the arguments and ``tiles`` is an array of the
+    nine-value tiles at that level with ``tx_min <= tx <= tx_max`` and
+    ``ty_min <= ty <= ty_max``, in the tiles' stored order (``[]`` when none
+    match). Integers are decimal; ``zmin``/``zmax`` use exactly six decimal
+    places (negative zero written as ``0.000000``). The output has no
+    whitespace, ASCII is not escaped and ``NaN``/``Infinity`` never appear.
+    The input is never modified.
+
+    :raises TypeError: ``pyramid`` is not a tuple or ``level``/bounds are not
+        non-bool ints.
+    :raises ValueError: ``level`` is out of range, the bounds are reversed, or
+        the pyramid structure, ordering, duplicates or fields are bad.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    for name, value in (("level", level), ("tx_min", tx_min), ("ty_min", ty_min),
+                        ("tx_max", tx_max), ("ty_max", ty_max)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a non-bool int")
+    if level < 0 or level >= len(pyramid):
+        raise ValueError("level out of range")
+    if tx_min > tx_max or ty_min > ty_max:
+        raise ValueError("region bounds must satisfy tx_min <= tx_max and "
+                         "ty_min <= ty_max")
+
+    _validate_pyramid(pyramid)
+
+    parts = ["{\"level\":", str(level),
+             ",\"tx_min\":", str(tx_min),
+             ",\"ty_min\":", str(ty_min),
+             ",\"tx_max\":", str(tx_max),
+             ",\"ty_max\":", str(ty_max),
+             ",\"tiles\":["]
+    first = True
+    for tile in pyramid[level]:
+        if not (tx_min <= tile[0] <= tx_max and ty_min <= tile[1] <= ty_max):
+            continue
+        if not first:
+            parts.append(",")
+        first = False
+        (tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count) = tile
+        parts.append("[")
+        parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
+                               str(ix1), str(iy1), _format_z(zmin),
+                               _format_z(zmax), str(count))))
+        parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
 def _reject_constant(raw: str):
     """Reject JSON non-finite literals (``NaN``/``Infinity``) at parse time."""
     raise ValueError(f"non-finite JSON literal is not allowed: {raw}")
