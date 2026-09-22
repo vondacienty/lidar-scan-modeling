@@ -458,3 +458,77 @@ def decode_tile_pyramid(text: str) -> tuple:
     if encode_tile_pyramid(pyramid) != text:
         raise ValueError("JSON text is not the canonical pyramid encoding")
     return pyramid
+
+
+def merge_tile_pyramids(pyramids: tuple) -> tuple:
+    """Merge tile pyramids produced by :func:`build_tile_pyramid`.
+
+    ``pyramids`` must be a tuple of outer pyramids (it may be empty, in which
+    case ``()`` is returned); every member must have the same number of levels
+    (possibly zero). Each level must be a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples, with the
+    first six fields and ``count`` non-bool ints, ``zmin``/``zmax`` finite
+    floats, and tiles strictly sorted by ``(tx, ty)`` without duplicates.
+
+    Tiles are unioned per level and per ``(tx, ty)``. Tiles sharing a
+    coordinate must also share their ``(ix0, iy0, ix1, iy1)`` bounds; the
+    merged tile keeps the geometry of the first input at that coordinate,
+    takes the minimum ``zmin`` and maximum ``zmax``, and sums ``count``.
+
+    Returns a pyramid with the same levels in the same order, each level's
+    tiles sorted by ``(tx, ty)`` (empty levels are ``()``). The result does
+    not depend on the order of the inputs and the inputs are never modified.
+
+    :raises TypeError: ``pyramids`` is not a tuple.
+    :raises ValueError: a member is not a valid pyramid, the level counts
+        differ, or same-coordinate tiles disagree on their cell bounds.
+    """
+    if not isinstance(pyramids, tuple):
+        raise TypeError("pyramids must be a tuple")
+    if not pyramids:
+        return ()
+
+    level_count = None
+    for pyramid in pyramids:
+        if not isinstance(pyramid, tuple):
+            raise ValueError("each pyramid must be a tuple of levels")
+        _validate_pyramid(pyramid)
+        if level_count is None:
+            level_count = len(pyramid)
+        elif len(pyramid) != level_count:
+            raise ValueError("all pyramids must have the same number of levels")
+
+    merged_levels = []
+    for level in range(level_count):
+        # key -> [bounds, zmin, zmax, count]; bounds come from the first
+        # pyramid contributing the coordinate.
+        combined: dict[tuple[int, int], list] = {}
+        for pyramid in pyramids:
+            for tile in pyramid[level]:
+                (tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count) = tile
+                key = (tx, ty)
+                bounds = (ix0, iy0, ix1, iy1)
+                entry = combined.get(key)
+                if entry is None:
+                    combined[key] = [bounds, zmin, zmax, count]
+                else:
+                    if entry[0] != bounds:
+                        raise ValueError(
+                            "tiles with the same (tx, ty) must agree on "
+                            "(ix0, iy0, ix1, iy1)"
+                        )
+                    if zmin < entry[1]:
+                        entry[1] = zmin
+                    if zmax > entry[2]:
+                        entry[2] = zmax
+                    entry[3] += count
+
+        level_tiles = []
+        for (tx, ty), (bounds, zmin, zmax, count) in sorted(combined.items()):
+            ix0, iy0, ix1, iy1 = bounds
+            level_tiles.append(
+                (tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)
+            )
+        merged_levels.append(tuple(level_tiles))
+
+    return tuple(merged_levels)
