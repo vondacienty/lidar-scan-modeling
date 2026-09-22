@@ -205,3 +205,55 @@ def build_tile_pyramid(points: Iterable[tuple | list],
             pyramid.append(tuple(level_tiles))
 
     return tuple(pyramid)
+
+
+def _validate_pyramid(pyramid) -> None:
+    """Validate the structure of a tile pyramid, raising ``ValueError``."""
+    for level_tiles in pyramid:
+        if not isinstance(level_tiles, tuple):
+            raise ValueError("each pyramid level must be a tuple")
+        prev_key = None
+        for tile in level_tiles:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise ValueError("each tile must be a 9-tuple "
+                                 "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)")
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and count must be "
+                                     "non-bool ints")
+            for value in tile[6:8]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("zmin and zmax must be finite floats")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("each pyramid level must be sorted by (tx, ty) "
+                                 "with no duplicate coordinates")
+            prev_key = key
+
+
+def query_tile_pyramid(pyramid: tuple, level: int, tx: int, ty: int) -> tuple | None:
+    """Look up the tile ``(tx, ty)`` at ``level`` of a tile pyramid.
+
+    ``pyramid`` must be an outer tuple as produced by
+    :func:`build_tile_pyramid`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples sorted
+    lexicographically by ``(tx, ty)``. ``level``, ``tx`` and ``ty`` must be
+    non-bool ints and ``level`` must satisfy ``0 <= level < len(pyramid)``.
+
+    Returns the stored 9-tuple for the exact ``(tx, ty)`` match at that level,
+    or ``None`` if no such tile exists. The input is never modified.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    for name, value in (("level", level), ("tx", tx), ("ty", ty)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a non-bool int")
+    if level < 0 or level >= len(pyramid):
+        raise ValueError("level out of range")
+
+    _validate_pyramid(pyramid)
+
+    for tile in pyramid[level]:
+        if tile[0] == tx and tile[1] == ty:
+            return tile
+    return None
