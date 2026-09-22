@@ -32,6 +32,7 @@ lidar-scan-modeling --help     # 打印用法
 - 命令行程序 `lidar-scan-modeling`
 - Python 包 `lidar_scan`，其 `__version__` 为当前版本号
 - `lidar_scan.voxel.fuse_voxels(points, voxel_size=1.0)`：按体素融合激光雷达点
+- `lidar_scan.chm.build_chm(points, ground, cell_size=1.0)`：基于地面格网构建冠层高度模型
 - `lidar_scan.las.iter_las(path)`：分块流式读取 LAS/LAZ 激光雷达文件
 - `lidar_scan.ply.iter_ply(path, chunk_size=65536)`：分块流式读取 PLY 激光雷达文件
 - `lidar_scan.e57.iter_e57(path, chunk_size=65536)`：分块流式读取 E57 激光雷达文件
@@ -51,6 +52,23 @@ from lidar_scan import fuse_voxels
 fuse_voxels([(0.0, 0.0, 0.0, 0.0, 1.0),
              (0.5, 0.5, 0.5, 10.0, 0.5)])
 # ((0, 0, 0, 0.4, 0.4, 0.4, 8.0, 0.447214, 2),)
+```
+
+### `build_chm`
+
+- `points`、`ground` 均为可迭代对象且只迭代一次（可为不支持 `len` 的迭代器）；每个点为五项 tuple/list `(x, y, z, intensity, sigma)`，每个地面格为五项 tuple/list `(ix, iy, z, sigma, count)`
+- 点的坐标/强度/z/sigma 及 `cell_size` 须为非 bool 的 int/float 且有限；地面的 `ix`、`iy`、`count` 须为非 bool int；点坐标除以 `cell_size` 后向负无穷取整得到格索引
+- 点按 `(floor(x/cell_size), floor(y/cell_size))` 匹配地面格，点格缺少对应地面格抛 `ValueError`；地面格索引重复抛 `ValueError`
+- 每格取 z 最高的点，z 并列时依次按 sigma、intensity、x、y 升序择首；输出 `count` 为该格全部点数
+- 输出 tuple，每项为五元组 `(ix, iy, height, sigma, count)`，按 `(ix, iy)` 字典序排列；`points` 为空时返回 `()`
+- `height = max(0, point_z - ground_z)`，`sigma = sqrt(point_sigma² + ground_sigma²)`；计算使用 `Decimal(str(v))`（精度 50、ROUND_HALF_EVEN），height/sigma 量化到六位小数后转 float，负零归一为正零
+- 容器不可迭代、点/地面格容器或长度不符、标量类型（含 `cell_size`）非法抛 `TypeError`；`cell_size` 或任一 sigma 非有限/≤0、地面 `count ≤ 0`、地面索引重复、点格缺地面抛 `ValueError`
+
+```python
+from lidar_scan import build_chm
+
+build_chm([(0.2, 0.2, 3.0, 10.0, 0.5)], ground=[(0, 0, 1.0, 0.5, 4)])
+# ((0, 0, 2.0, 0.707107, 1),)
 ```
 
 ### `iter_las`
@@ -121,5 +139,5 @@ for block in iter_e57("scan.e57", chunk_size=65536):
 
 ## 限制
 
-- 除版本查询、LAS/LAZ 分块读取、PLY 分块读取、E57 分块读取与体素融合外没有其他功能。
+- 除版本查询、LAS/LAZ 分块读取、PLY 分块读取、E57 分块读取、体素融合与冠层高度模型外没有其他功能。
 - 其他输入输出格式、数据来源与算法均尚未定义。
