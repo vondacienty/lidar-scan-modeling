@@ -646,6 +646,33 @@ def encode_tile_region(pyramid: tuple, level: int,
     return "".join(parts)
 
 
+def _encode_region_stats_text(level: int, tx_min: int, ty_min: int,
+                              tx_max: int, ty_max: int,
+                              tiles: Iterable[tuple]) -> str:
+    """Build the canonical compact region-stats JSON text from valid tiles."""
+    parts = ["{\"level\":", str(level),
+             ",\"tx_min\":", str(tx_min),
+             ",\"ty_min\":", str(ty_min),
+             ",\"tx_max\":", str(tx_max),
+             ",\"ty_max\":", str(ty_max),
+             ",\"tiles\":["]
+    first = True
+    for tile in tiles:
+        if not first:
+            parts.append(",")
+        first = False
+        (tx, ty, ix0, iy0, ix1, iy1,
+         zmin, zmax, zmean, zsigma, count) = tile
+        parts.append("[")
+        parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
+                               str(ix1), str(iy1), _format_z(zmin),
+                               _format_z(zmax), _format_z(zmean),
+                               _format_z(zsigma), str(count))))
+        parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
 def encode_tile_region_stats(pyramid: tuple, level: int,
                              tx_min: int, ty_min: int,
                              tx_max: int, ty_max: int) -> str:
@@ -689,28 +716,10 @@ def encode_tile_region_stats(pyramid: tuple, level: int,
 
     _validate_pyramid_stats(pyramid)
 
-    parts = ["{\"level\":", str(level),
-             ",\"tx_min\":", str(tx_min),
-             ",\"ty_min\":", str(ty_min),
-             ",\"tx_max\":", str(tx_max),
-             ",\"ty_max\":", str(ty_max),
-             ",\"tiles\":["]
-    first = True
-    for tile in pyramid[level]:
-        if tx_min <= tile[0] <= tx_max and ty_min <= tile[1] <= ty_max:
-            if not first:
-                parts.append(",")
-            first = False
-            (tx, ty, ix0, iy0, ix1, iy1,
-             zmin, zmax, zmean, zsigma, count) = tile
-            parts.append("[")
-            parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
-                                   str(ix1), str(iy1), _format_z(zmin),
-                                   _format_z(zmax), _format_z(zmean),
-                                   _format_z(zsigma), str(count))))
-            parts.append("]")
-    parts.append("]}")
-    return "".join(parts)
+    return _encode_region_stats_text(
+        level, tx_min, ty_min, tx_max, ty_max,
+        (tile for tile in pyramid[level]
+         if tx_min <= tile[0] <= tx_max and ty_min <= tile[1] <= ty_max))
 
 
 def _reject_constant(raw: str):
@@ -856,6 +865,102 @@ def decode_tile_pyramid_stats(text: str) -> tuple:
     if encode_tile_pyramid_stats(pyramid) != text:
         raise ValueError("JSON text is not the canonical pyramid-stats encoding")
     return pyramid
+
+
+def decode_tile_region_stats(text: str) -> tuple:
+    """Deserialize canonical JSON produced by :func:`encode_tile_region_stats`.
+
+    Only the encoder's canonical compact form is accepted: the top-level
+    object has exactly the keys ``level``, ``tx_min``, ``ty_min``,
+    ``tx_max``, ``ty_max`` and ``tiles`` in that order; the first five values
+    are non-bool ints with ``level >= 0`` and non-inverted bounds; ``tiles``
+    is an array of strict eleven-item arrays
+    ``[tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count]`` whose
+    indices and ``count`` are non-bool ints, whose four statistics are finite
+    numbers with ``zsigma > 0``, and whose tiles are strictly increasing in
+    ``(tx, ty)`` (no duplicates) and lie within the echoed rectangle.
+
+    Returns ``(level, tx_min, ty_min, tx_max, ty_max, tiles)`` where
+    ``tiles`` is a tuple of eleven-tuples in the stored order. The input is
+    never modified.
+
+    :raises TypeError: ``text`` is not a ``str``.
+    :raises ValueError: the JSON syntax, key order, types, bounds, ordering,
+        range, non-finite values or canonical re-encoding do not match.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("text is not valid JSON") from exc
+
+    expected_keys = ("level", "tx_min", "ty_min", "tx_max", "ty_max", "tiles")
+    if not isinstance(document, dict) or tuple(document) != expected_keys:
+        raise ValueError(
+            "top-level value must be an object with exactly 'level', "
+            "'tx_min', 'ty_min', 'tx_max', 'ty_max' and 'tiles' in that order"
+        )
+
+    level = document["level"]
+    tx_min = document["tx_min"]
+    ty_min = document["ty_min"]
+    tx_max = document["tx_max"]
+    ty_max = document["ty_max"]
+    raw_tiles = document["tiles"]
+
+    for name, value in zip(expected_keys[:5],
+                           (level, tx_min, ty_min, tx_max, ty_max)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be a non-bool int")
+    if level < 0:
+        raise ValueError("level must be non-negative")
+    if tx_min > tx_max or ty_min > ty_max:
+        raise ValueError("region bounds must satisfy tx_min <= tx_max and "
+                         "ty_min <= ty_max")
+    if not isinstance(raw_tiles, list):
+        raise ValueError("'tiles' must be an array")
+
+    tiles: list[tuple] = []
+    prev_key = None
+    for raw_tile in raw_tiles:
+        if not isinstance(raw_tile, list) or len(raw_tile) != 11:
+            raise ValueError("each tile must be an array of eleven values")
+        tile = tuple(raw_tile)
+        (tx, ty, ix0, iy0, ix1, iy1,
+         zmin, zmax, zmean, zsigma, count) = tile
+        for name, value in (("tx", tx), ("ty", ty), ("ix0", ix0),
+                            ("iy0", iy0), ("ix1", ix1), ("iy1", iy1),
+                            ("count", count)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        for name, value in (("zmin", zmin), ("zmax", zmax),
+                            ("zmean", zmean), ("zsigma", zsigma)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a finite number")
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number")
+        if zsigma <= 0:
+            raise ValueError("zsigma must be positive")
+        if not (tx_min <= tx <= tx_max and ty_min <= ty <= ty_max):
+            raise ValueError("each tile must lie within the region bounds")
+        key = (tx, ty)
+        if prev_key is not None and key <= prev_key:
+            raise ValueError("tiles must be sorted by (tx, ty) with no "
+                             "duplicate coordinates")
+        prev_key = key
+        tiles.append(tile)
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal statistic formatting, leading zeros,
+    # -0, exponents and any other non-canonical spelling.
+    if _encode_region_stats_text(level, tx_min, ty_min, tx_max, ty_max,
+                                 tiles) != text:
+        raise ValueError("JSON text is not the canonical region-stats encoding")
+    return (level, tx_min, ty_min, tx_max, ty_max, tuple(tiles))
 
 
 def merge_tile_pyramids(pyramids: tuple) -> tuple:
