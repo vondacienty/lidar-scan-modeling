@@ -232,6 +232,76 @@ def _validate_pyramid(pyramid) -> None:
             prev_key = key
 
 
+def merge_tile_pyramids(pyramids: tuple) -> tuple:
+    """Merge tile pyramids produced by :func:`build_tile_pyramid`.
+
+    ``pyramids`` must be a tuple of outer pyramids; it may be empty, in which
+    case ``()`` is returned. Every member must be a pyramid tuple whose levels
+    are tuples of ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)``
+    9-tuples sorted lexicographically by ``(tx, ty)`` with no duplicates, and
+    all members must have the same number of levels (which may be zero).
+
+    For each level the union of tile coordinates is taken. Tiles sharing a
+    ``(tx, ty)`` must agree on ``(ix0, iy0, ix1, iy1)`` or ``ValueError`` is
+    raised; the merged tile keeps that geometry, takes the minimum ``zmin``,
+    the maximum ``zmax`` and the integer sum of ``count``. The result has the
+    same number of levels in level order, each sorted by ``(tx, ty)`` with
+    empty levels as ``()``. The inputs are never modified and the result does
+    not depend on the order of the input pyramids.
+
+    :raises TypeError: ``pyramids`` is not a tuple.
+    :raises ValueError: a member is not a valid pyramid, the level counts
+        differ or co-located tiles disagree on their cell-index bounds.
+    """
+    if not isinstance(pyramids, tuple):
+        raise TypeError("pyramids must be a tuple")
+    if len(pyramids) == 0:
+        return ()
+
+    level_count = None
+    for pyramid in pyramids:
+        if not isinstance(pyramid, tuple):
+            raise ValueError("each pyramid must be a tuple of levels")
+        _validate_pyramid(pyramid)
+        if level_count is None:
+            level_count = len(pyramid)
+        elif len(pyramid) != level_count:
+            raise ValueError("all pyramids must have the same number of levels")
+
+    merged_levels = []
+    for level in range(level_count):
+        # key -> [ix0, iy0, ix1, iy1, zmin, zmax, count], first occurrence
+        # of a coordinate supplying the geometry.
+        tiles_by_key: dict[tuple[int, int], list] = {}
+        for pyramid in pyramids:
+            for tile in pyramid[level]:
+                key = (tile[0], tile[1])
+                geometry = (tile[2], tile[3], tile[4], tile[5])
+                entry = tiles_by_key.get(key)
+                if entry is None:
+                    tiles_by_key[key] = [tile[2], tile[3], tile[4], tile[5],
+                                         tile[6], tile[7], tile[8]]
+                else:
+                    if geometry != (entry[0], entry[1], entry[2], entry[3]):
+                        raise ValueError(
+                            "tiles with the same (tx, ty) must agree on "
+                            "(ix0, iy0, ix1, iy1)")
+                    if tile[6] < entry[4]:
+                        entry[4] = tile[6]
+                    if tile[7] > entry[5]:
+                        entry[5] = tile[7]
+                    entry[6] += tile[8]
+
+        level_tiles = []
+        for tx, ty in sorted(tiles_by_key):
+            ix0, iy0, ix1, iy1, zmin, zmax, count = tiles_by_key[(tx, ty)]
+            level_tiles.append((tx, ty, ix0, iy0, ix1, iy1,
+                                zmin, zmax, count))
+        merged_levels.append(tuple(level_tiles))
+
+    return tuple(merged_levels)
+
+
 def query_tile_pyramid(pyramid: tuple, level: int, tx: int, ty: int) -> tuple | None:
     """Look up the tile ``(tx, ty)`` at ``level`` of a tile pyramid.
 
