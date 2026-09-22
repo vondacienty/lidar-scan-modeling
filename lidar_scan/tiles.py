@@ -491,6 +491,50 @@ def query_tile_region(pyramid: tuple, level: int,
     )
 
 
+def query_tile_region_stats(pyramid: tuple, level: int,
+                            tx_min: int, ty_min: int,
+                            tx_max: int, ty_max: int) -> tuple:
+    """Select all tiles within a ``(tx, ty)`` rectangle at ``level`` (stats).
+
+    ``pyramid`` must be an outer tuple as produced by
+    :func:`build_tile_pyramid_stats`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)``
+    11-tuples sorted lexicographically by ``(tx, ty)``, where the first six
+    fields and ``count`` are non-bool ints, the four statistics are finite
+    floats and ``zsigma`` is positive. ``level`` and the four bounds must be
+    non-bool ints; ``level`` must satisfy ``0 <= level < len(pyramid)`` and
+    the bounds must satisfy ``tx_min <= tx_max`` and ``ty_min <= ty_max``.
+
+    Returns a tuple of the stored 11-tuples at that level with
+    ``tx_min <= tx <= tx_max`` and ``ty_min <= ty <= ty_max``, preserving the
+    level's existing order; an empty region match returns ``()``. The input is
+    never modified or reordered.
+
+    :raises TypeError: ``pyramid`` is not a tuple or ``level``/a bound is not
+        a non-bool int.
+    :raises ValueError: ``level`` is out of range, the bounds are inverted or
+        the pyramid's structure, ordering, duplicates or fields are bad.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    for name, value in (("level", level), ("tx_min", tx_min), ("ty_min", ty_min),
+                        ("tx_max", tx_max), ("ty_max", ty_max)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a non-bool int")
+    if level < 0 or level >= len(pyramid):
+        raise ValueError("level out of range")
+    if tx_min > tx_max or ty_min > ty_max:
+        raise ValueError("region bounds must satisfy tx_min <= tx_max and "
+                         "ty_min <= ty_max")
+
+    _validate_pyramid_stats(pyramid)
+
+    return tuple(
+        tile for tile in pyramid[level]
+        if tx_min <= tile[0] <= tx_max and ty_min <= tile[1] <= ty_max
+    )
+
+
 def _format_z(value: float) -> str:
     """Format a finite float with exactly six decimals (``-0`` normalized)."""
     text = format(value, ".6f")
