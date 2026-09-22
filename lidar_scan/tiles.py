@@ -819,3 +819,107 @@ def merge_tile_pyramids(pyramids: tuple) -> tuple:
         merged_levels.append(tuple(level_tiles))
 
     return tuple(merged_levels)
+
+
+def merge_tile_pyramid_stats(pyramids: tuple) -> tuple:
+    """Merge tile pyramids with z statistics, combining inverse-variance stats.
+
+    ``pyramids`` must be a tuple of outer pyramids as produced by
+    :func:`build_tile_pyramid_stats` (it may be empty, in which case ``()`` is
+    returned); every member must have the same number of levels (possibly
+    zero). Each level must be a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)``
+    11-tuples, with the first six fields and ``count`` non-bool ints, the four
+    statistics finite floats, ``zsigma`` positive, and tiles strictly sorted by
+    ``(tx, ty)`` without duplicates.
+
+    Tiles are unioned per level and per ``(tx, ty)``. Tiles sharing a
+    coordinate must also share their ``(ix0, iy0, ix1, iy1)`` bounds; the
+    merged tile keeps that geometry, takes the minimum ``zmin`` and maximum
+    ``zmax``, and sums ``count``. The z statistics use weights
+    ``w = 1 / zsigma ** 2``: ``zmean = sum(w * zmean) / sum(w)`` and
+    ``zsigma = sqrt(1 / sum(w))``; the summations are Decimal computations
+    (precision 50, ``ROUND_HALF_EVEN``, each input converted via
+    ``Decimal(str(v))``) with the summands accumulated in ascending Decimal
+    order, so the results do not depend on input order. The four statistics
+    are quantized to six decimal places as floats (negative zero normalized).
+
+    Returns a pyramid with the same levels in the same order, each level's
+    tiles sorted by ``(tx, ty)`` (empty levels are ``()``). The result does
+    not depend on the order of the inputs and the inputs are never modified.
+
+    :raises TypeError: ``pyramids`` is not a tuple.
+    :raises ValueError: a member is not a valid pyramid, the level counts
+        differ, or same-coordinate tiles disagree on their cell bounds.
+    """
+    if not isinstance(pyramids, tuple):
+        raise TypeError("pyramids must be a tuple")
+    if not pyramids:
+        return ()
+
+    level_count = None
+    for pyramid in pyramids:
+        if not isinstance(pyramid, tuple):
+            raise ValueError("each pyramid must be a tuple of levels")
+        _validate_pyramid_stats(pyramid)
+        if level_count is None:
+            level_count = len(pyramid)
+        elif len(pyramid) != level_count:
+            raise ValueError("all pyramids must have the same number of levels")
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        merged_levels = []
+        for level in range(level_count):
+            # key -> [bounds, zmin, zmax, count, weights, weighted means];
+            # bounds come from the first pyramid contributing the coordinate
+            # and the per-tile Decimal summands are sorted before accumulation.
+            combined: dict[tuple[int, int], list] = {}
+            for pyramid in pyramids:
+                for tile in pyramid[level]:
+                    (tx, ty, ix0, iy0, ix1, iy1,
+                     zmin, zmax, zmean, zsigma, count) = tile
+                    key = (tx, ty)
+                    bounds = (ix0, iy0, ix1, iy1)
+                    dzsigma = Decimal(str(zsigma))
+                    weight = Decimal(1) / (dzsigma * dzsigma)
+                    weighted_mean = weight * Decimal(str(zmean))
+                    entry = combined.get(key)
+                    if entry is None:
+                        combined[key] = [bounds, zmin, zmax, count,
+                                         [weight], [weighted_mean]]
+                    else:
+                        if entry[0] != bounds:
+                            raise ValueError(
+                                "tiles with the same (tx, ty) must agree on "
+                                "(ix0, iy0, ix1, iy1)"
+                            )
+                        if zmin < entry[1]:
+                            entry[1] = zmin
+                        if zmax > entry[2]:
+                            entry[2] = zmax
+                        entry[3] += count
+                        entry[4].append(weight)
+                        entry[5].append(weighted_mean)
+
+            level_tiles = []
+            for (tx, ty), entry in sorted(combined.items()):
+                (bounds, zmin, zmax, count,
+                 weights, weighted_means) = entry
+                sum_w = _sorted_sum(weights)
+                merged_zmean = _sorted_sum(weighted_means) / sum_w
+                merged_zsigma = (Decimal(1) / sum_w).sqrt()
+                ix0, iy0, ix1, iy1 = bounds
+                level_tiles.append((
+                    tx, ty, ix0, iy0, ix1, iy1,
+                    _quantize(Decimal(str(zmin))),
+                    _quantize(Decimal(str(zmax))),
+                    _quantize(merged_zmean),
+                    _quantize(merged_zsigma),
+                    count,
+                ))
+            merged_levels.append(tuple(level_tiles))
+
+    return tuple(merged_levels)
