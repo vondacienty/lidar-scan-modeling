@@ -104,3 +104,70 @@ def build_dem(points: Iterable[tuple | list], cell_size: int | float = 1.0) -> t
 
     result.sort(key=lambda item: (item[0], item[1]))
     return tuple(result)
+
+
+def build_dsm(points: Iterable[tuple | list], cell_size: int | float = 1.0) -> tuple:
+    """Build a 2D DSM keeping the highest-z point of each grid cell.
+
+    Each point is a 5-item ``(x, y, z, intensity, sigma)`` tuple/list. Coordinates
+    divided by ``cell_size`` and floored toward negative infinity give the cell
+    index ``(ix, iy)``. Within a cell the point with the highest z is kept;
+    exact z ties are resolved by ascending ``(sigma, intensity, x, y)``.
+
+    Returns a tuple of ``(ix, iy, z, sigma, count)`` tuples, where ``count`` is
+    the number of points in the cell, sorted lexicographically by ``(ix, iy)``;
+    an empty input returns ``()``.
+    """
+    if isinstance(cell_size, bool) or not isinstance(cell_size, _NUMERIC_TYPES):
+        raise TypeError("cell_size must be a non-bool int or float")
+    if isinstance(cell_size, float) and not math.isfinite(cell_size):
+        raise ValueError("cell_size must be finite")
+
+    try:
+        point_iter = iter(points)
+    except TypeError:
+        raise TypeError("points must be an iterable of points") from None
+
+    groups: dict[tuple[int, int], list] = {}
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        dcell = Decimal(str(cell_size))
+        if dcell <= 0:
+            raise ValueError("cell_size must be positive")
+
+        for point in point_iter:
+            if not isinstance(point, (tuple, list)) or len(point) != 5:
+                raise TypeError("each point must be a tuple or list of 5 items "
+                                "(x, y, z, intensity, sigma)")
+
+            dx = _as_decimal(point[0])
+            dy = _as_decimal(point[1])
+            dz = _as_decimal(point[2])
+            dintensity = _as_decimal(point[3])
+            dsigma = _as_decimal(point[4])
+            if dsigma <= 0:
+                raise ValueError("sigma must be positive")
+
+            ix = int((dx / dcell).to_integral_value(rounding=ROUND_FLOOR))
+            iy = int((dy / dcell).to_integral_value(rounding=ROUND_FLOOR))
+
+            candidate = (dz, dsigma, dintensity, dx, dy)
+            entry = groups.get((ix, iy))
+            if entry is None:
+                groups[(ix, iy)] = [1, candidate]
+            else:
+                entry[0] += 1
+                best = entry[1]
+                if candidate[0] > best[0] or (
+                        candidate[0] == best[0] and candidate[1:] < best[1:]):
+                    entry[1] = candidate
+
+        result = []
+        for (ix, iy), (count, best) in groups.items():
+            result.append((ix, iy, _quantize(best[0]), _quantize(best[1]), count))
+
+    result.sort(key=lambda item: (item[0], item[1]))
+    return tuple(result)
