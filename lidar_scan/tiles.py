@@ -51,10 +51,8 @@ def build_tile_index(points: Iterable[tuple | list],
     if tile_cells <= 0:
         raise ValueError("tile_cells must be positive")
 
-    try:
-        point_iter = iter(points)
-    except TypeError:
-        raise TypeError("points must be an iterable of points") from None
+    # A single iter() call, single pass; any TypeError propagates unchanged.
+    point_iter = iter(points)
 
     tiles: dict[tuple[int, int], list] = {}
 
