@@ -11,13 +11,20 @@ _QUANTUM = Decimal("0.000001")
 _NUMERIC_TYPES = (int, float)
 
 
-def _as_decimal(value) -> Decimal:
+def _as_decimal(value, what: str = "point coordinates, intensity and sigma") -> Decimal:
     """Validate a scalar parameter and convert it via ``Decimal(str(value))``."""
     if isinstance(value, bool) or not isinstance(value, _NUMERIC_TYPES):
-        raise TypeError("point coordinates, intensity and sigma must be non-bool int or float")
+        raise TypeError(f"{what} must be non-bool int or float")
     if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError("point coordinates, intensity and sigma must be finite")
+        raise ValueError(f"{what} must be finite")
     return Decimal(str(value))
+
+
+def _as_index(value, what: str) -> int:
+    """Validate a non-bool integer index/count field."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{what} must be a non-bool int")
+    return value
 
 
 def _sorted_sum(terms: list[Decimal]) -> Decimal:
@@ -168,6 +175,74 @@ def build_dsm(points: Iterable[tuple | list], cell_size: int | float = 1.0) -> t
         result = []
         for (ix, iy), (count, best) in groups.items():
             result.append((ix, iy, _quantize(best[0]), _quantize(best[1]), count))
+
+    result.sort(key=lambda item: (item[0], item[1]))
+    return tuple(result)
+
+
+def _read_cells(cells: Iterable[tuple | list], name: str) -> dict:
+    """Consume a single-pass iterable of DEM cells into a ``(ix, iy)``-keyed dict."""
+    try:
+        cell_iter = iter(cells)
+    except TypeError:
+        raise TypeError(f"{name} must be an iterable of DEM cells") from None
+
+    table: dict[tuple[int, int], tuple[Decimal, Decimal]] = {}
+    for cell in cell_iter:
+        if not isinstance(cell, (tuple, list)) or len(cell) != 5:
+            raise TypeError(f"each {name} cell must be a tuple or list of 5 items "
+                            "(ix, iy, z, sigma, count)")
+
+        ix = _as_index(cell[0], f"{name} ix")
+        iy = _as_index(cell[1], f"{name} iy")
+        z = _as_decimal(cell[2], f"{name} z")
+        sigma = _as_decimal(cell[3], f"{name} sigma")
+        if sigma <= 0:
+            raise ValueError(f"{name} sigma must be positive")
+        _as_index(cell[4], f"{name} count")  # count: validated but not used
+
+        key = (ix, iy)
+        if key in table:
+            raise ValueError(f"duplicate {name} cell index ({ix}, {iy})")
+        table[key] = (z, sigma)
+    return table
+
+
+def assess_dem(estimate: Iterable[tuple | list],
+               reference: Iterable[tuple | list]) -> tuple:
+    """Assess an estimated DEM against a reference DEM, cell by cell.
+
+    Both inputs are single-pass iterables of 5-item ``(ix, iy, z, sigma,
+    count)`` tuples/lists; they must cover exactly the same set of ``(ix,
+    iy)`` cell indices, without duplicates.
+
+    Returns a tuple of ``(ix, iy, bias, abs_error, combined_sigma, z_score)``
+    tuples sorted lexicographically by ``(ix, iy)``, where
+    ``bias = estimate.z - reference.z``, ``abs_error = abs(bias)``,
+    ``combined_sigma = sqrt(estimate.sigma**2 + reference.sigma**2)`` and
+    ``z_score = bias / combined_sigma``; an empty input pair returns ``()``.
+    """
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        est = _read_cells(estimate, "estimate")
+        ref = _read_cells(reference, "reference")
+
+        if est.keys() != ref.keys():
+            raise ValueError("estimate and reference cell index sets differ")
+
+        result = []
+        for (ix, iy), (est_z, est_sigma) in est.items():
+            ref_z, ref_sigma = ref[(ix, iy)]
+            bias = est_z - ref_z
+            combined = (est_sigma * est_sigma + ref_sigma * ref_sigma).sqrt()
+            z_score = bias / combined
+            result.append((
+                ix, iy,
+                _quantize(bias), _quantize(abs(bias)),
+                _quantize(combined), _quantize(z_score),
+            ))
 
     result.sort(key=lambda item: (item[0], item[1]))
     return tuple(result)
