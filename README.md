@@ -34,6 +34,7 @@ lidar-scan-modeling --help     # 打印用法
 - `lidar_scan.voxel.fuse_voxels(points, voxel_size=1.0)`：按体素融合激光雷达点
 - `lidar_scan.las.iter_las(path)`：分块流式读取 LAS/LAZ 激光雷达文件
 - `lidar_scan.ply.iter_ply(path, chunk_size=65536)`：分块流式读取 PLY 激光雷达文件
+- `lidar_scan.e57.iter_e57(path, chunk_size=65536)`：分块流式读取 E57 激光雷达文件
 
 ### `fuse_voxels`
 
@@ -98,7 +99,27 @@ for block in iter_ply("scan.ply", chunk_size=65536):
         ...
 ```
 
+### `iter_e57`
+
+- `path` 只接受 `str`，且后缀大小写不敏感地必须是 `.e57`
+- `chunk_size` 只接受非 bool 的 `int` 且必须为正，默认 65536；`path` 类型错误或 `chunk_size` 类型/取值错误在调用时抛出
+- 返回惰性一次性迭代器，按 E57 扫描索引顺序跨扫描拼接、各扫描内按点记录顺序产出 tuple 块；除末块外每块恰含 `chunk_size` 点，末块为剩余点；空文件或全部为零点数扫描不产出任何块
+- 分块增量解码，不会整文件载入；正常耗尽、异常或迭代器被回收都会关闭文件句柄，再次迭代不会重开文件
+- 每个扫描必须提供 `cartesianX`、`cartesianY`、`cartesianZ` 点字段；缺失笛卡尔坐标（包括仅有球坐标的扫描）抛 `ValueError`；不做位姿变换，直接输出笛卡尔字段值
+- 每点统一输出五项 tuple `(x, y, z, intensity, sigma)`：可选 `intensity` 字段缺省为 `0`，`sigma` 固定为 `1.0`
+- 坐标经 `Decimal(str(v))`（精度 50、ROUND_HALF_EVEN）量化到六位小数后转 float，负零归一为正零；intensity 必须为有限整数后转 int，坐标必须有限
+- 文件无法打开统一抛 `OSError`；未安装 `pye57` 抛 `RuntimeError`；容器、扫描、字段、记录截断或解码失败、非有限值均抛 `ValueError`
+
+```python
+from lidar_scan import iter_e57
+
+for block in iter_e57("scan.e57", chunk_size=65536):
+    # 每个 block 是 chunk_size 个 (x, y, z, intensity, sigma) tuple（末块除外）
+    for x, y, z, intensity, sigma in block:
+        ...
+```
+
 ## 限制
 
-- 除版本查询、LAS/LAZ 分块读取、PLY 分块读取与体素融合外没有其他功能。
+- 除版本查询、LAS/LAZ 分块读取、PLY 分块读取、E57 分块读取与体素融合外没有其他功能。
 - 其他输入输出格式、数据来源与算法均尚未定义。
