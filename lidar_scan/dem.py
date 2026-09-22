@@ -106,6 +106,83 @@ def build_dem(points: Iterable[tuple | list], cell_size: int | float = 1.0) -> t
     return tuple(result)
 
 
+def _as_index(value, name: str) -> int:
+    """Validate a grid index or count field as a non-bool int."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be a non-bool int")
+    return value
+
+
+def _read_cells(cells: Iterable[tuple | list], name: str) -> dict:
+    """Consume a single-pass iterable of ``(ix, iy, z, sigma, count)`` cells."""
+    try:
+        cell_iter = iter(cells)
+    except TypeError:
+        raise TypeError(f"{name} must be an iterable of cells") from None
+
+    result: dict[tuple[int, int], tuple[Decimal, Decimal]] = {}
+    for cell in cell_iter:
+        if not isinstance(cell, (tuple, list)) or len(cell) != 5:
+            raise TypeError("each cell must be a tuple or list of 5 items "
+                            "(ix, iy, z, sigma, count)")
+        ix = _as_index(cell[0], "ix")
+        iy = _as_index(cell[1], "iy")
+        dz = _as_decimal(cell[2])
+        dsigma = _as_decimal(cell[3])
+        _as_index(cell[4], "count")
+        if dsigma <= 0:
+            raise ValueError("sigma must be positive")
+        key = (ix, iy)
+        if key in result:
+            raise ValueError(f"duplicate cell index ({ix}, {iy})")
+        result[key] = (dz, dsigma)
+    return result
+
+
+def assess_dem(estimate: Iterable[tuple | list],
+               reference: Iterable[tuple | list]) -> tuple:
+    """Assess an estimated DEM against a reference DEM cell by cell.
+
+    Both inputs are single-pass iterables of 5-item ``(ix, iy, z, sigma,
+    count)`` tuples/lists, where ``ix``, ``iy`` and ``count`` are non-bool
+    ints and ``z`` and ``sigma`` are finite non-bool int/float with
+    ``sigma > 0``. Duplicate ``(ix, iy)`` indices within one input, or
+    differing index sets between the two inputs, raise ``ValueError``.
+
+    Returns a tuple of ``(ix, iy, bias, abs_error, combined_sigma, z_score)``
+    tuples sorted lexicographically by ``(ix, iy)``, where
+    ``bias = estimate.z - reference.z``, ``abs_error = abs(bias)``,
+    ``combined_sigma = sqrt(estimate.sigma**2 + reference.sigma**2)`` and
+    ``z_score = bias / combined_sigma``. Results are computed with Decimal
+    arithmetic, quantized to six decimal places and are independent of input
+    order. Two empty inputs return ``()``.
+    """
+    est_cells = _read_cells(estimate, "estimate")
+    ref_cells = _read_cells(reference, "reference")
+
+    if est_cells.keys() != ref_cells.keys():
+        raise ValueError("estimate and reference must contain the same "
+                         "set of (ix, iy) cell indices")
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        result = []
+        for key in sorted(est_cells):
+            est_z, est_sigma = est_cells[key]
+            ref_z, ref_sigma = ref_cells[key]
+            bias = est_z - ref_z
+            combined = (est_sigma * est_sigma + ref_sigma * ref_sigma).sqrt()
+            result.append((
+                key[0], key[1],
+                _quantize(bias), _quantize(abs(bias)),
+                _quantize(combined), _quantize(bias / combined),
+            ))
+
+    return tuple(result)
+
+
 def build_dsm(points: Iterable[tuple | list], cell_size: int | float = 1.0) -> tuple:
     """Build a 2D DSM keeping the highest-z point of each grid cell.
 
