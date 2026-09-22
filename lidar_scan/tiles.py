@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Iterable
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, localcontext
@@ -294,3 +295,121 @@ def query_tile_region(pyramid: tuple, level: int,
         tile for tile in pyramid[level]
         if tx_min <= tile[0] <= tx_max and ty_min <= tile[1] <= ty_max
     )
+
+
+def _format_z(value: float) -> str:
+    """Format a z bound as a fixed six-decimal JSON number token."""
+    text = f"{value:.6f}"
+    return "0.000000" if text == "-0.000000" else text
+
+
+def encode_tile_pyramid(pyramid: tuple) -> str:
+    """Serialize a tile pyramid to a canonical JSON string.
+
+    ``pyramid`` must be an outer tuple as produced by
+    :func:`build_tile_pyramid`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples sorted
+    lexicographically by ``(tx, ty)`` with no duplicates; ``tx``, ``ty``,
+    ``ix0``, ``iy0``, ``ix1``, ``iy1`` and ``count`` must be non-bool ints and
+    ``zmin``/``zmax`` finite floats.
+
+    The result is compact JSON (no whitespace, ``","``/``":"`` separators,
+    ``ensure_ascii=False``, no NaN/Infinity) whose top level is
+    ``{"levels":[...]}`` with one array per level in level order; tiles keep
+    their input order as 9-item arrays, with integers in decimal notation and
+    ``zmin``/``zmax`` formatted to exactly six decimal places (negative zero
+    becomes ``0.000000``).
+
+    Raises ``TypeError`` if ``pyramid`` is not a tuple and ``ValueError`` for
+    any structural, ordering, duplicate-key or field-type/value problem.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    _validate_pyramid(pyramid)
+
+    parts = ['{"levels":[']
+    for level_index, level_tiles in enumerate(pyramid):
+        if level_index:
+            parts.append(",")
+        parts.append("[")
+        for tile_index, tile in enumerate(level_tiles):
+            if tile_index:
+                parts.append(",")
+            tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count = tile
+            parts.append(
+                f"[{tx},{ty},{ix0},{iy0},{ix1},{iy1},"
+                f"{_format_z(zmin)},{_format_z(zmax)},{count}]"
+            )
+        parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
+def _reject_duplicate_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` that rejects duplicate JSON object keys."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_constant(value: str):
+    """``parse_constant`` hook rejecting NaN/Infinity (non-standard JSON)."""
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def decode_tile_pyramid(text: str) -> tuple:
+    """Parse a canonical JSON string back into a tile pyramid.
+
+    The inverse of :func:`encode_tile_pyramid`: ``text`` must be a ``str``
+    containing compact JSON whose top level is the sole key ``levels`` mapping
+    to an array of level arrays of 9-item tile arrays, with non-bool integer
+    ``tx``, ``ty``, ``ix0``, ``iy0``, ``ix1``, ``iy1`` and ``count`` fields,
+    finite six-decimal ``zmin``/``zmax`` numbers, levels sorted by
+    ``(tx, ty)`` with no duplicates, and canonical formatting overall.
+
+    Returns the outer tuple of level tuples of tile 9-tuples, preserving the
+    original level and tile order. Raises ``TypeError`` if ``text`` is not a
+    string and ``ValueError`` for invalid JSON syntax, top-level keys/types,
+    level/tile shapes, numeric formats or any mismatch against a canonical
+    re-encoding.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        obj = json.loads(text, parse_constant=_reject_constant,
+                         object_pairs_hook=_reject_duplicate_keys)
+    except ValueError as exc:
+        raise ValueError(f"invalid tile pyramid JSON: {exc}") from exc
+
+    if not isinstance(obj, dict) or list(obj.keys()) != ["levels"]:
+        raise ValueError("top-level JSON value must be an object with the "
+                         "single key 'levels'")
+    raw_levels = obj["levels"]
+    if not isinstance(raw_levels, list):
+        raise ValueError("'levels' must be an array")
+
+    levels: list[tuple] = []
+    for raw_level in raw_levels:
+        if not isinstance(raw_level, list):
+            raise ValueError("each pyramid level must be an array of tiles")
+        tiles = []
+        for raw_tile in raw_level:
+            if not isinstance(raw_tile, list) or len(raw_tile) != 9:
+                raise ValueError("each tile must be an array of 9 items "
+                                 "(tx, ty, ix0, iy0, ix1, iy1, "
+                                 "zmin, zmax, count)")
+            tiles.append(tuple(raw_tile))
+        levels.append(tuple(tiles))
+    pyramid = tuple(levels)
+
+    # Reuses the same level/tile, ordering, duplicate and field checks as
+    # encoding (tuple types, non-bool int fields, finite float z bounds).
+    _validate_pyramid(pyramid)
+
+    if encode_tile_pyramid(pyramid) != text:
+        raise ValueError("tile pyramid JSON is not in canonical format")
+    return pyramid
