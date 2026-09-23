@@ -1090,6 +1090,134 @@ def assess_tile_pyramid_stats(estimate: tuple, reference: tuple) -> tuple:
     return tuple(pyramid)
 
 
+def assess_tile_pyramid_windows(estimate: tuple, reference: tuple,
+                                windows: tuple) -> tuple:
+    """Assess matched tiles inside cell-index windows across pyramid levels.
+
+    ``estimate`` and ``reference`` must be outer tuples as produced by
+    :func:`build_tile_pyramid_stats`: each level is a tuple of 11-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)`` sorted
+    strictly by ``(tx, ty)`` with no duplicates, where the first six fields and
+    ``count`` are non-bool ints, the bounds satisfy ``ix0 <= ix1`` and
+    ``iy0 <= iy1``, and the four statistics are finite floats with
+    ``zsigma > 0``.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max``; ``level`` must satisfy
+    ``0 <= level < len(estimate)`` and ``0 <= level < len(reference)``.
+
+    For each window, tiles are matched when the two inputs have a tile with the
+    same ``(tx, ty)`` coordinates and identical ``(ix0, iy0, ix1, iy1)``
+    bounds whose closed cell-index intervals intersect the window
+    (``tile.ix1 >= ix_min and tile.ix0 <= ix_max and tile.iy1 >= iy_min and
+    tile.iy0 <= iy_max``). Tiles present on only one side are not matches; a
+    window with no match gets an empty ``tiles`` tuple. Matched tiles are
+    returned in the estimate level's order as
+    ``(tx, ty, ix0, iy0, ix1, iy1, bias, abs_error, combined_sigma, z_score,
+    count_delta)`` where ``bias = estimate.zmean - reference.zmean``,
+    ``abs_error = abs(bias)``,
+    ``combined_sigma = sqrt(estimate.zsigma**2 + reference.zsigma**2)``,
+    ``z_score = bias / combined_sigma`` and
+    ``count_delta = estimate.count - reference.count``. The four metrics are
+    Decimal computations (precision 50, ``ROUND_HALF_EVEN``, each input
+    converted via ``Decimal(str(v))``) quantized to six decimal places as
+    floats (negative zero normalized).
+
+    Returns a tuple, in ``windows`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` tuples. The inputs are
+    never modified.
+
+    :raises TypeError: ``estimate``/``reference``/``windows`` is not a tuple or
+        a window's container, length or field types are bad.
+    :raises ValueError: the structure, ordering, duplicates, fields, cell
+        bounds or finiteness of either input are bad, same-coordinate tiles
+        disagree on their cell bounds, ``level`` is out of range or the
+        window bounds are inverted.
+    """
+    if not isinstance(estimate, tuple):
+        raise TypeError("estimate must be a tuple")
+    if not isinstance(reference, tuple):
+        raise TypeError("reference must be a tuple")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    _validate_pyramid_stats(estimate)
+    _validate_pyramid_stats(reference)
+
+    for pyramid in (estimate, reference):
+        for level_tiles in pyramid:
+            for tile in level_tiles:
+                if tile[4] < tile[2] or tile[5] < tile[3]:
+                    raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                     "iy0 <= iy1")
+
+    results = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for window in windows:
+            level, ix_min, iy_min, ix_max, iy_max = window
+            if (level < 0 or level >= len(estimate)
+                    or level >= len(reference)):
+                raise ValueError("level out of range")
+            if ix_min > ix_max or iy_min > iy_max:
+                raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                                 "and iy_min <= iy_max")
+
+            ref_by_key = {}
+            for ref_tile in reference[level]:
+                if (ref_tile[4] >= ix_min and ref_tile[2] <= ix_max
+                        and ref_tile[5] >= iy_min and ref_tile[3] <= iy_max):
+                    ref_by_key[(ref_tile[0], ref_tile[1])] = ref_tile
+
+            matched = []
+            for est_tile in estimate[level]:
+                if not (est_tile[4] >= ix_min and est_tile[2] <= ix_max
+                        and est_tile[5] >= iy_min and est_tile[3] <= iy_max):
+                    continue
+                ref_tile = ref_by_key.get((est_tile[0], est_tile[1]))
+                if ref_tile is None:
+                    continue
+                if est_tile[2:6] != ref_tile[2:6]:
+                    raise ValueError(
+                        "tiles with the same (tx, ty) must agree on "
+                        "(ix0, iy0, ix1, iy1)"
+                    )
+
+                est_zmean = Decimal(str(est_tile[8]))
+                ref_zmean = Decimal(str(ref_tile[8]))
+                est_zsigma = Decimal(str(est_tile[9]))
+                ref_zsigma = Decimal(str(ref_tile[9]))
+                bias = est_zmean - ref_zmean
+                combined = (est_zsigma * est_zsigma
+                            + ref_zsigma * ref_zsigma).sqrt()
+                matched.append((
+                    est_tile[0], est_tile[1],
+                    est_tile[2], est_tile[3], est_tile[4], est_tile[5],
+                    _quantize(bias), _quantize(abs(bias)),
+                    _quantize(combined), _quantize(bias / combined),
+                    est_tile[10] - ref_tile[10],
+                ))
+
+            results.append((level, ix_min, iy_min, ix_max, iy_max,
+                            tuple(matched)))
+
+    return tuple(results)
+
+
 def _format_z(value: float) -> str:
     """Format a finite float with exactly six decimals (``-0`` normalized)."""
     text = format(value, ".6f")
