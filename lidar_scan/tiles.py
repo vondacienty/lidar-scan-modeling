@@ -996,6 +996,80 @@ def encode_tile_region(pyramid: tuple, level: int,
     return "".join(parts)
 
 
+def encode_tile_window(pyramid: tuple, level: int,
+                       ix_min: int, iy_min: int,
+                       ix_max: int, iy_max: int) -> str:
+    """Serialize the tiles intersecting a cell-index window at one pyramid level.
+
+    ``pyramid`` must be the outer tuple as produced by
+    :func:`build_tile_pyramid`: each level is a tuple of 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` with the first six
+    fields and ``count`` non-bool ints, ``zmin``/``zmax`` finite floats,
+    ``ix0 <= ix1``/``iy0 <= iy1``, and tiles sorted by ``(tx, ty)`` without
+    duplicates. ``level`` and the four window bounds must be non-bool ints;
+    ``level`` must satisfy ``0 <= level < len(pyramid)`` and the bounds must
+    satisfy ``ix_min <= ix_max`` and ``iy_min <= iy_max``.
+
+    Returns a canonical compact JSON string whose top-level keys, in fixed
+    order, are ``level``, ``ix_min``, ``iy_min``, ``ix_max``, ``iy_max`` and
+    ``tiles``. The first five values echo the arguments; ``tiles`` is the
+    array of nine-value tiles at ``level`` whose closed cell-index intervals
+    intersect the window (``tile.ix1 >= ix_min and tile.ix0 <= ix_max and
+    tile.iy1 >= iy_min and tile.iy0 <= iy_max``), in the level's stored order
+    (``[]`` when nothing matches). Integers are decimal; ``zmin``/``zmax`` use
+    exactly six decimal places (negative zero written as ``0.000000``). The
+    output has no whitespace, ASCII is not escaped and ``NaN``/``Infinity``
+    never appear. The input is never modified.
+
+    :raises TypeError: ``pyramid`` is not a tuple or ``level``/a bound is not
+        a non-bool int.
+    :raises ValueError: ``level`` is out of range, the bounds are inverted or
+        the pyramid's structure, ordering, duplicates, fields or cell bounds
+        are bad.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    for name, value in (("level", level), ("ix_min", ix_min), ("iy_min", iy_min),
+                        ("ix_max", ix_max), ("iy_max", iy_max)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a non-bool int")
+    if level < 0 or level >= len(pyramid):
+        raise ValueError("level out of range")
+    if ix_min > ix_max or iy_min > iy_max:
+        raise ValueError("window bounds must satisfy ix_min <= ix_max and "
+                         "iy_min <= iy_max")
+
+    _validate_pyramid(pyramid)
+
+    for level_tiles in pyramid:
+        for tile in level_tiles:
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+
+    parts = ["{\"level\":", str(level),
+             ",\"ix_min\":", str(ix_min),
+             ",\"iy_min\":", str(iy_min),
+             ",\"ix_max\":", str(ix_max),
+             ",\"iy_max\":", str(iy_max),
+             ",\"tiles\":["]
+    first = True
+    for tile in pyramid[level]:
+        if (tile[4] >= ix_min and tile[2] <= ix_max
+                and tile[5] >= iy_min and tile[3] <= iy_max):
+            if not first:
+                parts.append(",")
+            first = False
+            (tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count) = tile
+            parts.append("[")
+            parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
+                                   str(ix1), str(iy1), _format_z(zmin),
+                                   _format_z(zmax), str(count))))
+            parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
 def _format_region_stats_text(level, tx_min, ty_min, tx_max, ty_max,
                               tiles) -> str:
     """Build the canonical compact JSON text of a stats region document."""
