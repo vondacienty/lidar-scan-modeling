@@ -620,6 +620,109 @@ def aggregate_tile_region_stats(pyramid: tuple, level: int,
             _quantize(zmean), _quantize(zsigma), count)
 
 
+def _validate_tile_stats_region(tiles, name: str) -> None:
+    """Validate a flat tuple of z-statistics tiles, raising ``ValueError``.
+
+    Each tile must be an 11-tuple
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)`` where
+    the first six fields and ``count`` are non-bool ints, the four statistics
+    are finite floats, ``zsigma`` is positive, and the tiles are strictly
+    sorted by ``(tx, ty)`` with no duplicates.
+    """
+    prev_key = None
+    for tile in tiles:
+        if not isinstance(tile, tuple) or len(tile) != 11:
+            raise ValueError(
+                f"each {name} tile must be an 11-tuple "
+                "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, "
+                "count)"
+            )
+        for value in tile[0:6] + (tile[10],):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and count must be "
+                                 "non-bool ints")
+        for value in tile[6:10]:
+            if not isinstance(value, float) or not math.isfinite(value):
+                raise ValueError("zmin, zmax, zmean and zsigma must be finite "
+                                 "floats")
+        if tile[9] <= 0:
+            raise ValueError("zsigma must be positive")
+        key = (tile[0], tile[1])
+        if prev_key is not None and key <= prev_key:
+            raise ValueError(f"{name} tiles must be sorted by (tx, ty) with no "
+                             "duplicate coordinates")
+        prev_key = key
+
+
+def assess_tile_region_stats(estimate: tuple, reference: tuple) -> tuple:
+    """Assess estimated tile-region statistics against reference statistics.
+
+    Both inputs are tuples of 11-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)``
+    strictly sorted by ``(tx, ty)``, where the first six fields and ``count``
+    are non-bool ints, the four statistics are finite floats and ``zsigma`` is
+    positive. The two inputs must agree position-wise on their coordinates and
+    cell bounds ``(tx, ty, ix0, iy0, ix1, iy1)``; the ``count`` fields (and
+    statistic values) may differ.
+
+    Returns a tuple of ``(tx, ty, bias, abs_error, combined_sigma, z_score)``
+    tuples in the inputs' order, where
+    ``bias = estimate.zmean - reference.zmean``, ``abs_error = abs(bias)``,
+    ``combined_sigma = sqrt(estimate.zsigma ** 2 + reference.zsigma ** 2)``
+    and ``z_score = bias / combined_sigma``. The metrics are computed with
+    Decimal arithmetic (precision 50, ``ROUND_HALF_EVEN``, each input converted
+    via ``Decimal(str(v))``), quantized to six decimal places as floats
+    (negative zero normalized). Two empty inputs return ``()``. The inputs are
+    never modified.
+
+    :raises TypeError: ``estimate`` or ``reference`` is not a tuple.
+    :raises ValueError: the structure, ordering, duplicates, fields or the
+        coordinate/bound correspondence between the two inputs are bad.
+    """
+    if not isinstance(estimate, tuple):
+        raise TypeError("estimate must be a tuple")
+    if not isinstance(reference, tuple):
+        raise TypeError("reference must be a tuple")
+
+    _validate_tile_stats_region(estimate, "estimate")
+    _validate_tile_stats_region(reference, "reference")
+
+    if len(estimate) != len(reference):
+        raise ValueError("estimate and reference must contain the same tiles "
+                         "in the same order")
+
+    if not estimate:
+        return ()
+
+    for est_tile, ref_tile in zip(estimate, reference):
+        if est_tile[0:6] != ref_tile[0:6]:
+            raise ValueError(
+                "estimate and reference tiles must agree on "
+                "(tx, ty, ix0, iy0, ix1, iy1)"
+            )
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        result = []
+        for est_tile, ref_tile in zip(estimate, reference):
+            est_mean = Decimal(str(est_tile[8]))
+            ref_mean = Decimal(str(ref_tile[8]))
+            est_sigma = Decimal(str(est_tile[9]))
+            ref_sigma = Decimal(str(ref_tile[9]))
+            bias = est_mean - ref_mean
+            combined = (est_sigma * est_sigma
+                        + ref_sigma * ref_sigma).sqrt()
+            result.append((
+                est_tile[0], est_tile[1],
+                _quantize(bias), _quantize(abs(bias)),
+                _quantize(combined), _quantize(bias / combined),
+            ))
+
+    return tuple(result)
+
+
 def _format_z(value: float) -> str:
     """Format a finite float with exactly six decimals (``-0`` normalized)."""
     text = format(value, ".6f")
