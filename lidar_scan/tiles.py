@@ -885,6 +885,80 @@ def assess_tile_region_stats(estimate: tuple, reference: tuple) -> tuple:
     return tuple(result)
 
 
+def assess_tile_window_stats(estimate: tuple, reference: tuple) -> tuple:
+    """Assess estimated tile-window statistics against a reference, tile by tile.
+
+    Both inputs are tuples of 11-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)`` sorted
+    strictly by ``(tx, ty)`` with no duplicates, where ``tx``, ``ty``, the four
+    cell bounds and ``count`` are non-bool ints, the bounds satisfy
+    ``ix0 <= ix1`` and ``iy0 <= iy1``, and ``zmin``, ``zmax``, ``zmean`` and
+    ``zsigma`` are finite floats with ``zsigma > 0``. The two inputs must
+    contain the same ``(tx, ty)`` coordinates with identical
+    ``(ix0, iy0, ix1, iy1)`` bounds (their ``count`` values may differ);
+    otherwise ``ValueError`` is raised.
+
+    Returns a tuple, in the inputs' order, of
+    ``(tx, ty, bias, abs_error, combined_sigma, z_score)`` tuples where
+    ``bias = estimate.zmean - reference.zmean``, ``abs_error = abs(bias)``,
+    ``combined_sigma = sqrt(estimate.zsigma**2 + reference.zsigma**2)`` and
+    ``z_score = bias / combined_sigma``. The metrics are Decimal computations
+    (precision 50, ``ROUND_HALF_EVEN``, each input converted via
+    ``Decimal(str(v))``) quantized to six decimal places as floats (negative
+    zero normalized). Two empty inputs return ``()``. The inputs are never
+    modified.
+
+    :raises TypeError: ``estimate`` or ``reference`` is not a tuple.
+    :raises ValueError: the structure, ordering, duplicates, fields, cell
+        bounds, coordinate sets or shared cell bounds of either input are bad.
+    """
+    if not isinstance(estimate, tuple):
+        raise TypeError("estimate must be a tuple")
+    if not isinstance(reference, tuple):
+        raise TypeError("reference must be a tuple")
+
+    _validate_tile_region_stats(estimate)
+    _validate_tile_region_stats(reference)
+
+    for tiles in (estimate, reference):
+        for tile in tiles:
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+
+    if len(estimate) != len(reference):
+        raise ValueError("estimate and reference must contain the same "
+                         "(tx, ty) tile coordinates")
+    for est_tile, ref_tile in zip(estimate, reference):
+        if est_tile[0:2] != ref_tile[0:2]:
+            raise ValueError("estimate and reference must contain the same "
+                             "(tx, ty) tile coordinates")
+        if est_tile[2:6] != ref_tile[2:6]:
+            raise ValueError("tiles with the same (tx, ty) must agree on "
+                             "(ix0, iy0, ix1, iy1)")
+
+    result = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for est_tile, ref_tile in zip(estimate, reference):
+            est_zmean = Decimal(str(est_tile[8]))
+            ref_zmean = Decimal(str(ref_tile[8]))
+            est_zsigma = Decimal(str(est_tile[9]))
+            ref_zsigma = Decimal(str(ref_tile[9]))
+            bias = est_zmean - ref_zmean
+            combined = (est_zsigma * est_zsigma
+                        + ref_zsigma * ref_zsigma).sqrt()
+            result.append((
+                est_tile[0], est_tile[1],
+                _quantize(bias), _quantize(abs(bias)),
+                _quantize(combined), _quantize(bias / combined),
+            ))
+
+    return tuple(result)
+
+
 def _format_z(value: float) -> str:
     """Format a finite float with exactly six decimals (``-0`` normalized)."""
     text = format(value, ".6f")
