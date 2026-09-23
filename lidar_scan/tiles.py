@@ -1896,6 +1896,97 @@ def encode_tile_pyramid_stats(pyramid: tuple) -> str:
     return "".join(parts)
 
 
+def _validate_pyramid_assessment(assessment) -> None:
+    """Validate the outer tuple returned by :func:`assess_tile_pyramid_stats`.
+
+    Every level must be a tuple of strict 11-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, bias, abs_error, combined_sigma, z_score,
+    count_delta)``: the first six fields and ``count_delta`` are non-bool ints
+    with ``ix0 <= ix1`` and ``iy0 <= iy1``; the four metrics are finite floats
+    with ``combined_sigma > 0``; and the tiles are sorted strictly by
+    ``(tx, ty)`` with no duplicates.
+    """
+    for level_tiles in assessment:
+        if not isinstance(level_tiles, tuple):
+            raise ValueError("each assessment level must be a tuple")
+        prev_key = None
+        for tile in level_tiles:
+            if not isinstance(tile, tuple) or len(tile) != 11:
+                raise ValueError(
+                    "each tile must be an 11-tuple "
+                    "(tx, ty, ix0, iy0, ix1, iy1, bias, abs_error, "
+                    "combined_sigma, z_score, count_delta)"
+                )
+            for value in tile[0:6] + (tile[10],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and "
+                                     "count_delta must be non-bool ints")
+            for value in tile[6:10]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("bias, abs_error, combined_sigma and "
+                                     "z_score must be finite floats")
+            if tile[8] <= 0:
+                raise ValueError("combined_sigma must be positive")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("each assessment level must be sorted by "
+                                 "(tx, ty) with no duplicate coordinates")
+            prev_key = key
+
+
+def encode_tile_pyramid_assessment(assessment: tuple) -> str:
+    """Serialize the result of :func:`assess_tile_pyramid_stats`.
+
+    ``assessment`` must be the outer tuple returned by
+    :func:`assess_tile_pyramid_stats`: each level is a tuple of 11-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, bias, abs_error, combined_sigma, z_score,
+    count_delta)`` with tiles sorted strictly by ``(tx, ty)`` and no
+    duplicates, where the first six fields and ``count_delta`` are non-bool
+    ints satisfying ``ix0 <= ix1`` and ``iy0 <= iy1``, and ``bias``,
+    ``abs_error``, ``combined_sigma`` and ``z_score`` are finite floats with
+    ``combined_sigma > 0``.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``levels``: an array (in level order) of arrays of tile arrays in the
+    tiles' input order. Integers are decimal; the four metrics use exactly six
+    decimal places (negative zero written as ``0.000000``). The output has no
+    whitespace, ASCII is not escaped and ``NaN``/``Infinity`` never appear. An
+    empty assessment encodes as ``{"levels":[]}``. The input is never modified.
+
+    :raises TypeError: ``assessment`` is not a tuple.
+    :raises ValueError: the structure, ordering, duplicates, fields or cell
+        bounds are bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    _validate_pyramid_assessment(assessment)
+
+    parts = ['{"levels":[']
+    for level_index, level_tiles in enumerate(assessment):
+        if level_index:
+            parts.append(",")
+        parts.append("[")
+        for tile_index, tile in enumerate(level_tiles):
+            if tile_index:
+                parts.append(",")
+            (tx, ty, ix0, iy0, ix1, iy1,
+             bias, abs_error, combined_sigma, z_score,
+             count_delta) = tile
+            parts.append("[")
+            parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
+                                   str(ix1), str(iy1), _format_z(bias),
+                                   _format_z(abs_error),
+                                   _format_z(combined_sigma),
+                                   _format_z(z_score), str(count_delta))))
+            parts.append("]")
+        parts.append("]")
+    parts.append(']}')
+    return "".join(parts)
+
+
 def decode_tile_pyramid_stats(text: str) -> tuple:
     """Deserialize canonical JSON produced by :func:`encode_tile_pyramid_stats`.
 
