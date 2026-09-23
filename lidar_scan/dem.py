@@ -248,3 +248,100 @@ def build_dsm(points: Iterable[tuple | list], cell_size: int | float = 1.0) -> t
 
     result.sort(key=lambda item: (item[0], item[1]))
     return tuple(result)
+
+
+def _read_dem_member(dem) -> list:
+    """Validate one DEM tuple as produced by :func:`build_dem`.
+
+    Returns its cells as ``((ix, iy), Decimal(z), Decimal(sigma), count)``.
+    Any structural, ordering or field violation raises ``ValueError``.
+    """
+    if not isinstance(dem, tuple):
+        raise ValueError("each DEM must be a tuple of (ix, iy, z, sigma, count) cells")
+
+    cells = []
+    previous = None
+    for cell in dem:
+        if not isinstance(cell, tuple) or len(cell) != 5:
+            raise ValueError("each cell must be a 5-tuple (ix, iy, z, sigma, count)")
+        ix, iy, z, sigma, count = cell
+
+        if isinstance(ix, bool) or not isinstance(ix, int):
+            raise ValueError("ix must be a non-bool int")
+        if isinstance(iy, bool) or not isinstance(iy, int):
+            raise ValueError("iy must be a non-bool int")
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError("count must be a non-bool int")
+        if not isinstance(z, float) or not math.isfinite(z):
+            raise ValueError("z must be a finite float")
+        if not isinstance(sigma, float) or not math.isfinite(sigma):
+            raise ValueError("sigma must be a finite float")
+        if sigma <= 0:
+            raise ValueError("sigma must be positive")
+
+        key = (ix, iy)
+        if previous is not None and key <= previous:
+            if key == previous:
+                raise ValueError(f"duplicate cell index ({ix}, {iy})")
+            raise ValueError("cells must be strictly increasing by (ix, iy)")
+        previous = key
+
+        cells.append((key, Decimal(str(z)), Decimal(str(sigma)), count))
+    return cells
+
+
+def merge_dems(dems: tuple) -> tuple:
+    """Merge DEM tuples over the union of their grid coordinates.
+
+    ``dems`` must be a tuple (possibly empty) of DEM tuples as produced by
+    :func:`build_dem`; each member may itself be empty. Every cell must be a
+    5-tuple ``(ix, iy, z, sigma, count)``, strictly increasing by ``(ix, iy)``
+    with no duplicates, where ``ix``, ``iy`` and ``count`` are non-bool ints
+    and ``z`` and ``sigma`` are finite floats with ``sigma > 0``.
+
+    Coordinates absent from a member are simply absent from that member's
+    contribution. For each output coordinate, ``w = 1 / sigma**2`` of each
+    contributing cell, ``z = sum(w * z) / sum(w)``, ``sigma = sqrt(1 / sum(w))``
+    and ``count`` is the exact integer sum of the contributing counts.
+
+    Returns a tuple of ``(ix, iy, z, sigma, count)`` tuples sorted
+    lexicographically by ``(ix, iy)``; the union of no coordinates returns
+    ``()``. Decimal arithmetic uses ``Decimal(str(v))`` at precision 50 with
+    ROUND_HALF_EVEN; weights and weighted terms are summed in ascending
+    Decimal order, so the result is independent of the order of ``dems`` and
+    of their members. Outputs ``z`` and ``sigma`` are quantized to six decimal
+    places as floats with negative zero normalized. Inputs are never modified.
+    """
+    if not isinstance(dems, tuple):
+        raise TypeError("dems must be a tuple of DEM tuples")
+
+    merged: dict[tuple[int, int], list] = {}
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for dem in dems:
+            for key, dz, dsigma, count in _read_dem_member(dem):
+                weight = Decimal(1) / (dsigma * dsigma)
+                entry = merged.get(key)
+                if entry is None:
+                    entry = [0, [], []]
+                    merged[key] = entry
+                entry[0] += count
+                entry[1].append(weight)
+                entry[2].append(weight * dz)
+
+        result = []
+        for key in sorted(merged):
+            count, weights, weighted_zs = merged[key]
+            sum_w = _sorted_sum(weights)
+            z = _sorted_sum(weighted_zs) / sum_w
+            sigma = (Decimal(1) / sum_w).sqrt()
+            result.append((
+                key[0], key[1],
+                _quantize(z), _quantize(sigma),
+                count,
+            ))
+
+    return tuple(result)

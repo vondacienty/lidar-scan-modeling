@@ -33,6 +33,7 @@ lidar-scan-modeling --help     # 打印用法
 - Python 包 `lidar_scan`，其 `__version__` 为当前版本号
 - `lidar_scan.voxel.fuse_voxels(points, voxel_size=1.0)`：按体素融合激光雷达点
 - `lidar_scan.chm.build_chm(points, ground, cell_size=1.0)`：基于地面格网构建冠层高度模型
+- `lidar_scan.dem.merge_dems(dems)`：按坐标并集合并多个 DEM
 - `lidar_scan.las.iter_las(path)`：分块流式读取 LAS/LAZ 激光雷达文件
 - `lidar_scan.ply.iter_ply(path, chunk_size=65536)`：分块流式读取 PLY 激光雷达文件
 - `lidar_scan.e57.iter_e57(path, chunk_size=65536)`：分块流式读取 E57 激光雷达文件
@@ -69,6 +70,22 @@ from lidar_scan import build_chm
 
 build_chm([(0.2, 0.2, 3.0, 10.0, 0.5)], ground=[(0, 0, 1.0, 0.5, 4)])
 # ((0, 0, 2.0, 0.707107, 1),)
+```
+
+### `merge_dems`
+
+- `dems` 必须是外层 tuple（可为空 `()`），非 tuple 抛 `TypeError`；每个成员必须是 `build_dem` 生成的 tuple（自身也可为空）
+- 每个成员的每格必须是严格五元组 `(ix, iy, z, sigma, count)`，按 `(ix, iy)` 严格递增且无重复；`ix`、`iy`、`count` 为非 bool int，`z`、`sigma` 为有限 float 且 `sigma > 0`
+- 成员或格结构、顺序、字段非法均抛 `ValueError`
+- 按所有成员坐标的并集合并，某成员缺失的坐标仍在输出中；同坐标令 `w = 1/sigma²`，`z = sum(w*z)/sum(w)`，`sigma = sqrt(1/sum(w))`，`count` 为各 count 的精确整数和
+- 计算使用 `Decimal(str(v))`（精度 50、ROUND_HALF_EVEN），权重及加权项按 Decimal 升序累加，结果与 `dems` 及成员输入顺序无关；`z`/`sigma` 量化到六位小数后转 float，负零归一为正零
+- 返回按 `(ix, iy)` 字典序排列的 tuple，空并集返回 `()`；不修改任何输入
+
+```python
+from lidar_scan import merge_dems
+
+merge_dems(((0, 0, 2.0, 1.0, 3),), ((0, 0, 4.0, 1.0, 1),))
+# ((0, 0, 3.0, 0.707107, 4),)
 ```
 
 ### `iter_las`
