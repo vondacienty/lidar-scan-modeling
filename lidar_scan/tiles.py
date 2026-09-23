@@ -2598,3 +2598,149 @@ def update_tile_pyramid_stats(pyramid: tuple,
             new_pyramid.append(tuple(level_tiles))
 
     return merge_tile_pyramid_stats((pyramid, tuple(new_pyramid)))
+
+
+def update_tile_pyramid(pyramid: tuple,
+                        points: Iterable[tuple | list],
+                        cell_size: int | float = 1.0,
+                        tile_cells: int = 256,
+                        levels: int = 3) -> tuple:
+    """Add points to a tile pyramid.
+
+    Equivalent to
+    ``merge_tile_pyramids((pyramid, build_tile_pyramid(points, cell_size, tile_cells, levels)))``
+    but ``points`` is consumed in a single pass: the new points are aggregated
+    into a pyramid exactly as in :func:`build_tile_pyramid` and the
+    combination is then performed as in :func:`merge_tile_pyramids`.
+
+    ``pyramid`` must be an outer tuple as produced by
+    :func:`build_tile_pyramid` with exactly ``levels`` levels: each level is a
+    tuple of ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples
+    sorted lexicographically by ``(tx, ty)`` (with no duplicate coordinates),
+    where the first six fields and ``count`` are non-bool ints and
+    ``zmin``/``zmax`` are finite floats. At level ``l`` every tile's bounds
+    must be ``(tx * N, ty * N, (tx + 1) * N - 1, (ty + 1) * N - 1)`` where
+    ``N = tile_cells * 2 ** l``.
+
+    Each point is a 5-item ``(x, y, z, intensity, sigma)`` tuple/list of
+    finite non-bool ints/floats with ``sigma > 0``; cell indices are
+    ``ix = floor(x / cell_size)``, ``iy = floor(y / cell_size)`` and at level
+    ``l`` (``0 <= l < levels``) each tile covers
+    ``N = tile_cells * 2 ** l`` cells per axis, so ``tx = ix // N`` and
+    ``ty = iy // N``.
+
+    Returns the updated pyramid (a new tuple; the input pyramid and its tiles
+    are never modified), with the same structure, ordering and fields as
+    :func:`build_tile_pyramid`. An empty ``points`` iterable returns the
+    original ``pyramid`` unchanged.
+
+    :raises TypeError: ``pyramid`` is not a tuple, ``points`` is not iterable,
+        ``cell_size``/``tile_cells``/``levels`` have the wrong type, or a
+        point's container/length/fields have the wrong type.
+    :raises ValueError: a parameter is non-finite or non-positive, the number
+        of levels does not match ``pyramid``, the pyramid's structure,
+        ordering, duplicates, fields or cell bounds are bad, a point field is
+        non-finite or ``sigma <= 0``, or same-coordinate tiles disagree on
+        their cell bounds.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    if isinstance(cell_size, bool) or not isinstance(cell_size, _NUMERIC_TYPES):
+        raise TypeError("cell_size must be a non-bool int or float")
+    if isinstance(cell_size, float) and not math.isfinite(cell_size):
+        raise ValueError("cell_size must be finite")
+    if isinstance(tile_cells, bool) or not isinstance(tile_cells, int):
+        raise TypeError("tile_cells must be a non-bool int")
+    if tile_cells <= 0:
+        raise ValueError("tile_cells must be positive")
+    if isinstance(levels, bool) or not isinstance(levels, int):
+        raise TypeError("levels must be a non-bool int")
+    if levels <= 0:
+        raise ValueError("levels must be positive")
+    _validate_pyramid(pyramid)
+    if len(pyramid) != levels:
+        raise ValueError("all pyramids must have the same number of levels")
+    for level, level_tiles in enumerate(pyramid):
+        width = tile_cells * 2 ** level
+        for tile in level_tiles:
+            tx, ty, ix0, iy0, ix1, iy1 = tile[0:6]
+            if (ix0, iy0, ix1, iy1) != (
+                tx * width, ty * width,
+                (tx + 1) * width - 1, (ty + 1) * width - 1,
+            ):
+                raise ValueError(
+                    "tile bounds must be (tx * N, ty * N, (tx + 1) * N - 1, "
+                    "(ty + 1) * N - 1) with N = tile_cells * 2 ** level"
+                )
+
+    # Single pass over ``points``: iter() is called exactly once, len() is
+    # never called on it, and every level is aggregated simultaneously. The
+    # new points are accumulated exactly as in build_tile_pyramid and the
+    # resulting pyramid is then combined with ``pyramid`` via
+    # merge_tile_pyramids, guaranteeing identical results.
+    point_iter = iter(points)
+
+    widths = [tile_cells * 2 ** level for level in range(levels)]
+    tiles_per_level: list[dict[tuple[int, int], list]] = [
+        {} for _ in range(levels)
+    ]
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        dcell = Decimal(str(cell_size))
+        if dcell <= 0:
+            raise ValueError("cell_size must be positive")
+
+        saw_point = False
+        for point in point_iter:
+            if not isinstance(point, (tuple, list)) or len(point) != 5:
+                raise TypeError("each point must be a tuple or list of 5 items "
+                                "(x, y, z, intensity, sigma)")
+
+            dx = _as_decimal(point[0])
+            dy = _as_decimal(point[1])
+            dz = _as_decimal(point[2])
+            _as_decimal(point[3])
+            dsigma = _as_decimal(point[4])
+            if dsigma <= 0:
+                raise ValueError("sigma must be positive")
+
+            ix = int((dx / dcell).to_integral_value(rounding=ROUND_FLOOR))
+            iy = int((dy / dcell).to_integral_value(rounding=ROUND_FLOOR))
+
+            for level, width in enumerate(widths):
+                key = (ix // width, iy // width)
+                tiles = tiles_per_level[level]
+                entry = tiles.get(key)
+                if entry is None:
+                    tiles[key] = [dz, dz, 1]
+                else:
+                    if dz < entry[0]:
+                        entry[0] = dz
+                    if dz > entry[1]:
+                        entry[1] = dz
+                    entry[2] += 1
+            saw_point = True
+
+        if not saw_point:
+            return pyramid
+
+        new_pyramid = []
+        for width, tiles in zip(widths, tiles_per_level):
+            level_tiles = []
+            for (tx, ty), (zmin, zmax, count) in tiles.items():
+                ix0 = tx * width
+                iy0 = ty * width
+                level_tiles.append((
+                    tx, ty,
+                    ix0, iy0,
+                    ix0 + width - 1, iy0 + width - 1,
+                    _quantize(zmin), _quantize(zmax),
+                    count,
+                ))
+            level_tiles.sort(key=lambda item: (item[0], item[1]))
+            new_pyramid.append(tuple(level_tiles))
+
+    return merge_tile_pyramids((pyramid, tuple(new_pyramid)))
