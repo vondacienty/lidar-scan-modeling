@@ -208,6 +208,171 @@ def build_tile_pyramid(points: Iterable[tuple | list],
     return tuple(pyramid)
 
 
+def window_tiles(points: Iterable[tuple | list],
+                 windows: tuple,
+                 cell_size: int | float = 1.0,
+                 tile_cells: int = 256,
+                 levels: int = 3) -> tuple:
+    """Aggregate points into the tiles intersected by cell-index windows.
+
+    Each point is a 5-item ``(x, y, z, intensity, sigma)`` tuple/list. Cell
+    indices are ``ix = floor(x / cell_size)``, ``iy = floor(y / cell_size)``.
+    At level ``l`` (``0 <= l < levels``) each tile covers
+    ``N = tile_cells * 2 ** l`` cells per axis, so ``tx = ix // N`` and
+    ``ty = iy // N``; level 0 matches :func:`build_tile_index`.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max`` and
+    ``0 <= level < levels``. A tile matches a window when its closed
+    cell-index intervals intersect it: ``tile.ix1 >= ix_min and
+    tile.ix0 <= ix_max and tile.iy1 >= iy_min and tile.iy0 <= iy_max``; for a
+    level of width ``N`` this is exactly
+    ``ix_min // N <= tx <= ix_max // N`` and
+    ``iy_min // N <= ty <= iy_max // N``. Windows at the same level share
+    their aggregation, so a tile hit by several windows is aggregated once.
+
+    ``points`` is consumed in a single pass aggregating only the levels and
+    tiles the windows cover; each matched ``(tx, ty)`` accumulates
+    ``zmin``/``zmax``/``count``. The z values are Decimal computations
+    (precision 50, ``ROUND_HALF_EVEN``, each input converted via
+    ``Decimal(str(v))``); ``zmin``/``zmax`` are quantized to six decimal
+    places as floats (negative zero normalized).
+
+    Returns a tuple, in ``windows`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` tuples where ``tiles``
+    is a tuple of ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)``
+    9-tuples sorted lexicographically by ``(tx, ty)``; a window with no
+    matched tiles (and every window when ``points`` is empty) gets
+    ``tiles == ()``, and empty ``windows`` returns ``()``.
+
+    :raises TypeError: ``points`` is not iterable, ``windows`` is not a tuple,
+        a window's container/length/field types are bad, a point's
+        container/length/fields have the wrong type, or
+        ``cell_size``/``tile_cells``/``levels`` have the wrong type.
+    :raises ValueError: a parameter is non-finite or non-positive, ``level``
+        is out of range, the window bounds are inverted, or a point field is
+        non-finite or ``sigma <= 0``.
+    """
+    if isinstance(cell_size, bool) or not isinstance(cell_size, _NUMERIC_TYPES):
+        raise TypeError("cell_size must be a non-bool int or float")
+    if isinstance(cell_size, float) and not math.isfinite(cell_size):
+        raise ValueError("cell_size must be finite")
+    if isinstance(tile_cells, bool) or not isinstance(tile_cells, int):
+        raise TypeError("tile_cells must be a non-bool int")
+    if tile_cells <= 0:
+        raise ValueError("tile_cells must be positive")
+    if isinstance(levels, bool) or not isinstance(levels, int):
+        raise TypeError("levels must be a non-bool int")
+    if levels <= 0:
+        raise ValueError("levels must be positive")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    field_names = ("level", "ix_min", "iy_min", "ix_max", "iy_max")
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(field_names, window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    widths = [tile_cells * 2 ** level for level in range(levels)]
+
+    # Per active level, the windows as inclusive tile-index rectangles plus
+    # the tiles actually hit by points (a shared union across the windows).
+    active: dict[int, dict] = {}
+    parsed_windows = []
+    for window in windows:
+        level, ix_min, iy_min, ix_max, iy_max = window
+        if level < 0 or level >= levels:
+            raise ValueError("level out of range")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+
+        width = widths[level]
+        parsed_windows.append((level, ix_min, iy_min, ix_max, iy_max))
+        state = active.get(level)
+        if state is None:
+            state = {"rects": [], "hits": {}}
+            active[level] = state
+        state["rects"].append((ix_min // width, ix_max // width,
+                               iy_min // width, iy_max // width))
+
+    # Single pass over ``points``: iter() is called exactly once and only the
+    # levels referenced by ``windows`` are aggregated.
+    point_iter = iter(points)
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        dcell = Decimal(str(cell_size))
+        if dcell <= 0:
+            raise ValueError("cell_size must be positive")
+
+        for point in point_iter:
+            if not isinstance(point, (tuple, list)) or len(point) != 5:
+                raise TypeError("each point must be a tuple or list of 5 items "
+                                "(x, y, z, intensity, sigma)")
+
+            dx = _as_decimal(point[0])
+            dy = _as_decimal(point[1])
+            dz = _as_decimal(point[2])
+            _as_decimal(point[3])
+            dsigma = _as_decimal(point[4])
+            if dsigma <= 0:
+                raise ValueError("sigma must be positive")
+
+            ix = int((dx / dcell).to_integral_value(rounding=ROUND_FLOOR))
+            iy = int((dy / dcell).to_integral_value(rounding=ROUND_FLOOR))
+
+            for level, state in active.items():
+                width = widths[level]
+                key = (ix // width, iy // width)
+                hits = state["hits"]
+                entry = hits.get(key)
+                if entry is None:
+                    tx, ty = key
+                    for tx_lo, tx_hi, ty_lo, ty_hi in state["rects"]:
+                        if tx_lo <= tx <= tx_hi and ty_lo <= ty <= ty_hi:
+                            hits[key] = [dz, dz, 1]
+                            break
+                else:
+                    if dz < entry[0]:
+                        entry[0] = dz
+                    if dz > entry[1]:
+                        entry[1] = dz
+                    entry[2] += 1
+
+        results = []
+        for level, ix_min, iy_min, ix_max, iy_max in parsed_windows:
+            width = widths[level]
+            tx_lo, tx_hi = ix_min // width, ix_max // width
+            ty_lo, ty_hi = iy_min // width, iy_max // width
+            matched = []
+            for (tx, ty), (zmin, zmax, count) in active[level]["hits"].items():
+                if tx_lo <= tx <= tx_hi and ty_lo <= ty <= ty_hi:
+                    ix0 = tx * width
+                    iy0 = ty * width
+                    matched.append((
+                        tx, ty,
+                        ix0, iy0,
+                        ix0 + width - 1, iy0 + width - 1,
+                        _quantize(zmin), _quantize(zmax),
+                        count,
+                    ))
+            matched.sort(key=lambda item: (item[0], item[1]))
+            results.append((level, ix_min, iy_min, ix_max, iy_max,
+                            tuple(matched)))
+
+    return tuple(results)
+
+
 def _sorted_sum(terms: list) -> Decimal:
     """Add Decimal terms in ascending numeric order.
 
