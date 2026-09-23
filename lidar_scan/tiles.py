@@ -2053,6 +2053,46 @@ def decode_tile_pyramid_assessment(text: str) -> tuple:
     return assessment
 
 
+def query_tile_pyramid_assessment(assessment: tuple, level: int,
+                                  tx: int, ty: int) -> tuple | None:
+    """Look up the tile ``(tx, ty)`` at ``level`` of a pyramid assessment.
+
+    ``assessment`` must be an outer tuple as returned by
+    :func:`assess_tile_pyramid_stats`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, bias, abs_error, combined_sigma, z_score,
+    count_delta)`` 11-tuples sorted lexicographically by ``(tx, ty)`` with no
+    duplicates, where the first six fields and ``count_delta`` are non-bool
+    ints satisfying ``ix0 <= ix1`` and ``iy0 <= iy1``, and ``bias``,
+    ``abs_error``, ``combined_sigma`` and ``z_score`` are finite floats with
+    ``combined_sigma > 0``. ``level``, ``tx`` and ``ty`` must be non-bool ints
+    and ``level`` must satisfy ``0 <= level < len(assessment)``.
+
+    Returns the stored 11-tuple for the exact ``(tx, ty)`` match at that
+    level, or ``None`` if no such tile exists. The input is never modified or
+    reordered.
+
+    :raises TypeError: ``assessment`` is not a tuple or ``level``/``tx``/``ty``
+        is not a non-bool int.
+    :raises ValueError: ``level`` is out of range or the assessment's
+        structure, ordering, duplicates, fields, cell bounds or finiteness are
+        bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    for name, value in (("level", level), ("tx", tx), ("ty", ty)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a non-bool int")
+    if level < 0 or level >= len(assessment):
+        raise ValueError("level out of range")
+
+    _validate_pyramid_assessment(assessment)
+
+    for tile in assessment[level]:
+        if tile[0] == tx and tile[1] == ty:
+            return tile
+    return None
+
+
 def decode_tile_pyramid_stats(text: str) -> tuple:
     """Deserialize canonical JSON produced by :func:`encode_tile_pyramid_stats`.
 
