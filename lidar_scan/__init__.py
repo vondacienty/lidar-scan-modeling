@@ -4,7 +4,7 @@ __version__ = "0.1.0"
 
 from . import chm, dem, e57, las, ply, tiles, voxel
 from .chm import build_chm
-from .dem import assess_dem, build_dem, build_dsm
+from .dem import assess_dem, build_dem, build_dsm, merge_dems
 from .e57 import iter_e57
 from .las import iter_las
 from .ply import iter_ply
@@ -35,6 +35,7 @@ __all__ = ["__version__", "chm", "dem", "e57", "las", "ply", "tiles", "voxel",
            "encode_tile_pyramid_stats", "encode_tile_region",
            "encode_tile_region_stats", "encode_tile_window_stats",
            "fuse_voxels",
+           "merge_dems",
            "merge_tile_pyramid_stats", "merge_tile_pyramids",
            "query_tile_pyramid", "query_tile_pyramid_stats",
            "query_tile_region", "query_tile_region_stats",

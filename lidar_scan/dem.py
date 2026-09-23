@@ -113,6 +113,97 @@ def _as_index(value, name: str) -> int:
     return value
 
 
+def merge_dems(dems: tuple) -> tuple:
+    """Merge DEM tuples produced by :func:`build_dem` over the union of cells.
+
+    ``dems`` must be a tuple (possibly empty) of DEM tuples, each as returned
+    by :func:`build_dem` (also possibly empty). Every cell must be a 5-tuple
+    ``(ix, iy, z, sigma, count)`` sorted strictly increasingly by ``(ix, iy)``
+    with no duplicates; ``ix``, ``iy`` and ``count`` must be non-bool ints and
+    ``z`` and ``sigma`` must be finite floats with ``sigma > 0``. A non-tuple
+    ``dems`` raises ``TypeError``; malformed members or cells, non-increasing
+    indices or invalid fields raise ``ValueError``.
+
+    Cells are combined over the union of ``(ix, iy)`` coordinates, so a
+    coordinate missing from some members is still emitted. For coincident
+    coordinates the weight is ``w = 1 / sigma**2``, the merged z is
+    ``sum(w * z) / sum(w)``, the merged sigma is ``sqrt(1 / sum(w))`` and the
+    merged count is the exact integer sum of the member counts. Decimal
+    arithmetic (precision 50, ROUND_HALF_EVEN) accumulates weights and
+    weighted terms in ascending value order, so results are independent of
+    the order of ``dems`` and their members.
+
+    Returns a tuple of ``(ix, iy, z, sigma, count)`` tuples sorted
+    lexicographically by ``(ix, iy)``, with ``z`` and ``sigma`` quantized to
+    six decimal places; an empty union returns ``()``. Inputs are not
+    modified.
+    """
+    if not isinstance(dems, tuple):
+        raise TypeError("dems must be a tuple of DEM tuples")
+
+    groups: dict[tuple[int, int], list] = {}
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for member in dems:
+            if not isinstance(member, tuple):
+                raise ValueError("each DEM must be a tuple of "
+                                 "(ix, iy, z, sigma, count) cells")
+
+            previous_key = None
+            for cell in member:
+                if not isinstance(cell, tuple) or len(cell) != 5:
+                    raise ValueError("each cell must be a 5-tuple "
+                                     "(ix, iy, z, sigma, count)")
+                ix, iy, z, sigma, count = cell
+                if isinstance(ix, bool) or not isinstance(ix, int):
+                    raise ValueError("ix must be a non-bool int")
+                if isinstance(iy, bool) or not isinstance(iy, int):
+                    raise ValueError("iy must be a non-bool int")
+                if not isinstance(z, float) or not math.isfinite(z):
+                    raise ValueError("z must be a finite float")
+                if not isinstance(sigma, float) or not math.isfinite(sigma):
+                    raise ValueError("sigma must be a finite float")
+                if sigma <= 0.0:
+                    raise ValueError("sigma must be positive")
+                if isinstance(count, bool) or not isinstance(count, int):
+                    raise ValueError("count must be a non-bool int")
+
+                key = (ix, iy)
+                if previous_key is not None and key <= previous_key:
+                    raise ValueError("cells must be sorted strictly increasingly "
+                                     "by (ix, iy) with no duplicates")
+                previous_key = key
+
+                dz = Decimal(str(z))
+                dsigma = Decimal(str(sigma))
+                weight = Decimal(1) / (dsigma * dsigma)
+
+                entry = groups.get(key)
+                if entry is None:
+                    entry = [0, [], []]
+                    groups[key] = entry
+                entry[0] += count
+                entry[1].append(weight)
+                entry[2].append(weight * dz)
+
+        result = []
+        for key, (total_count, weights, weighted_zs) in groups.items():
+            sum_w = _sorted_sum(weights)
+            merged_z = _sorted_sum(weighted_zs) / sum_w
+            merged_sigma = (Decimal(1) / sum_w).sqrt()
+            result.append((
+                key[0], key[1],
+                _quantize(merged_z), _quantize(merged_sigma),
+                total_count,
+            ))
+
+    result.sort(key=lambda item: (item[0], item[1]))
+    return tuple(result)
+
+
 def _read_cells(cells: Iterable[tuple | list], name: str) -> dict:
     """Consume a single-pass iterable of ``(ix, iy, z, sigma, count)`` cells."""
     try:
