@@ -23,9 +23,17 @@ python -m pytest
 安装后提供 `lidar-scan-modeling` 命令：
 
 ```bash
-lidar-scan-modeling version    # 打印版本号
-lidar-scan-modeling --help     # 打印用法
+lidar-scan-modeling version       # 打印版本号
+lidar-scan-modeling window-tiles  # 从 stdin 读取 JSON，聚合窗口瓦片
+lidar-scan-modeling --help        # 打印用法
 ```
+
+### `window-tiles` 子命令
+
+- 从 stdin 读取 UTF-8 编码的单个 JSON 对象；顶层仅允许 `points`、`windows`、`cell_size`、`tile_cells`、`levels` 五个键，后三者可省略，默认 `1.0`、`256`、`3`
+- `points` 为五元数组 `[x, y, z, intensity, sigma]` 的数组；`windows` 为五元数组 `[level, ix_min, iy_min, ix_max, iy_max]` 的数组；校验规则与 `lidar_scan.window_tiles` 一致，points 单遍消费
+- 成功时返回 0，stdout 写一行紧凑 JSON：顶层键序为 `windows`，值按输入顺序为 `[level, ix_min, iy_min, ix_max, iy_max, tiles]`，`tiles` 为九项数组 `[tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count]`；整数为十进制，`zmin`/`zmax` 固定六位小数、负零写作 `0.000000`，不出现 `NaN`/`Infinity`
+- UTF-8、JSON 语法、顶层或数组结构错误抛 `ValueError`；字段类型错误抛 `TypeError`；取值错误抛 `ValueError`；失败时不写 stdout，stderr 首行写异常类名并返回 2
 
 ## 现有公开接口
 
