@@ -677,6 +677,93 @@ def aggregate_tile_region_stats(pyramid: tuple, level: int,
             _quantize(zmean), _quantize(zsigma), count)
 
 
+def aggregate_tile_window_stats(pyramid: tuple, level: int,
+                                ix_min: int, iy_min: int,
+                                ix_max: int, iy_max: int) -> tuple | None:
+    """Aggregate the z statistics of tiles intersecting a cell-index window.
+
+    ``pyramid`` must be an outer tuple as produced by
+    :func:`build_tile_pyramid_stats`: each level is a tuple of 11-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)``
+    sorted lexicographically by ``(tx, ty)``, where the first six fields and
+    ``count`` are non-bool ints, the four statistics are finite floats and
+    ``zsigma`` is positive. ``level`` and the four window bounds must be
+    non-bool ints; ``level`` must satisfy ``0 <= level < len(pyramid)`` and
+    the bounds must satisfy ``ix_min <= ix_max`` and ``iy_min <= iy_max``.
+
+    Tiles at ``level`` whose closed cell-index intervals intersect the window
+    (``tile.ix1 >= ix_min and tile.ix0 <= ix_max and tile.iy1 >= iy_min and
+    tile.iy0 <= iy_max``) are aggregated in the level's existing order:
+    ``zmin`` is the minimum tile ``zmin``, ``zmax`` the maximum tile ``zmax``
+    and ``count`` the sum of the tile counts. The z statistics use weights
+    ``w = 1 / zsigma ** 2``: ``zmean = sum(w * zmean) / sum(w)`` and
+    ``zsigma = sqrt(1 / sum(w))``; the summations are Decimal computations
+    (precision 50, ``ROUND_HALF_EVEN``, each input converted via
+    ``Decimal(str(v))``) with the summands accumulated in ascending Decimal
+    order, so the result does not depend on tile order. The four statistics
+    are quantized to six decimal places as floats (negative zero normalized).
+
+    Returns ``(zmin, zmax, zmean, zsigma, count)`` for the matched tiles, or
+    ``None`` when no tile intersects the window. The input is never modified
+    or reordered.
+
+    :raises TypeError: ``pyramid`` is not a tuple or ``level``/a bound is not
+        a non-bool int.
+    :raises ValueError: ``level`` is out of range, the bounds are inverted or
+        the pyramid's structure, ordering, duplicates or fields are bad.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    for name, value in (("level", level), ("ix_min", ix_min), ("iy_min", iy_min),
+                        ("ix_max", ix_max), ("iy_max", iy_max)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a non-bool int")
+    if level < 0 or level >= len(pyramid):
+        raise ValueError("level out of range")
+    if ix_min > ix_max or iy_min > iy_max:
+        raise ValueError("window bounds must satisfy ix_min <= ix_max and "
+                         "iy_min <= iy_max")
+
+    _validate_pyramid_stats(pyramid)
+
+    matches = [
+        tile for tile in pyramid[level]
+        if (tile[4] >= ix_min and tile[2] <= ix_max
+            and tile[5] >= iy_min and tile[3] <= iy_max)
+    ]
+    if not matches:
+        return None
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        zmin = Decimal(str(matches[0][6]))
+        zmax = Decimal(str(matches[0][7]))
+        count = 0
+        weights: list[Decimal] = []
+        weighted_means: list[Decimal] = []
+        for tile in matches:
+            tile_zmin = Decimal(str(tile[6]))
+            tile_zmax = Decimal(str(tile[7]))
+            if tile_zmin < zmin:
+                zmin = tile_zmin
+            if tile_zmax > zmax:
+                zmax = tile_zmax
+            count += tile[10]
+            dzsigma = Decimal(str(tile[9]))
+            weight = Decimal(1) / (dzsigma * dzsigma)
+            weights.append(weight)
+            weighted_means.append(weight * Decimal(str(tile[8])))
+
+        sum_w = _sorted_sum(weights)
+        zmean = _sorted_sum(weighted_means) / sum_w
+        zsigma = (Decimal(1) / sum_w).sqrt()
+
+    return (_quantize(zmin), _quantize(zmax),
+            _quantize(zmean), _quantize(zsigma), count)
+
+
 def assess_tile_region_stats(estimate: tuple, reference: tuple) -> tuple:
     """Assess estimated tile-region statistics against a reference, tile by tile.
 
