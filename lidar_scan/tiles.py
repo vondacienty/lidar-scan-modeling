@@ -2036,6 +2036,72 @@ def decode_tile_pyramid_stats(text: str) -> tuple:
     return pyramid
 
 
+def decode_tile_pyramid_assessment(text: str) -> tuple:
+    """Deserialize canonical JSON produced by :func:`encode_tile_pyramid_assessment`.
+
+    The document must be the compact encoder output: the top-level value must
+    be an object whose only key is ``levels``; ``levels`` must be an array (in
+    level order) of arrays of strict 11-value tile arrays
+    ``[tx, ty, ix0, iy0, ix1, iy1, bias, abs_error, combined_sigma, z_score,
+    count_delta]`` where the first six fields and ``count_delta`` are non-bool
+    ints with ``ix0 <= ix1`` and ``iy0 <= iy1``, the four metrics are finite
+    floats with ``combined_sigma > 0``, and each level's ``(tx, ty)``
+    coordinates are strictly increasing with no duplicates. The spelling must
+    be exactly canonical: integers in decimal, the four metrics with exactly
+    six decimal places (negative zero written as ``0.000000``), no whitespace
+    or extra keys and no ``NaN``/``Infinity``.
+
+    Returns the all-tuple assessment in level order, each tile an 11-tuple in
+    the document's order; an empty document ``{"levels":[]}`` returns ``()``.
+    The input text is never modified.
+
+    :raises TypeError: ``text`` is not a ``str``.
+    :raises ValueError: the JSON syntax, top-level keys/types, level/tile
+        shape, field types, cell bounds, ordering, duplicates, non-finite
+        values, non-positive ``combined_sigma``, numeric formatting or
+        canonical re-encoding does not match.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("text is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"levels"}:
+        raise ValueError("top-level value must be an object with only 'levels'")
+    raw_levels = document["levels"]
+    if not isinstance(raw_levels, list):
+        raise ValueError("'levels' must be an array")
+
+    levels: list[tuple] = []
+    for raw_tiles in raw_levels:
+        if not isinstance(raw_tiles, list):
+            raise ValueError("each level must be an array of tiles")
+        tiles: list[tuple] = []
+        for raw_tile in raw_tiles:
+            if not isinstance(raw_tile, list) or len(raw_tile) != 11:
+                raise ValueError("each tile must be an array of eleven values")
+            tiles.append(tuple(raw_tile))
+        levels.append(tuple(tiles))
+    assessment = tuple(levels)
+
+    # Structural rules: tuple levels, field types/finiteness, positive
+    # combined_sigma, cell bounds, (tx, ty) sort order and no duplicates.
+    _validate_pyramid_assessment(assessment)
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal metric formatting, leading zeros, -0,
+    # exponents and any other non-canonical spelling.
+    if encode_tile_pyramid_assessment(assessment) != text:
+        raise ValueError("JSON text is not the canonical pyramid-assessment "
+                         "encoding")
+    return assessment
+
+
 def merge_tile_pyramids(pyramids: tuple) -> tuple:
     """Merge tile pyramids produced by :func:`build_tile_pyramid`.
 
