@@ -360,38 +360,49 @@ def _validate_pyramid(pyramid) -> None:
             prev_key = key
 
 
+def _validate_tile_region_stats(tiles) -> None:
+    """Validate a flat tuple of tile-stat 11-tuples, raising ``ValueError``.
+
+    Each tile must be an 11-tuple
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)`` where
+    the first six fields and ``count`` are non-bool ints, the four statistics
+    are finite floats, ``zsigma`` is positive and the tiles are sorted
+    strictly by ``(tx, ty)`` with no duplicates.
+    """
+    prev_key = None
+    for tile in tiles:
+        if not isinstance(tile, tuple) or len(tile) != 11:
+            raise ValueError(
+                "each tile must be an 11-tuple "
+                "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)"
+            )
+        for value in tile[0:6] + (tile[10],):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and count must be "
+                                 "non-bool ints")
+        for value in tile[6:10]:
+            if not isinstance(value, float) or not math.isfinite(value):
+                raise ValueError("zmin, zmax, zmean and zsigma must be finite "
+                                 "floats")
+        if tile[9] <= 0:
+            raise ValueError("zsigma must be positive")
+        key = (tile[0], tile[1])
+        if prev_key is not None and key <= prev_key:
+            raise ValueError("tiles must be sorted by (tx, ty) with no "
+                             "duplicate coordinates")
+        prev_key = key
+
+
 def _validate_pyramid_stats(pyramid) -> None:
     """Validate the structure of a tile pyramid with z statistics.
 
-    Like :func:`_validate_pyramid` but each tile must be an 11-tuple
-    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)`` where
-    the four statistics are finite floats and ``zsigma`` is positive.
+    Every level must be a tuple of 11-tuples as checked by
+    :func:`_validate_tile_region_stats`.
     """
     for level_tiles in pyramid:
         if not isinstance(level_tiles, tuple):
             raise ValueError("each pyramid level must be a tuple")
-        prev_key = None
-        for tile in level_tiles:
-            if not isinstance(tile, tuple) or len(tile) != 11:
-                raise ValueError(
-                    "each tile must be an 11-tuple "
-                    "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)"
-                )
-            for value in tile[0:6] + (tile[10],):
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and count must be "
-                                     "non-bool ints")
-            for value in tile[6:10]:
-                if not isinstance(value, float) or not math.isfinite(value):
-                    raise ValueError("zmin, zmax, zmean and zsigma must be finite "
-                                     "floats")
-            if tile[9] <= 0:
-                raise ValueError("zsigma must be positive")
-            key = (tile[0], tile[1])
-            if prev_key is not None and key <= prev_key:
-                raise ValueError("each pyramid level must be sorted by (tx, ty) "
-                                 "with no duplicate coordinates")
-            prev_key = key
+        _validate_tile_region_stats(level_tiles)
 
 
 def query_tile_pyramid_stats(pyramid: tuple, level: int,
@@ -618,6 +629,73 @@ def aggregate_tile_region_stats(pyramid: tuple, level: int,
 
     return (_quantize(zmin), _quantize(zmax),
             _quantize(zmean), _quantize(zsigma), count)
+
+
+def assess_tile_region_stats(estimate: tuple, reference: tuple) -> tuple:
+    """Assess estimated tile-region statistics against a reference, tile by tile.
+
+    Both inputs are tuples of 11-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)`` sorted
+    strictly by ``(tx, ty)`` with no duplicates, where ``tx``, ``ty``, the four
+    cell bounds and ``count`` are non-bool ints and ``zmin``, ``zmax``,
+    ``zmean`` and ``zsigma`` are finite floats with ``zsigma > 0``. The two
+    inputs must contain the same ``(tx, ty)`` coordinates with identical
+    ``(ix0, iy0, ix1, iy1)`` bounds (their ``count`` values may differ);
+    otherwise ``ValueError`` is raised.
+
+    Returns a tuple, in the inputs' order, of
+    ``(tx, ty, bias, abs_error, combined_sigma, z_score)`` tuples where
+    ``bias = estimate.zmean - reference.zmean``, ``abs_error = abs(bias)``,
+    ``combined_sigma = sqrt(estimate.zsigma**2 + reference.zsigma**2)`` and
+    ``z_score = bias / combined_sigma``. The metrics are Decimal computations
+    (precision 50, ``ROUND_HALF_EVEN``, each input converted via
+    ``Decimal(str(v))``) quantized to six decimal places as floats (negative
+    zero normalized). Two empty inputs return ``()``. The inputs are never
+    modified.
+
+    :raises TypeError: ``estimate`` or ``reference`` is not a tuple.
+    :raises ValueError: the structure, ordering, duplicates, fields, coordinate
+        sets or cell bounds of either input are bad.
+    """
+    if not isinstance(estimate, tuple):
+        raise TypeError("estimate must be a tuple")
+    if not isinstance(reference, tuple):
+        raise TypeError("reference must be a tuple")
+
+    _validate_tile_region_stats(estimate)
+    _validate_tile_region_stats(reference)
+
+    if len(estimate) != len(reference):
+        raise ValueError("estimate and reference must contain the same "
+                         "(tx, ty) tile coordinates")
+    for est_tile, ref_tile in zip(estimate, reference):
+        if est_tile[0:2] != ref_tile[0:2]:
+            raise ValueError("estimate and reference must contain the same "
+                             "(tx, ty) tile coordinates")
+        if est_tile[2:6] != ref_tile[2:6]:
+            raise ValueError("tiles with the same (tx, ty) must agree on "
+                             "(ix0, iy0, ix1, iy1)")
+
+    result = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for est_tile, ref_tile in zip(estimate, reference):
+            est_zmean = Decimal(str(est_tile[8]))
+            ref_zmean = Decimal(str(ref_tile[8]))
+            est_zsigma = Decimal(str(est_tile[9]))
+            ref_zsigma = Decimal(str(ref_tile[9]))
+            bias = est_zmean - ref_zmean
+            combined = (est_zsigma * est_zsigma
+                        + ref_zsigma * ref_zsigma).sqrt()
+            result.append((
+                est_tile[0], est_tile[1],
+                _quantize(bias), _quantize(abs(bias)),
+                _quantize(combined), _quantize(bias / combined),
+            ))
+
+    return tuple(result)
 
 
 def _format_z(value: float) -> str:
