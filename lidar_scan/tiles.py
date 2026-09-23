@@ -546,6 +546,55 @@ def query_tile_region_stats(pyramid: tuple, level: int,
     )
 
 
+def query_tile_window_stats(pyramid: tuple, level: int,
+                            ix_min: int, iy_min: int,
+                            ix_max: int, iy_max: int) -> tuple:
+    """Select all tiles intersecting a cell-index window at a stats-pyramid level.
+
+    ``pyramid`` must be an outer tuple as produced by
+    :func:`build_tile_pyramid_stats`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)``
+    11-tuples sorted lexicographically by ``(tx, ty)``, where the first six
+    fields and ``count`` are non-bool ints, the four statistics are finite
+    floats and ``zsigma`` is positive. ``level`` and the four window bounds
+    must be non-bool ints; ``level`` must satisfy ``0 <= level < len(pyramid)``
+    and the bounds must satisfy ``ix_min <= ix_max`` and ``iy_min <= iy_max``.
+
+    A tile is selected when its closed cell-index rectangle intersects the
+    closed window: ``tile.ix1 >= ix_min and tile.ix0 <= ix_max and
+    tile.iy1 >= iy_min and tile.iy0 <= iy_max`` (a single shared boundary cell
+    therefore counts as an intersection).
+
+    Returns a tuple of the stored 11-tuples at that level, preserving the
+    level's existing order; an empty match returns ``()``. The input is never
+    modified or reordered.
+
+    :raises TypeError: ``pyramid`` is not a tuple or ``level``/a bound is not
+        a non-bool int.
+    :raises ValueError: ``level`` is out of range, the bounds are inverted or
+        the pyramid's structure, ordering, duplicates or fields are bad.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    for name, value in (("level", level), ("ix_min", ix_min), ("iy_min", iy_min),
+                        ("ix_max", ix_max), ("iy_max", iy_max)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a non-bool int")
+    if level < 0 or level >= len(pyramid):
+        raise ValueError("level out of range")
+    if ix_min > ix_max or iy_min > iy_max:
+        raise ValueError("window bounds must satisfy ix_min <= ix_max and "
+                         "iy_min <= iy_max")
+
+    _validate_pyramid_stats(pyramid)
+
+    return tuple(
+        tile for tile in pyramid[level]
+        if tile[4] >= ix_min and tile[2] <= ix_max
+        and tile[5] >= iy_min and tile[3] <= iy_max
+    )
+
+
 def aggregate_tile_region_stats(pyramid: tuple, level: int,
                                 tx_min: int, ty_min: int,
                                 tx_max: int, ty_max: int) -> tuple | None:
