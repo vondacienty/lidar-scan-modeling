@@ -1200,6 +1200,105 @@ def _reject_constant(raw: str):
     raise ValueError(f"non-finite JSON literal is not allowed: {raw}")
 
 
+def decode_tile_window_stats(text: str) -> tuple:
+    """Deserialize canonical JSON produced by :func:`encode_tile_window_stats`.
+
+    The document must be the compact encoder output: top-level keys exactly
+    ``level``, ``ix_min``, ``iy_min``, ``ix_max``, ``iy_max`` and ``tiles`` in
+    that order; the first five values non-bool ints with ``level >= 0`` and
+    ``ix_min <= ix_max``/``iy_min <= iy_max``; ``tiles`` an array of strict
+    11-tuples ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma,
+    count)`` whose indices and ``count`` are non-bool ints, whose four
+    statistics are finite floats with ``zsigma > 0``, whose ``(tx, ty)``
+    coordinates are strictly increasing with no duplicates and whose closed
+    cell-index intervals intersect the window (``ix1 >= ix_min and
+    ix0 <= ix_max and iy1 >= iy_min and iy0 <= iy_max``), and whose spelling
+    is exactly canonical (integers in decimal, statistics with six decimals,
+    negative zero as ``0.000000``, no whitespace or extra keys, no
+    ``NaN``/``Infinity``).
+
+    Returns ``(level, ix_min, iy_min, ix_max, iy_max, tiles_tuple)`` where
+    ``tiles_tuple`` is a tuple of 11-tuples in the document's order. The input
+    text is never modified.
+
+    :raises TypeError: ``text`` is not a ``str``.
+    :raises ValueError: the JSON syntax, key order, types, bounds, ordering,
+        duplicates, range, non-finite values, non-positive ``zsigma``, numeric
+        formatting or canonical re-encoding does not match.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("text is not valid JSON") from exc
+
+    expected_keys = ("level", "ix_min", "iy_min", "ix_max", "iy_max", "tiles")
+    if (not isinstance(document, dict)
+            or tuple(document) != expected_keys):
+        raise ValueError(
+            "top-level value must be an object with exactly the keys "
+            "'level', 'ix_min', 'iy_min', 'ix_max', 'iy_max', 'tiles' "
+            "in that order")
+
+    level, ix_min, iy_min, ix_max, iy_max = (
+        document[name] for name in expected_keys[:5])
+    raw_tiles = document["tiles"]
+
+    for name, value in (("level", level), ("ix_min", ix_min),
+                        ("iy_min", iy_min), ("ix_max", ix_max),
+                        ("iy_max", iy_max)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be a non-bool int")
+    if level < 0:
+        raise ValueError("level must be non-negative")
+    if ix_min > ix_max or iy_min > iy_max:
+        raise ValueError("window bounds must satisfy ix_min <= ix_max and "
+                         "iy_min <= iy_max")
+    if not isinstance(raw_tiles, list):
+        raise ValueError("'tiles' must be an array")
+
+    tiles: list[tuple] = []
+    prev_key = None
+    for raw_tile in raw_tiles:
+        if not isinstance(raw_tile, list) or len(raw_tile) != 11:
+            raise ValueError("each tile must be an array of eleven values")
+        tile = tuple(raw_tile)
+        for value in tile[0:6] + (tile[10],):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    "tx, ty, ix0, iy0, ix1, iy1 and count must be non-bool "
+                    "ints")
+        for value in tile[6:10]:
+            if not isinstance(value, float) or not math.isfinite(value):
+                raise ValueError("zmin, zmax, zmean and zsigma must be finite "
+                                 "floats")
+        if tile[9] <= 0:
+            raise ValueError("zsigma must be positive")
+        if not (tile[4] >= ix_min and tile[2] <= ix_max
+                and tile[5] >= iy_min and tile[3] <= iy_max):
+            raise ValueError("each tile must intersect the cell-index window")
+        key = (tile[0], tile[1])
+        if prev_key is not None and key <= prev_key:
+            raise ValueError("tiles must be sorted by (tx, ty) with no "
+                             "duplicate coordinates")
+        prev_key = key
+        tiles.append(tile)
+    tiles_tuple = tuple(tiles)
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal statistic formatting, leading zeros,
+    # -0, exponents and any other non-canonical spelling.
+    if _format_window_stats_text(level, ix_min, iy_min, ix_max, iy_max,
+                                 tiles_tuple) != text:
+        raise ValueError("JSON text is not the canonical window-stats "
+                         "encoding")
+    return (level, ix_min, iy_min, ix_max, iy_max, tiles_tuple)
+
+
 def decode_tile_pyramid(text: str) -> tuple:
     """Deserialize a canonical JSON document produced by :func:`encode_tile_pyramid`.
 
