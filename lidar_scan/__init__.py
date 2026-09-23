@@ -29,7 +29,8 @@ from .tiles import (aggregate_tile_region_stats, aggregate_tile_window_stats,
                     query_tile_pyramid_stats,
                     query_tile_region, query_tile_region_stats,
                     query_tile_window, query_tile_window_stats,
-                    update_tile_pyramid, update_tile_pyramid_stats)
+                    update_tile_pyramid, update_tile_pyramid_stats,
+                    window_tiles)
 from .voxel import fuse_voxels
 
 __all__ = ["__version__", "chm", "dem", "e57", "las", "ply", "tiles", "voxel",
@@ -56,4 +57,5 @@ __all__ = ["__version__", "chm", "dem", "e57", "las", "ply", "tiles", "voxel",
            "query_tile_region", "query_tile_region_stats",
            "query_tile_window", "query_tile_window_stats",
            "update_tile_pyramid", "update_tile_pyramid_stats",
+           "window_tiles",
            "iter_e57", "iter_las", "iter_ply"]

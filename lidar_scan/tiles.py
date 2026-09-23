@@ -208,6 +208,152 @@ def build_tile_pyramid(points: Iterable[tuple | list],
     return tuple(pyramid)
 
 
+def window_tiles(points: Iterable[tuple | list],
+                 windows: tuple,
+                 cell_size: int | float = 1.0,
+                 tile_cells: int = 256,
+                 levels: int = 3) -> tuple:
+    """Aggregate points into pyramid tiles intersecting cell-index windows.
+
+    Each point is a 5-item ``(x, y, z, intensity, sigma)`` tuple/list of
+    finite non-bool ints/floats with ``sigma > 0``. Cell indices are
+    ``ix = floor(x / cell_size)``, ``iy = floor(y / cell_size)``. At level
+    ``l`` (``0 <= l < levels``) each tile covers
+    ``N = tile_cells * 2 ** l`` cells per axis, so ``tx = ix // N`` and
+    ``ty = iy // N``; the per-tile summary holds the minimum/maximum ``z`` and
+    the point count.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max``; ``level`` must satisfy
+    ``0 <= level < levels``.
+
+    ``points`` is consumed in a single pass (``iter()`` is called exactly
+    once) while every level is aggregated simultaneously. For each window, a
+    tile matches when its closed cell-index intervals intersect the window:
+    ``tile.ix1 >= ix_min and tile.ix0 <= ix_max and tile.iy1 >= iy_min and
+    tile.iy0 <= iy_max``.
+
+    Returns a tuple, in ``windows`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` tuples where ``tiles``
+    is a tuple of ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)``
+    9-tuples sorted lexicographically by ``(tx, ty)``; a window with no
+    matching tile gets an empty ``tiles`` tuple and an empty ``windows``
+    tuple returns ``()``. ``zmin``/``zmax`` are Decimal computations
+    (``Decimal(str(v))``, precision 50, ``ROUND_HALF_EVEN``) quantized to six
+    decimal places as floats (negative zero normalized).
+
+    :raises TypeError: ``points`` is not iterable, ``windows`` is not a tuple,
+        a window's container/length/field types are bad, a point's
+        container/length/fields have the wrong type, or
+        ``cell_size``/``tile_cells``/``levels`` have the wrong type.
+    :raises ValueError: a parameter or point field is non-finite,
+        ``cell_size``/``tile_cells``/``levels``/``sigma`` is non-positive,
+        ``level`` is out of range or the window bounds are inverted.
+    """
+    if isinstance(cell_size, bool) or not isinstance(cell_size, _NUMERIC_TYPES):
+        raise TypeError("cell_size must be a non-bool int or float")
+    if isinstance(cell_size, float) and not math.isfinite(cell_size):
+        raise ValueError("cell_size must be finite")
+    if isinstance(tile_cells, bool) or not isinstance(tile_cells, int):
+        raise TypeError("tile_cells must be a non-bool int")
+    if tile_cells <= 0:
+        raise ValueError("tile_cells must be positive")
+    if isinstance(levels, bool) or not isinstance(levels, int):
+        raise TypeError("levels must be a non-bool int")
+    if levels <= 0:
+        raise ValueError("levels must be positive")
+
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+    for window in windows:
+        level, ix_min, iy_min, ix_max, iy_max = window
+        if level < 0 or level >= levels:
+            raise ValueError("level out of range")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+
+    # Single pass over ``points``: iter() is called exactly once, len() is
+    # never called on it, and every level is aggregated simultaneously.
+    point_iter = iter(points)
+
+    widths = [tile_cells * 2 ** level for level in range(levels)]
+    tiles_per_level: list[dict[tuple[int, int], list]] = [
+        {} for _ in range(levels)
+    ]
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        dcell = Decimal(str(cell_size))
+        if dcell <= 0:
+            raise ValueError("cell_size must be positive")
+
+        for point in point_iter:
+            if not isinstance(point, (tuple, list)) or len(point) != 5:
+                raise TypeError("each point must be a tuple or list of 5 items "
+                                "(x, y, z, intensity, sigma)")
+
+            dx = _as_decimal(point[0])
+            dy = _as_decimal(point[1])
+            dz = _as_decimal(point[2])
+            _as_decimal(point[3])
+            dsigma = _as_decimal(point[4])
+            if dsigma <= 0:
+                raise ValueError("sigma must be positive")
+
+            ix = int((dx / dcell).to_integral_value(rounding=ROUND_FLOOR))
+            iy = int((dy / dcell).to_integral_value(rounding=ROUND_FLOOR))
+
+            for level, width in enumerate(widths):
+                key = (ix // width, iy // width)
+                tiles = tiles_per_level[level]
+                entry = tiles.get(key)
+                if entry is None:
+                    tiles[key] = [dz, dz, 1]
+                else:
+                    if dz < entry[0]:
+                        entry[0] = dz
+                    if dz > entry[1]:
+                        entry[1] = dz
+                    entry[2] += 1
+
+        results = []
+        for level, ix_min, iy_min, ix_max, iy_max in windows:
+            width = widths[level]
+            matched = []
+            for (tx, ty), (zmin, zmax, count) in tiles_per_level[level].items():
+                ix0 = tx * width
+                iy0 = ty * width
+                ix1 = ix0 + width - 1
+                iy1 = iy0 + width - 1
+                if (ix1 >= ix_min and ix0 <= ix_max
+                        and iy1 >= iy_min and iy0 <= iy_max):
+                    matched.append((
+                        tx, ty,
+                        ix0, iy0, ix1, iy1,
+                        _quantize(zmin), _quantize(zmax),
+                        count,
+                    ))
+            matched.sort(key=lambda item: (item[0], item[1]))
+            results.append((level, ix_min, iy_min, ix_max, iy_max,
+                            tuple(matched)))
+
+    return tuple(results)
+
+
 def _sorted_sum(terms: list) -> Decimal:
     """Add Decimal terms in ascending numeric order.
 
