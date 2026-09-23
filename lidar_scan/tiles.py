@@ -1304,3 +1304,70 @@ def merge_tile_pyramid_stats(pyramids: tuple) -> tuple:
             merged_levels.append(tuple(level_tiles))
 
     return tuple(merged_levels)
+
+
+def update_tile_pyramid_stats(pyramid: tuple,
+                              points: Iterable[tuple | list],
+                              cell_size: int | float = 1.0,
+                              tile_cells: int = 256,
+                              levels: int = 3) -> tuple:
+    """Add points to an existing tile pyramid with z statistics.
+
+    ``pyramid`` must be an outer tuple as produced by
+    :func:`build_tile_pyramid_stats` with exactly ``levels`` levels: each
+    level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, zmean, zsigma, count)``
+    11-tuples, with the first six fields and ``count`` non-bool ints, the four
+    statistics finite floats, ``zsigma`` positive, and tiles strictly sorted
+    by ``(tx, ty)`` without duplicates. ``cell_size``, ``tile_cells`` and
+    ``levels`` are validated exactly as in :func:`build_tile_pyramid_stats`.
+
+    Each point is a 5-item ``(x, y, z, intensity, sigma)`` tuple/list of
+    finite non-bool ints/floats with ``sigma > 0``; the points are consumed in
+    a single pass and added to the levels with cell indices
+    ``ix = floor(x / cell_size)``, ``iy = floor(y / cell_size)``.
+
+    The result is equivalent to
+    ``merge_tile_pyramid_stats((pyramid, build_tile_pyramid_stats(points, cell_size, tile_cells, levels)))``:
+    per-tile statistics use weights ``w = 1 / sigma ** 2`` with Decimal sums
+    (precision 50, ``ROUND_HALF_EVEN``) of the terms sorted in ascending
+    order, and the four statistics are quantized to six decimal places as
+    floats (negative zero normalized). The returned pyramid is a tuple whose
+    levels are sorted by ``(tx, ty)``; the inputs are never modified. An
+    empty ``points`` returns ``pyramid`` unchanged.
+
+    :raises TypeError: ``pyramid`` is not a tuple, ``points`` is not iterable,
+        a parameter has a bad type, or a point is not a 5-item tuple/list of
+        non-bool ints/floats.
+    :raises ValueError: a parameter is non-finite or not positive, a point
+        field is non-finite or its ``sigma`` is not positive, the pyramid's
+        structure, ordering, duplicates or fields are bad, its level count
+        differs from ``levels``, or same-coordinate tiles disagree on their
+        cell bounds.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    if isinstance(cell_size, bool) or not isinstance(cell_size, _NUMERIC_TYPES):
+        raise TypeError("cell_size must be a non-bool int or float")
+    if isinstance(cell_size, float) and not math.isfinite(cell_size):
+        raise ValueError("cell_size must be finite")
+    if isinstance(tile_cells, bool) or not isinstance(tile_cells, int):
+        raise TypeError("tile_cells must be a non-bool int")
+    if tile_cells <= 0:
+        raise ValueError("tile_cells must be positive")
+    if isinstance(levels, bool) or not isinstance(levels, int):
+        raise TypeError("levels must be a non-bool int")
+    if levels <= 0:
+        raise ValueError("levels must be positive")
+
+    _validate_pyramid_stats(pyramid)
+    if len(pyramid) != levels:
+        raise ValueError("pyramid must have exactly `levels` levels")
+
+    # Single pass over ``points`` (iter() is called exactly once, inside the
+    # builder); the merge then combines the two pyramids without touching the
+    # points again.
+    addition = build_tile_pyramid_stats(points, cell_size, tile_cells, levels)
+    if all(not level_tiles for level_tiles in addition):
+        return pyramid
+    return merge_tile_pyramid_stats((pyramid, addition))
