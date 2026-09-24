@@ -623,6 +623,45 @@ def query_tile_pyramid_assessment(assessment: tuple, level: int,
     return None
 
 
+def query_tile_pyramid_delta(assessment: tuple, level: int,
+                             tx: int, ty: int) -> tuple | None:
+    """Look up the tile ``(tx, ty)`` at ``level`` of a pyramid delta assessment.
+
+    ``assessment`` must be the outer tuple returned by
+    :func:`assess_tile_pyramid_deltas`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` 9-tuples sorted
+    strictly by ``(tx, ty)`` with no duplicates, where the first six fields
+    and ``dcount`` are non-bool ints with ``ix0 <= ix1`` and ``iy0 <= iy1``,
+    and ``dzmin``/``dzmax`` are finite floats. ``level``, ``tx`` and ``ty``
+    must be non-bool ints and ``level`` must satisfy
+    ``0 <= level < len(assessment)``.
+
+    Returns the stored 9-tuple for the exact ``(tx, ty)`` match at that
+    level, or ``None`` if no such tile exists. The input is never modified or
+    reordered and repeated calls return identical results.
+
+    :raises TypeError: ``assessment`` is not a tuple or ``level``/``tx``/
+        ``ty`` is not a non-bool int.
+    :raises ValueError: ``level`` is out of range or the assessment's
+        structure, ordering, duplicates, fields, cell bounds or finiteness
+        are bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    for name, value in (("level", level), ("tx", tx), ("ty", ty)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a non-bool int")
+    if level < 0 or level >= len(assessment):
+        raise ValueError("level out of range")
+
+    _validate_pyramid_deltas(assessment)
+
+    for tile in assessment[level]:
+        if tile[0] == tx and tile[1] == ty:
+            return tile
+    return None
+
+
 def query_tile_pyramid(pyramid: tuple, level: int, tx: int, ty: int) -> tuple | None:
     """Look up the tile ``(tx, ty)`` at ``level`` of a tile pyramid.
 
