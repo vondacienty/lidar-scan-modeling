@@ -3234,3 +3234,211 @@ def update_tile_pyramid_windows(pyramid: tuple,
         results.append((level, ix_min, iy_min, ix_max, iy_max, matched))
 
     return tuple(results)
+
+
+def _validate_pyramid_windows(result) -> None:
+    """Validate the tuple returned by :func:`merge_tile_pyramid_windows`.
+
+    The outer value must be a tuple of 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` whose first five fields
+    are non-bool ints with ``ix_min <= ix_max`` and ``iy_min <= iy_max``;
+    ``tiles`` must be a tuple of strict 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` whose indices and
+    ``count`` are non-bool ints with ``ix0 <= ix1`` and ``iy0 <= iy1``, whose
+    ``zmin``/``zmax`` are finite floats, and whose ``(tx, ty)`` coordinates are
+    strictly increasing with no duplicates.
+    """
+    for window in result:
+        if not isinstance(window, tuple) or len(window) != 6:
+            raise ValueError(
+                "each window must be a 6-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max, tiles)"
+            )
+        level, ix_min, iy_min, ix_max, iy_max, tiles = window
+        for name, value in (("level", level), ("ix_min", ix_min),
+                            ("iy_min", iy_min), ("ix_max", ix_max),
+                            ("iy_max", iy_max)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max and "
+                             "iy_min <= iy_max")
+        if not isinstance(tiles, tuple):
+            raise ValueError("tiles must be a tuple")
+        prev_key = None
+        for tile in tiles:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise ValueError("each tile must be a 9-tuple "
+                                 "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, "
+                                 "count)")
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(
+                        "tx, ty, ix0, iy0, ix1, iy1 and count must be "
+                        "non-bool ints"
+                    )
+            for value in tile[6:8]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("zmin and zmax must be finite floats")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("tiles must be sorted by (tx, ty) with no "
+                                 "duplicate coordinates")
+            prev_key = key
+
+
+def _format_pyramid_windows_text(result) -> str:
+    """Build the canonical compact JSON text of a pyramid-windows document."""
+    parts = ['{"windows":[']
+    for window_index, window in enumerate(result):
+        if window_index:
+            parts.append(",")
+        level, ix_min, iy_min, ix_max, iy_max, tiles = window
+        parts.append("[")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",[")
+        for tile_index, tile in enumerate(tiles):
+            if tile_index:
+                parts.append(",")
+            (tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count) = tile
+            parts.append("[")
+            parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
+                                   str(ix1), str(iy1), _format_z(zmin),
+                                   _format_z(zmax), str(count))))
+            parts.append("]")
+        parts.append("]]")
+    parts.append(']}')
+    return "".join(parts)
+
+
+def encode_tile_pyramid_windows(result: tuple) -> str:
+    """Serialize the result of :func:`merge_tile_pyramid_windows`.
+
+    ``result`` must be the tuple returned by
+    :func:`merge_tile_pyramid_windows`: a tuple of 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` whose first five fields
+    are non-bool ints with ``ix_min <= ix_max`` and ``iy_min <= iy_max``;
+    ``tiles`` is a tuple of 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` with the first six
+    fields and ``count`` non-bool ints satisfying ``ix0 <= ix1`` and
+    ``iy0 <= iy1``, ``zmin``/``zmax`` finite floats, and tiles sorted strictly
+    by ``(tx, ty)`` without duplicates.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``windows``: an array, in window order, of six-value window arrays whose
+    last value is the array of nine-value tiles in the tiles' stored order; an
+    empty result encodes as ``{"windows":[]}``. Integers are decimal;
+    ``zmin``/``zmax`` use exactly six decimal places (negative zero written as
+    ``0.000000``). The output has no whitespace, ASCII is not escaped and
+    ``NaN``/``Infinity`` never appear. The input is never modified.
+
+    :raises TypeError: ``result`` is not a tuple.
+    :raises ValueError: the structure, field types, bounds, ordering,
+        duplicates or finiteness of a window or tile are bad.
+    """
+    if not isinstance(result, tuple):
+        raise TypeError("result must be a tuple")
+    _validate_pyramid_windows(result)
+    return _format_pyramid_windows_text(result)
+
+
+def decode_tile_pyramid_windows(text: str) -> tuple:
+    """Deserialize canonical JSON produced by :func:`encode_tile_pyramid_windows`.
+
+    The document must be the compact encoder output: an object whose sole
+    top-level key is ``windows``; ``windows`` an array (in window order) of
+    strict six-item windows
+    ``[level, ix_min, iy_min, ix_max, iy_max, tiles]`` whose first five values
+    are non-bool ints with ``ix_min <= ix_max`` and ``iy_min <= iy_max``;
+    ``tiles`` an array of strict 9-item tiles
+    ``[tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count]`` whose indices and
+    ``count`` are non-bool ints with ``ix0 <= ix1`` and ``iy0 <= iy1``, whose
+    ``zmin``/``zmax`` are finite floats and whose ``(tx, ty)`` coordinates are
+    strictly increasing with no duplicates; and whose spelling is exactly
+    canonical (integers in decimal, ``zmin``/``zmax`` with six decimals,
+    negative zero as ``0.000000``, no whitespace or extra keys, no
+    ``NaN``/``Infinity``).
+
+    Returns the outer tuple of 6-tuples in the document's order; the empty
+    document ``{"windows":[]}`` returns ``()``. The input text is never
+    modified.
+
+    :raises TypeError: ``text`` is not a ``str``.
+    :raises ValueError: the JSON syntax, key order, types, lengths, bounds,
+        ordering, duplicates, finiteness, numeric formatting or canonical
+        re-encoding does not match.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("text is not valid JSON") from exc
+
+    if not isinstance(document, dict) or tuple(document) != ("windows",):
+        raise ValueError("top-level value must be an object with exactly the "
+                         "key 'windows'")
+    raw_windows = document["windows"]
+    if not isinstance(raw_windows, list):
+        raise ValueError("'windows' must be an array")
+
+    windows: list[tuple] = []
+    for raw_window in raw_windows:
+        if not isinstance(raw_window, list) or len(raw_window) != 6:
+            raise ValueError("each window must be an array of six values")
+        level, ix_min, iy_min, ix_max, iy_max, raw_tiles = raw_window
+        for name, value in (("level", level), ("ix_min", ix_min),
+                            ("iy_min", iy_min), ("ix_max", ix_max),
+                            ("iy_max", iy_max)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max and "
+                             "iy_min <= iy_max")
+        if not isinstance(raw_tiles, list):
+            raise ValueError("each window's tiles must be an array")
+
+        tiles: list[tuple] = []
+        prev_key = None
+        for raw_tile in raw_tiles:
+            if not isinstance(raw_tile, list) or len(raw_tile) != 9:
+                raise ValueError("each tile must be an array of nine values")
+            tile = tuple(raw_tile)
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(
+                        "tx, ty, ix0, iy0, ix1, iy1 and count must be "
+                        "non-bool ints"
+                    )
+            for value in tile[6:8]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("zmin and zmax must be finite floats")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("tiles must be sorted by (tx, ty) with no "
+                                 "duplicate coordinates")
+            prev_key = key
+            tiles.append(tile)
+
+        windows.append((level, ix_min, iy_min, ix_max, iy_max, tuple(tiles)))
+    result = tuple(windows)
+
+    # Structural rules are re-validated on the tupleized result before the
+    # byte-for-byte canonical comparison, which rejects whitespace, reordered
+    # or duplicate keys, non-six-decimal z formatting, leading zeros, -0,
+    # exponents and any other non-canonical spelling.
+    _validate_pyramid_windows(result)
+    if _format_pyramid_windows_text(result) != text:
+        raise ValueError("JSON text is not the canonical pyramid-windows "
+                         "encoding")
+    return result
