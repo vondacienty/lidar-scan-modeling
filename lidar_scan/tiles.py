@@ -898,6 +898,73 @@ def query_tile_pyramid_windows(pyramid: tuple, windows: tuple) -> tuple:
     return tuple(results)
 
 
+def query_tile_pyramid_delta_windows(assessment: tuple, windows: tuple) -> tuple:
+    """Select delta-assessment tiles intersecting cell-index windows.
+
+    ``assessment`` must be the outer tuple returned by
+    :func:`assess_tile_pyramid_deltas`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` 9-tuples sorted
+    strictly by ``(tx, ty)`` with no duplicates, where the first six fields
+    and ``dcount`` are non-bool ints with ``ix0 <= ix1`` and ``iy0 <= iy1``,
+    and ``dzmin``/``dzmax`` are finite floats.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max``; ``level`` must satisfy
+    ``0 <= level < len(assessment)``.
+
+    For each window, a tile matches when its closed cell-index intervals
+    intersect the window: ``tile.ix1 >= ix_min and tile.ix0 <= ix_max and
+    tile.iy1 >= iy_min and tile.iy0 <= iy_max``.
+
+    Returns a tuple, in ``windows`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` tuples where ``tiles``
+    is a tuple of the stored 9-tuples at that level, preserving the level's
+    existing order; a window with no matching tile gets an empty ``tiles``
+    tuple and an empty ``windows`` tuple returns ``()``. The input is never
+    modified and repeated calls return identical results.
+
+    :raises TypeError: ``assessment``/``windows`` is not a tuple or a window's
+        container, length or field types are bad.
+    :raises ValueError: ``level`` is out of range, the window bounds are
+        inverted, or the assessment's structure, ordering, duplicates, fields
+        or cell bounds are bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    _validate_pyramid_deltas(assessment)
+
+    results = []
+    for level, ix_min, iy_min, ix_max, iy_max in windows:
+        if level < 0 or level >= len(assessment):
+            raise ValueError("level out of range")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        matched = tuple(
+            tile for tile in assessment[level]
+            if (tile[4] >= ix_min and tile[2] <= ix_max
+                and tile[5] >= iy_min and tile[3] <= iy_max)
+        )
+        results.append((level, ix_min, iy_min, ix_max, iy_max, matched))
+
+    return tuple(results)
+
+
 def query_tile_window_stats(pyramid: tuple, level: int,
                             ix_min: int, iy_min: int,
                             ix_max: int, iy_max: int) -> tuple:
