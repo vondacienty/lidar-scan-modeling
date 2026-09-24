@@ -4190,3 +4190,182 @@ def decode_tile_pyramid_delta_windows(text: str) -> tuple:
         raise ValueError("JSON text is not the canonical pyramid-delta-windows "
                          "encoding")
     return result
+
+
+def _validate_delta_summary(result) -> None:
+    """Validate the tuple returned by
+    :func:`aggregate_tile_pyramid_delta_windows`.
+
+    Every member must be a 6-tuple
+    ``(level, ix_min, iy_min, ix_max, iy_max, summary)`` whose first five
+    fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose ``summary`` is either ``None`` or a strict
+    4-tuple ``(min_dzmin, max_dzmax, sum_dcount, match_count)`` where
+    ``min_dzmin``/``max_dzmax`` are finite floats with
+    ``min_dzmin <= max_dzmax`` and ``sum_dcount``/``match_count`` are
+    non-bool ints with ``match_count > 0``.
+    """
+    for window in result:
+        if not isinstance(window, tuple) or len(window) != 6:
+            raise ValueError(
+                "each window must be a 6-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max, summary)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window[:5]):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        level, ix_min, iy_min, ix_max, iy_max, summary = window
+        if level < 0:
+            raise ValueError("level must be >= 0")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        if summary is None:
+            continue
+        if not isinstance(summary, tuple) or len(summary) != 4:
+            raise ValueError(
+                "summary must be None or a 4-tuple "
+                "(min_dzmin, max_dzmax, sum_dcount, match_count)"
+            )
+        min_dzmin, max_dzmax, sum_dcount, match_count = summary
+        for name, value in (("min_dzmin", min_dzmin),
+                            ("max_dzmax", max_dzmax)):
+            if not isinstance(value, float) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite float")
+        if min_dzmin > max_dzmax:
+            raise ValueError("min_dzmin must be <= max_dzmax")
+        for name, value in (("sum_dcount", sum_dcount),
+                            ("match_count", match_count)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        if match_count <= 0:
+            raise ValueError("match_count must be > 0")
+
+
+def _format_delta_summary_text(result) -> str:
+    """Build the canonical compact JSON text of a delta-summary document."""
+    parts = ['{"windows":[']
+    for window_index, window in enumerate(result):
+        if window_index:
+            parts.append(",")
+        level, ix_min, iy_min, ix_max, iy_max, summary = window
+        parts.append("[")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",")
+        if summary is None:
+            parts.append("null")
+        else:
+            min_dzmin, max_dzmax, sum_dcount, match_count = summary
+            parts.append("[")
+            parts.append(",".join((_format_z(min_dzmin),
+                                   _format_z(max_dzmax),
+                                   str(sum_dcount), str(match_count))))
+            parts.append("]")
+        parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
+def encode_delta_summary(result: tuple) -> str:
+    """Serialize the result of
+    :func:`aggregate_tile_pyramid_delta_windows`.
+
+    ``result`` must be the returned tuple: a tuple, in windows order, of
+    strict 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, summary)`` whose first five
+    fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose ``summary`` is either ``None`` or a strict
+    4-tuple ``(min_dzmin, max_dzmax, sum_dcount, match_count)`` where
+    ``min_dzmin``/``max_dzmax`` are finite floats with
+    ``min_dzmin <= max_dzmax`` and ``sum_dcount``/``match_count`` are
+    non-bool ints with ``match_count > 0``.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``windows``: an array (in windows order) of six-value arrays, the last
+    value being ``null`` or a four-value summary array
+    ``[min_dzmin, max_dzmax, sum_dcount, match_count]``. Integers are
+    decimal; ``min_dzmin``/``max_dzmax`` use exactly six decimal places
+    (negative zero written as ``0.000000``). The output has no whitespace,
+    ASCII is not escaped and ``NaN``/``Infinity`` never appear. An empty
+    result encodes as ``{"windows":[]}``. The input is never modified.
+
+    :raises TypeError: ``result`` is not a tuple.
+    :raises ValueError: the structure, field types, bounds, level range,
+        finiteness or match count are bad.
+    """
+    if not isinstance(result, tuple):
+        raise TypeError("result must be a tuple")
+    _validate_delta_summary(result)
+    return _format_delta_summary_text(result)
+
+
+def decode_delta_summary(text: str) -> tuple:
+    """Deserialize canonical JSON produced by :func:`encode_delta_summary`.
+
+    The document must be the compact encoder output: an object whose sole
+    top-level key is ``windows``; ``windows`` an array of strict six-value
+    arrays ``[level, ix_min, iy_min, ix_max, iy_max, summary]`` whose first
+    five values are non-bool ints with ``level >= 0`` and
+    ``ix_min <= ix_max``/``iy_min <= iy_max`` and whose ``summary`` is
+    either ``null`` or a strict four-value array
+    ``[min_dzmin, max_dzmax, sum_dcount, match_count]`` with
+    ``min_dzmin``/``max_dzmax`` finite floats satisfying
+    ``min_dzmin <= max_dzmax`` and ``sum_dcount``/``match_count`` non-bool
+    ints with ``match_count > 0``, and whose spelling is exactly canonical
+    (integers in decimal, the two floats with six decimals, negative zero
+    as ``0.000000``, no whitespace or extra keys, no ``NaN``/``Infinity``).
+
+    Returns the outer windows-order tuple of 6-tuples (each non-null
+    ``summary`` a 4-tuple); the empty document ``{"windows":[]}`` returns
+    ``()``. The input text is never modified.
+
+    :raises TypeError: ``text`` is not a ``str``.
+    :raises ValueError: the JSON syntax, key order, types, lengths, bounds,
+        level range, finiteness, match count, numeric formatting or
+        canonical re-encoding does not match.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("text is not valid JSON") from exc
+
+    if not isinstance(document, dict) or tuple(document) != ("windows",):
+        raise ValueError("top-level value must be an object with exactly the "
+                         "key 'windows'")
+    raw_windows = document["windows"]
+    if not isinstance(raw_windows, list):
+        raise ValueError("'windows' must be an array")
+
+    windows: list[tuple] = []
+    for raw_window in raw_windows:
+        if not isinstance(raw_window, list) or len(raw_window) != 6:
+            raise ValueError("each window must be an array of six values")
+        raw_summary = raw_window[5]
+        if raw_summary is not None:
+            if not isinstance(raw_summary, list) or len(raw_summary) != 4:
+                raise ValueError(
+                    "each window's summary must be null or an array of four "
+                    "values"
+                )
+            raw_summary = tuple(raw_summary)
+        windows.append(tuple(raw_window[:5]) + (raw_summary,))
+    result = tuple(windows)
+
+    # Structural rules: field types/finiteness, level range, window bounds,
+    # summary fields and match count.
+    _validate_delta_summary(result)
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal float formatting, leading zeros, -0,
+    # exponents and any other non-canonical spelling.
+    if _format_delta_summary_text(result) != text:
+        raise ValueError("JSON text is not the canonical delta-summary "
+                         "encoding")
+    return result
