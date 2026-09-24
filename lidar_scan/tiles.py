@@ -3842,3 +3842,122 @@ def decode_tile_pyramid_windows(text: str) -> tuple:
         raise ValueError("JSON text is not the canonical pyramid-windows "
                          "encoding")
     return result
+
+
+def _validate_tile_pyramid_delta_windows(result) -> None:
+    """Validate the tuple returned by :func:`query_tile_pyramid_delta_windows`.
+
+    Every member must be a 6-tuple
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` whose first five fields
+    are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose ``tiles`` is a tuple of strict 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)``: the first six
+    fields and ``dcount`` non-bool ints, ``dzmin``/``dzmax`` finite floats,
+    ``ix0 <= ix1``/``iy0 <= iy1``, the tiles strictly sorted by ``(tx, ty)``
+    with no duplicates and every tile's closed cell-index intervals
+    intersecting the window.
+    """
+    for window in result:
+        if not isinstance(window, tuple) or len(window) != 6:
+            raise ValueError(
+                "each window must be a 6-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max, tiles)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window[:5]):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        level, ix_min, iy_min, ix_max, iy_max, tiles = window
+        if level < 0:
+            raise ValueError("level must be >= 0")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        if not isinstance(tiles, tuple):
+            raise ValueError("tiles must be a tuple")
+        prev_key = None
+        for tile in tiles:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise ValueError(
+                    "each tile must be a 9-tuple "
+                    "(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)"
+                )
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(
+                        "tx, ty, ix0, iy0, ix1, iy1 and dcount must be "
+                        "non-bool ints"
+                    )
+            for value in tile[6:8]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("dzmin and dzmax must be finite floats")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("tiles must be sorted by (tx, ty) with no "
+                                 "duplicate coordinates")
+            prev_key = key
+            if not (tile[4] >= ix_min and tile[2] <= ix_max
+                    and tile[5] >= iy_min and tile[3] <= iy_max):
+                raise ValueError("each tile must intersect the window's "
+                                 "closed cell-index intervals")
+
+
+def _format_pyramid_delta_windows_text(result) -> str:
+    """Build the canonical compact JSON text of a delta-windows document."""
+    parts = ['{"windows":[']
+    for window_index, window in enumerate(result):
+        if window_index:
+            parts.append(",")
+        level, ix_min, iy_min, ix_max, iy_max, tiles = window
+        parts.append("[")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",[")
+        for tile_index, tile in enumerate(tiles):
+            if tile_index:
+                parts.append(",")
+            (tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount) = tile
+            parts.append("[")
+            parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
+                                   str(ix1), str(iy1), _format_z(dzmin),
+                                   _format_z(dzmax), str(dcount))))
+            parts.append("]")
+        parts.append("]]")
+    parts.append("]}")
+    return "".join(parts)
+
+
+def encode_tile_pyramid_delta_windows(result: tuple) -> str:
+    """Serialize the result of :func:`query_tile_pyramid_delta_windows`.
+
+    ``result`` must be the tuple returned by
+    :func:`query_tile_pyramid_delta_windows`: a tuple, in windows order, of
+    6-tuples ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` whose first
+    five fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max``
+    and ``iy_min <= iy_max`` and whose ``tiles`` is a tuple of 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` with the first six
+    fields and ``dcount`` non-bool ints, ``dzmin``/``dzmax`` finite floats,
+    ``ix0 <= ix1``/``iy0 <= iy1``, the tiles sorted strictly by ``(tx, ty)``
+    with no duplicates and every tile intersecting the window's closed
+    cell-index intervals.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``windows``: an array (in windows order) of six-value arrays, the last
+    value being an array of nine-value tiles in the tiles' stored order.
+    Integers are decimal; ``dzmin``/``dzmax`` use exactly six decimal places
+    (negative zero written as ``0.000000``). The output has no whitespace,
+    ASCII is not escaped and ``NaN``/``Infinity`` never appear. An empty
+    result encodes as ``{"windows":[]}``. The input is never modified and
+    repeated calls return identical strings.
+
+    :raises TypeError: ``result`` is not a tuple.
+    :raises ValueError: the structure, field types, ordering, duplicates,
+        cell bounds, window intersection or non-finite values are bad.
+    """
+    if not isinstance(result, tuple):
+        raise TypeError("result must be a tuple")
+    _validate_tile_pyramid_delta_windows(result)
+    return _format_pyramid_delta_windows_text(result)
