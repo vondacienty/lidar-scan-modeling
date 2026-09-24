@@ -2525,6 +2525,154 @@ def decode_tile_pyramid_assessment(text: str) -> tuple:
     return assessment
 
 
+def _validate_pyramid_deltas(assessment) -> None:
+    """Validate the outer tuple returned by :func:`assess_tile_pyramid_deltas`.
+
+    Every level must be a tuple of strict 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)``: the first six
+    fields and ``dcount`` are non-bool ints with ``ix0 <= ix1`` and
+    ``iy0 <= iy1``; ``dzmin``/``dzmax`` are finite floats; and the tiles are
+    sorted strictly by ``(tx, ty)`` with no duplicates.
+    """
+    for level_tiles in assessment:
+        if not isinstance(level_tiles, tuple):
+            raise ValueError("each assessment level must be a tuple")
+        prev_key = None
+        for tile in level_tiles:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise ValueError(
+                    "each tile must be a 9-tuple "
+                    "(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)"
+                )
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and "
+                                     "dcount must be non-bool ints")
+            for value in tile[6:8]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("dzmin and dzmax must be finite floats")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("each assessment level must be sorted by "
+                                 "(tx, ty) with no duplicate coordinates")
+            prev_key = key
+
+
+def encode_tile_pyramid_deltas(assessment: tuple) -> str:
+    """Serialize the result of :func:`assess_tile_pyramid_deltas`.
+
+    ``assessment`` must be the outer tuple returned by
+    :func:`assess_tile_pyramid_deltas`: each level is a tuple of strict
+    9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` with tiles sorted
+    strictly by ``(tx, ty)`` and no duplicates, where the first six fields and
+    ``dcount`` are non-bool ints satisfying ``ix0 <= ix1`` and
+    ``iy0 <= iy1``, and ``dzmin``/``dzmax`` are finite floats.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``levels``: an array (in level order) of arrays of tile arrays in the
+    tiles' stored order. Integers are decimal; ``dzmin``/``dzmax`` use exactly
+    six decimal places (negative zero written as ``0.000000``). The output has
+    no whitespace, ASCII is not escaped and ``NaN``/``Infinity`` never appear.
+    An empty assessment encodes as ``{"levels":[]}``. The input is never
+    modified.
+
+    :raises TypeError: ``assessment`` is not a tuple.
+    :raises ValueError: the structure, ordering, duplicates, fields,
+        finiteness or cell bounds are bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    _validate_pyramid_deltas(assessment)
+
+    parts = ['{"levels":[']
+    for level_index, level_tiles in enumerate(assessment):
+        if level_index:
+            parts.append(",")
+        parts.append("[")
+        for tile_index, tile in enumerate(level_tiles):
+            if tile_index:
+                parts.append(",")
+            (tx, ty, ix0, iy0, ix1, iy1,
+             dzmin, dzmax, dcount) = tile
+            parts.append("[")
+            parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
+                                   str(ix1), str(iy1), _format_z(dzmin),
+                                   _format_z(dzmax), str(dcount))))
+            parts.append("]")
+        parts.append("]")
+    parts.append(']}')
+    return "".join(parts)
+
+
+def decode_tile_pyramid_deltas(text: str) -> tuple:
+    """Deserialize canonical JSON produced by :func:`encode_tile_pyramid_deltas`.
+
+    The document must be the compact encoder output: an object whose sole
+    top-level key is ``levels``; ``levels`` an array (in level order) of
+    arrays of strict 9-item tiles
+    ``[tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount]`` whose first six
+    fields and ``dcount`` are non-bool ints with ``ix0 <= ix1`` and
+    ``iy0 <= iy1``, whose ``dzmin``/``dzmax`` are finite floats, and whose
+    ``(tx, ty)`` coordinates are strictly increasing with no duplicates within
+    each level, and whose spelling is exactly canonical (integers in decimal,
+    deltas with six decimals, negative zero as ``0.000000``, no whitespace or
+    extra keys, no ``NaN``/``Infinity``).
+
+    Returns the outer level-order tuple of tuples of 9-tuples in the
+    document's order; the empty document ``{"levels":[]}`` returns ``()``.
+    The input text is never modified.
+
+    :raises TypeError: ``text`` is not a ``str``.
+    :raises ValueError: the JSON syntax, top-level keys/types, level/tile
+        shape, field types, bounds, ordering, duplicates, non-finite values,
+        numeric formatting or canonical re-encoding does not match.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("text is not valid JSON") from exc
+
+    if not isinstance(document, dict) or tuple(document) != ("levels",):
+        raise ValueError("top-level value must be an object with exactly the "
+                         "key 'levels'")
+    raw_levels = document["levels"]
+    if not isinstance(raw_levels, list):
+        raise ValueError("'levels' must be an array")
+
+    levels: list[tuple] = []
+    for raw_tiles in raw_levels:
+        if not isinstance(raw_tiles, list):
+            raise ValueError("each level must be an array of tiles")
+        tiles: list[tuple] = []
+        for raw_tile in raw_tiles:
+            if not isinstance(raw_tile, list) or len(raw_tile) != 9:
+                raise ValueError("each tile must be an array of nine values")
+            tiles.append(tuple(raw_tile))
+        levels.append(tuple(tiles))
+    assessment = tuple(levels)
+
+    # Structural rules: tuple levels, field types/finiteness, cell bounds,
+    # (tx, ty) sort order and no duplicates.
+    _validate_pyramid_deltas(assessment)
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal delta formatting, leading zeros,
+    # -0, exponents and any other non-canonical spelling.
+    if encode_tile_pyramid_deltas(assessment) != text:
+        raise ValueError("JSON text is not the canonical pyramid-deltas "
+                         "encoding")
+    return assessment
+
+
 def decode_tile_pyramid_stats(text: str) -> tuple:
     """Deserialize canonical JSON produced by :func:`encode_tile_pyramid_stats`.
 
