@@ -4702,3 +4702,103 @@ def decode_delta_assessment(text: str) -> tuple:
         raise ValueError("JSON text is not the canonical delta-assessment "
                          "encoding")
     return assessment
+
+
+def merge_delta_assessments(assessments: tuple) -> tuple:
+    """Merge delta assessments produced by :func:`assess_delta_summary`.
+
+    ``assessments`` must be a tuple of assessments as returned by
+    :func:`assess_delta_summary` (it may be empty, in which case ``()`` is
+    returned). Each member is a tuple of strict 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, delta)`` whose first five
+    fields are non-bool ints with ``level >= 0`` and ordered bounds, whose
+    five-field keys are strictly increasing with no duplicates, and whose
+    ``delta`` is either ``None`` or a strict 4-tuple
+    ``(dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count)`` where the first
+    two values are finite non-bool ints or floats and the last two are
+    non-bool ints.
+
+    Keys are unioned across the assessments; an assessment missing a key
+    contributes nothing for it. When any present delta for the same key is
+    ``None`` while another is numeric, ``ValueError`` is raised; if every
+    present delta for a key is ``None`` the merged delta is ``None``.
+    Otherwise the fields are summed item by item: the two count deltas are
+    added as exact ints; the two min/max deltas are added as exact ints when
+    every summand is an int, and otherwise as a Decimal computation
+    (``Decimal(str(v))``, precision 50, ``ROUND_HALF_EVEN``) with the
+    summands accumulated in ascending value order, quantized to six decimal
+    places as a float (negative zero normalized).
+
+    Returns a tuple of the same 6-tuples sorted strictly by the five-field
+    keys. The result does not depend on the order of the inputs and the
+    inputs are never modified.
+
+    :raises TypeError: ``assessments`` is not a tuple.
+    :raises ValueError: a member is not a valid delta assessment, or the
+        deltas for the same key mix ``None`` with numeric values.
+    """
+    if not isinstance(assessments, tuple):
+        raise TypeError("assessments must be a tuple")
+    if not assessments:
+        return ()
+
+    for assessment in assessments:
+        if not isinstance(assessment, tuple):
+            raise ValueError("each assessment must be a tuple of windows")
+        _validate_delta_assessment(assessment)
+
+    # key -> [seen_none, raw dmin terms, raw dmax terms, dsum, dmatch];
+    # numeric deltas are accumulated field by field exactly as given (ints
+    # are only converted to Decimal when the field also contains a float),
+    # and any None delta for the key is remembered for the final check.
+    combined: dict[tuple, list] = {}
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for assessment in assessments:
+            for level, ix_min, iy_min, ix_max, iy_max, delta in assessment:
+                key = (level, ix_min, iy_min, ix_max, iy_max)
+                entry = combined.get(key)
+                if entry is None:
+                    if delta is None:
+                        combined[key] = [True, [], [], 0, 0]
+                    else:
+                        dmin, dmax, dsum, dmatch = delta
+                        combined[key] = [False, [dmin], [dmax], dsum, dmatch]
+                else:
+                    if delta is None:
+                        entry[0] = True
+                    else:
+                        dmin, dmax, dsum, dmatch = delta
+                        entry[1].append(dmin)
+                        entry[2].append(dmax)
+                        entry[3] += dsum
+                        entry[4] += dmatch
+
+        result = []
+        for key in sorted(combined):
+            has_none, dmin_terms, dmax_terms, dsum, dmatch = combined[key]
+            if has_none and dmin_terms:
+                raise ValueError(
+                    "deltas with the same "
+                    "(level, ix_min, iy_min, ix_max, iy_max) key must not mix "
+                    "None with numeric values"
+                )
+            if has_none:
+                delta = None
+            else:
+                if all(isinstance(term, int) for term in dmin_terms):
+                    dmin = sum(dmin_terms)
+                else:
+                    dmin = _quantize(_sorted_sum(
+                        [Decimal(str(term)) for term in dmin_terms]))
+                if all(isinstance(term, int) for term in dmax_terms):
+                    dmax = sum(dmax_terms)
+                else:
+                    dmax = _quantize(_sorted_sum(
+                        [Decimal(str(term)) for term in dmax_terms]))
+                delta = (dmin, dmax, dsum, dmatch)
+            result.append(key + (delta,))
+
+    return tuple(result)
