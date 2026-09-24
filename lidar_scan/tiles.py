@@ -826,6 +826,150 @@ def aggregate_tile_pyramid_delta_windows(assessment: tuple,
     return tuple(results)
 
 
+def _validate_delta_summary_entries(entries) -> None:
+    """Validate a tuple of delta-summary 6-tuples, raising ``ValueError``.
+
+    Each member must be a strict 6-tuple
+    ``(level, ix_min, iy_min, ix_max, iy_max, summary)`` whose first five
+    fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max``, whose five-field keys are strictly increasing with
+    no duplicates, and whose ``summary`` is either ``None`` or a strict
+    4-tuple ``(min_dzmin, max_dzmax, sum_dcount, match_count)`` where
+    ``min_dzmin``/``max_dzmax`` are finite non-bool ints/floats with
+    ``min_dzmin <= max_dzmax`` and ``sum_dcount``/``match_count`` are
+    non-bool ints with ``match_count > 0``.
+    """
+    prev_key = None
+    for window in entries:
+        if not isinstance(window, tuple) or len(window) != 6:
+            raise ValueError(
+                "each window must be a 6-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max, summary)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window[:5]):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        level, ix_min, iy_min, ix_max, iy_max, summary = window
+        if level < 0:
+            raise ValueError("level must be >= 0")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        key = (level, ix_min, iy_min, ix_max, iy_max)
+        if prev_key is not None and key <= prev_key:
+            raise ValueError("windows must be sorted by "
+                             "(level, ix_min, iy_min, ix_max, iy_max) with no "
+                             "duplicate keys")
+        prev_key = key
+        if summary is None:
+            continue
+        if not isinstance(summary, tuple) or len(summary) != 4:
+            raise ValueError(
+                "summary must be None or a 4-tuple "
+                "(min_dzmin, max_dzmax, sum_dcount, match_count)"
+            )
+        min_dzmin, max_dzmax, sum_dcount, match_count = summary
+        for name, value in (("min_dzmin", min_dzmin),
+                            ("max_dzmax", max_dzmax)):
+            if isinstance(value, bool) or not isinstance(
+                    value, _NUMERIC_TYPES):
+                raise ValueError(f"{name} must be a non-bool int or float")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        if min_dzmin > max_dzmax:
+            raise ValueError("summary must satisfy min_dzmin <= max_dzmax")
+        for name, value in (("sum_dcount", sum_dcount),
+                            ("match_count", match_count)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        if match_count <= 0:
+            raise ValueError("match_count must be > 0")
+
+
+def _delta_extremum(estimate_value, reference_value):
+    """Subtract two summary extrema, exact for two ints else a quantized float."""
+    if isinstance(estimate_value, int) and isinstance(reference_value, int):
+        return estimate_value - reference_value
+    delta = Decimal(str(estimate_value)) - Decimal(str(reference_value))
+    return _quantize(delta)
+
+
+def assess_delta_summary(estimate: tuple, reference: tuple) -> tuple:
+    """Assess aggregated delta-window summaries of an estimate vs a reference.
+
+    Both inputs are tuples of strict 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, summary)`` whose first five
+    fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose five-field keys are strictly increasing
+    with no duplicates. ``summary`` is either ``None`` or a strict 4-tuple
+    ``(min_dzmin, max_dzmax, sum_dcount, match_count)`` where
+    ``min_dzmin``/``max_dzmax`` are finite non-bool ints/floats with
+    ``min_dzmin <= max_dzmax`` and ``sum_dcount``/``match_count`` are
+    non-bool ints with ``match_count > 0``.
+
+    The two inputs must contain the same window keys, and the summaries of
+    matching windows must agree on their ``None`` status; otherwise
+    ``ValueError`` is raised.
+
+    Returns a tuple, in ``estimate`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, delta)`` tuples. When both
+    summaries are ``None``, ``delta`` is ``None``; otherwise ``delta`` is the
+    4-tuple ``(dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count)`` with each
+    field equal to the estimate value minus the reference value. The two
+    count differences are exact ints. An extremum difference of two ints is
+    also an exact int; if either operand is a float it is computed as
+    ``Decimal(str(v))`` at precision 50 with ``ROUND_HALF_EVEN``, quantized
+    to six decimal places as a float (negative zero normalized). Two empty
+    inputs return ``()``. The inputs are never modified.
+
+    :raises TypeError: ``estimate`` or ``reference`` is not a tuple.
+    :raises ValueError: the structure, ordering, duplicates, fields, level
+        range, bounds, summary shape or finiteness of either input are bad,
+        the window-key sets differ or matching windows disagree on their
+        ``None`` status.
+    """
+    if not isinstance(estimate, tuple):
+        raise TypeError("estimate must be a tuple")
+    if not isinstance(reference, tuple):
+        raise TypeError("reference must be a tuple")
+
+    _validate_delta_summary_entries(estimate)
+    _validate_delta_summary_entries(reference)
+
+    if len(estimate) != len(reference):
+        raise ValueError("estimate and reference must contain the same "
+                         "window keys")
+    for est_window, ref_window in zip(estimate, reference):
+        if est_window[:5] != ref_window[:5]:
+            raise ValueError("estimate and reference must contain the same "
+                             "window keys")
+        if (est_window[5] is None) != (ref_window[5] is None):
+            raise ValueError("matching windows must agree on their summary "
+                             "None status")
+
+    result = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for est_window, ref_window in zip(estimate, reference):
+            level, ix_min, iy_min, ix_max, iy_max, est_summary = est_window
+            ref_summary = ref_window[5]
+            if est_summary is None:
+                result.append((level, ix_min, iy_min, ix_max, iy_max, None))
+                continue
+            delta = (
+                _delta_extremum(est_summary[0], ref_summary[0]),
+                _delta_extremum(est_summary[1], ref_summary[1]),
+                est_summary[2] - ref_summary[2],
+                est_summary[3] - ref_summary[3],
+            )
+            result.append((level, ix_min, iy_min, ix_max, iy_max, delta))
+
+    return tuple(result)
+
+
 def query_tile_pyramid(pyramid: tuple, level: int, tx: int, ty: int) -> tuple | None:
     """Look up the tile ``(tx, ty)`` at ``level`` of a tile pyramid.
 
