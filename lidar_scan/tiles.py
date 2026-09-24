@@ -4702,3 +4702,101 @@ def decode_delta_assessment(text: str) -> tuple:
         raise ValueError("JSON text is not the canonical delta-assessment "
                          "encoding")
     return assessment
+
+
+def merge_delta_assessments(assessments: tuple) -> tuple:
+    """Merge delta assessments produced by :func:`assess_delta_summary`.
+
+    ``assessments`` must be a tuple of such assessments (it may be empty, in
+    which case ``()`` is returned). Each member must be a tuple of strict
+    6-tuples ``(level, ix_min, iy_min, ix_max, iy_max, delta)`` whose first
+    five fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max``
+    and ``iy_min <= iy_max``; the five-field keys must be strictly increasing
+    with no duplicates. ``delta`` is either ``None`` or a strict 4-tuple
+    ``(dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count)`` where the first
+    two values are finite non-bool ints or floats and the last two are
+    non-bool ints.
+
+    The five-field keys are unioned across the assessments; a key missing
+    from an assessment contributes nothing. Assessments sharing a key must
+    agree on its ``delta`` being ``None`` versus present, otherwise
+    ``ValueError`` is raised. When every contributing ``delta`` is ``None``
+    the merged ``delta`` is ``None``; otherwise the four fields are summed
+    term by term over the contributing deltas. The two count deltas are
+    exact ints; a minimum/maximum delta is an exact int sum when every
+    contributing term is an int, and otherwise a Decimal computation
+    (``Decimal(str(v))``, precision 50, ``ROUND_HALF_EVEN``) with the
+    summands accumulated in ascending Decimal order, quantized to six
+    decimal places as a float (negative zero normalized).
+
+    Returns a tuple of 6-tuples sorted by the five-field key. The result
+    does not depend on the order of the inputs and the inputs are never
+    modified.
+
+    :raises TypeError: ``assessments`` is not a tuple.
+    :raises ValueError: a member is not a valid assessment (structure,
+        field types, level range, bounds, key ordering/duplicates, delta
+        shape or finiteness) or assessments sharing a key disagree on the
+        delta being ``None`` versus present.
+    """
+    if not isinstance(assessments, tuple):
+        raise TypeError("assessments must be a tuple")
+    if not assessments:
+        return ()
+
+    for assessment in assessments:
+        if not isinstance(assessment, tuple):
+            raise ValueError("each assessment must be a tuple as returned "
+                             "by assess_delta_summary")
+        _validate_delta_assessment(assessment)
+
+    # key -> None (all contributing deltas None) or [dmin terms, dmax
+    # terms, dsum_dcount, dmatch_count]; the per-field summands are
+    # collected so their accumulation order does not depend on input order.
+    combined: dict[tuple, list | None] = {}
+    for assessment in assessments:
+        for window in assessment:
+            key = window[:5]
+            delta = window[5]
+            if key not in combined:
+                combined[key] = (None if delta is None
+                                 else [[delta[0]], [delta[1]],
+                                       delta[2], delta[3]])
+                continue
+            entry = combined[key]
+            if (entry is None) != (delta is None):
+                raise ValueError(
+                    "assessments sharing a key must agree on the delta "
+                    "being None versus present"
+                )
+            if delta is not None:
+                entry[0].append(delta[0])
+                entry[1].append(delta[1])
+                entry[2] += delta[2]
+                entry[3] += delta[3]
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        merged = []
+        for key in sorted(combined):
+            entry = combined[key]
+            if entry is None:
+                delta = None
+            else:
+                dmin_terms, dmax_terms, dsum_dcount, dmatch_count = entry
+                if all(isinstance(term, int) for term in dmin_terms):
+                    dmin = sum(dmin_terms)
+                else:
+                    dmin = _quantize(_sorted_sum(
+                        [Decimal(str(term)) for term in dmin_terms]))
+                if all(isinstance(term, int) for term in dmax_terms):
+                    dmax = sum(dmax_terms)
+                else:
+                    dmax = _quantize(_sorted_sum(
+                        [Decimal(str(term)) for term in dmax_terms]))
+                delta = (dmin, dmax, dsum_dcount, dmatch_count)
+            merged.append(key + (delta,))
+
+    return tuple(merged)
