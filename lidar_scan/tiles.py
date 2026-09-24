@@ -2722,6 +2722,98 @@ def decode_tile_pyramid_stats(text: str) -> tuple:
     return pyramid
 
 
+def merge_tile_pyramid_deltas(assessments: tuple) -> tuple:
+    """Merge per-tile delta assessments produced by
+    :func:`assess_tile_pyramid_deltas`.
+
+    ``assessments`` must be a tuple of outer assessment tuples (it may be
+    empty, in which case ``()`` is returned); every member must have the same
+    number of levels (possibly zero). Each level must be a tuple of strict
+    9-tuples ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` with tiles
+    sorted strictly by ``(tx, ty)`` and no duplicates, where the first six
+    fields and ``dcount`` are non-bool ints satisfying ``ix0 <= ix1`` and
+    ``iy0 <= iy1``, and ``dzmin``/``dzmax`` are finite floats.
+
+    Tiles are unioned per level and per ``(tx, ty)``; coordinates missing from
+    an assessment contribute zero. Tiles sharing a coordinate must also share
+    their ``(ix0, iy0, ix1, iy1)`` bounds; the merged tile keeps that geometry
+    and sums ``dzmin``, ``dzmax`` and ``dcount``. The two float sums are
+    Decimal computations (precision 50, ``ROUND_HALF_EVEN``, each input
+    converted via ``Decimal(str(v))``) with the summands accumulated in
+    ascending Decimal order, then quantized to six decimal places as floats
+    (negative zero normalized); ``dcount`` is an exact int sum.
+
+    Returns an assessment with the same levels in the same order, each level's
+    tiles sorted by ``(tx, ty)`` (empty levels are ``()``). The result does not
+    depend on the order of the inputs and the inputs are never modified.
+
+    :raises TypeError: ``assessments`` is not a tuple.
+    :raises ValueError: a member is not a tuple, the level counts differ, a
+        member's structure, ordering, duplicates, fields, finiteness or cell
+        bounds are bad, or same-coordinate tiles disagree on their cell
+        bounds.
+    """
+    if not isinstance(assessments, tuple):
+        raise TypeError("assessments must be a tuple")
+    if not assessments:
+        return ()
+
+    level_count = None
+    for assessment in assessments:
+        if not isinstance(assessment, tuple):
+            raise ValueError("each assessment must be a tuple of levels")
+        _validate_pyramid_deltas(assessment)
+        if level_count is None:
+            level_count = len(assessment)
+        elif len(assessment) != level_count:
+            raise ValueError("all assessments must have the same number "
+                             "of levels")
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        merged_levels = []
+        for level in range(level_count):
+            # key -> [bounds, dzmin terms, dzmax terms, dcount]; bounds come
+            # from the first assessment contributing the coordinate and the
+            # per-tile Decimal summands are sorted before accumulation.
+            combined: dict[tuple[int, int], list] = {}
+            for assessment in assessments:
+                for tile in assessment[level]:
+                    (tx, ty, ix0, iy0, ix1, iy1,
+                     dzmin, dzmax, dcount) = tile
+                    key = (tx, ty)
+                    bounds = (ix0, iy0, ix1, iy1)
+                    entry = combined.get(key)
+                    if entry is None:
+                        combined[key] = [bounds, [Decimal(str(dzmin))],
+                                         [Decimal(str(dzmax))], dcount]
+                    else:
+                        if entry[0] != bounds:
+                            raise ValueError(
+                                "tiles with the same (tx, ty) must agree on "
+                                "(ix0, iy0, ix1, iy1)"
+                            )
+                        entry[1].append(Decimal(str(dzmin)))
+                        entry[2].append(Decimal(str(dzmax)))
+                        entry[3] += dcount
+
+            level_tiles = []
+            for (tx, ty), entry in sorted(combined.items()):
+                bounds, dzmin_terms, dzmax_terms, dcount = entry
+                ix0, iy0, ix1, iy1 = bounds
+                level_tiles.append((
+                    tx, ty, ix0, iy0, ix1, iy1,
+                    _quantize(_sorted_sum(dzmin_terms)),
+                    _quantize(_sorted_sum(dzmax_terms)),
+                    dcount,
+                ))
+            merged_levels.append(tuple(level_tiles))
+
+    return tuple(merged_levels)
+
+
 def merge_tile_pyramids(pyramids: tuple) -> tuple:
     """Merge tile pyramids produced by :func:`build_tile_pyramid`.
 
