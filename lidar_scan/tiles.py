@@ -729,6 +729,103 @@ def query_tile_pyramid_delta_windows(assessment: tuple, windows: tuple) -> tuple
     return tuple(results)
 
 
+def aggregate_tile_pyramid_delta_windows(assessment: tuple,
+                                         windows: tuple) -> tuple:
+    """Aggregate delta tiles intersecting cell-index windows across levels.
+
+    ``assessment`` must be the outer tuple returned by
+    :func:`assess_tile_pyramid_deltas`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` 9-tuples sorted
+    strictly by ``(tx, ty)`` with no duplicates, where the first six fields
+    and ``dcount`` are non-bool ints with ``ix0 <= ix1`` and ``iy0 <= iy1``,
+    and ``dzmin``/``dzmax`` are finite floats.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max``; ``level`` must satisfy
+    ``0 <= level < len(assessment)``.
+
+    For each window, a tile matches when its closed cell-index intervals
+    intersect the window: ``tile.ix1 >= ix_min and tile.ix0 <= ix_max and
+    tile.iy1 >= iy_min and tile.iy0 <= iy_max``. Matching tiles are aggregated
+    in the level's existing order into
+    ``summary = (min_dzmin, max_dzmax, sum_dcount, match_count)`` where
+    ``min_dzmin`` is the minimum tile ``dzmin``, ``max_dzmax`` the maximum
+    tile ``dzmax`` (the extrema compared via ``Decimal(str(v))`` at precision
+    50 with ``ROUND_HALF_EVEN`` and quantized to six decimal places as floats,
+    negative zero normalized), ``sum_dcount`` is the exact int sum of the
+    tile ``dcount`` values and ``match_count`` is the int number of matching
+    tiles.
+
+    Returns a tuple, in ``windows`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, summary)`` tuples; a window with
+    no matching tile gets ``summary = None`` and an empty ``windows`` tuple
+    returns ``()``. The input is never modified and repeated calls return
+    identical results.
+
+    :raises TypeError: ``assessment``/``windows`` is not a tuple or a window's
+        container, length or field types are bad.
+    :raises ValueError: ``level`` is out of range, the window bounds are
+        inverted, or the assessment's structure, ordering, duplicates, fields,
+        cell bounds or finiteness are bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    _validate_pyramid_deltas(assessment)
+
+    results = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for level, ix_min, iy_min, ix_max, iy_max in windows:
+            if level < 0 or level >= len(assessment):
+                raise ValueError("level out of range")
+            if ix_min > ix_max or iy_min > iy_max:
+                raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                                 "and iy_min <= iy_max")
+
+            min_dzmin = None
+            max_dzmax = None
+            sum_dcount = 0
+            match_count = 0
+            for tile in assessment[level]:
+                if not (tile[4] >= ix_min and tile[2] <= ix_max
+                        and tile[5] >= iy_min and tile[3] <= iy_max):
+                    continue
+                ddzmin = Decimal(str(tile[6]))
+                ddzmax = Decimal(str(tile[7]))
+                if min_dzmin is None or ddzmin < min_dzmin:
+                    min_dzmin = ddzmin
+                if max_dzmax is None or ddzmax > max_dzmax:
+                    max_dzmax = ddzmax
+                sum_dcount += tile[8]
+                match_count += 1
+
+            if match_count:
+                summary = (_quantize(min_dzmin), _quantize(max_dzmax),
+                           sum_dcount, match_count)
+            else:
+                summary = None
+            results.append((level, ix_min, iy_min, ix_max, iy_max, summary))
+
+    return tuple(results)
+
+
 def query_tile_pyramid(pyramid: tuple, level: int, tx: int, ty: int) -> tuple | None:
     """Look up the tile ``(tx, ty)`` at ``level`` of a tile pyramid.
 
