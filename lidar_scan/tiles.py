@@ -4371,3 +4371,146 @@ def decode_delta_summary(text: str) -> tuple:
         raise ValueError("JSON text is not the canonical delta-summary "
                          "encoding")
     return result
+
+
+def _validate_delta_summary_entries(entries) -> None:
+    """Validate an input tuple of delta-summary 6-tuples for
+    :func:`assess_delta_summary`, raising ``ValueError``.
+
+    Each member must be a strict 6-tuple
+    ``(level, ix_min, iy_min, ix_max, iy_max, summary)`` whose first five
+    fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max``; the five-field keys must be strictly increasing
+    with no duplicates. ``summary`` is either ``None`` or a strict 4-tuple
+    ``(min_dzmin, max_dzmax, sum_dcount, match_count)`` where
+    ``min_dzmin``/``max_dzmax`` are finite non-bool ints or floats with
+    ``min_dzmin <= max_dzmax`` and ``sum_dcount``/``match_count`` are
+    non-bool ints with ``match_count > 0``.
+    """
+    prev_key = None
+    for window in entries:
+        if not isinstance(window, tuple) or len(window) != 6:
+            raise ValueError(
+                "each entry must be a 6-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max, summary)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window[:5]):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        level, ix_min, iy_min, ix_max, iy_max, summary = window
+        if level < 0:
+            raise ValueError("level must be >= 0")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        key = (level, ix_min, iy_min, ix_max, iy_max)
+        if prev_key is not None and key <= prev_key:
+            raise ValueError(
+                "entries must be sorted strictly by "
+                "(level, ix_min, iy_min, ix_max, iy_max) with no duplicate "
+                "keys"
+            )
+        prev_key = key
+
+        if summary is None:
+            continue
+        if not isinstance(summary, tuple) or len(summary) != 4:
+            raise ValueError(
+                "summary must be None or a 4-tuple "
+                "(min_dzmin, max_dzmax, sum_dcount, match_count)"
+            )
+        min_dzmin, max_dzmax, sum_dcount, match_count = summary
+        for name, value in (("min_dzmin", min_dzmin),
+                            ("max_dzmax", max_dzmax)):
+            if isinstance(value, bool) or not isinstance(value, _NUMERIC_TYPES):
+                raise ValueError(f"{name} must be a non-bool int or float")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        if Decimal(str(min_dzmin)) > Decimal(str(max_dzmax)):
+            raise ValueError("summary must satisfy min_dzmin <= max_dzmax")
+        for name, value in (("sum_dcount", sum_dcount),
+                            ("match_count", match_count)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        if match_count <= 0:
+            raise ValueError("match_count must be > 0")
+
+
+def assess_delta_summary(estimate: tuple, reference: tuple) -> tuple:
+    """Compute per-window summary deltas of an estimated vs a reference result.
+
+    Both inputs are tuples as returned by
+    :func:`aggregate_tile_pyramid_delta_windows`: members are strict 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, summary)`` whose first five
+    fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose five-field keys are strictly increasing
+    with no duplicates. ``summary`` is either ``None`` or a strict 4-tuple
+    ``(min_dzmin, max_dzmax, sum_dcount, match_count)`` where
+    ``min_dzmin``/``max_dzmax`` are finite non-bool ints or floats with
+    ``min_dzmin <= max_dzmax`` and ``sum_dcount``/``match_count`` are
+    non-bool ints with ``match_count > 0``.
+
+    The two inputs must contain the same five-field keys, and the two
+    summaries for each key must agree on being ``None`` versus present;
+    otherwise ``ValueError`` is raised.
+
+    Returns a tuple, in ``estimate`` order, of 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, delta)``. When both summaries
+    are ``None``, ``delta`` is ``None``; otherwise it is the 4-tuple
+    ``(dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count)`` with each value
+    computed as ``estimate - reference``. The two count deltas are exact
+    ints; a minimum/maximum delta is an exact int when both operands are
+    ints, and otherwise a Decimal computation
+    (``Decimal(str(v))``, precision 50, ``ROUND_HALF_EVEN``) quantized to
+    six decimal places as a float (negative zero normalized). Two empty
+    inputs return ``()``. The inputs are never modified.
+
+    :raises TypeError: ``estimate`` or ``reference`` is not a tuple.
+    :raises ValueError: the structure, ordering, duplicate keys, field
+        types, level range, bounds, summary shape, finiteness,
+        ``match_count``, key sets or None states of either input are bad.
+    """
+    if not isinstance(estimate, tuple):
+        raise TypeError("estimate must be a tuple")
+    if not isinstance(reference, tuple):
+        raise TypeError("reference must be a tuple")
+
+    _validate_delta_summary_entries(estimate)
+    _validate_delta_summary_entries(reference)
+
+    estimate_states = {window[:5]: window[5] is None for window in estimate}
+    reference_states = {window[:5]: window[5] is None for window in reference}
+    if estimate_states != reference_states:
+        raise ValueError("estimate and reference must contain the same keys "
+                         "with matching summary None states")
+    reference_summaries = {window[:5]: window[5] for window in reference}
+
+    result = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for level, ix_min, iy_min, ix_max, iy_max, est_summary in estimate:
+            key = (level, ix_min, iy_min, ix_max, iy_max)
+            if est_summary is None:
+                delta = None
+            else:
+                ref_summary = reference_summaries[key]
+                est_min, est_max, est_sum, est_matches = est_summary
+                ref_min, ref_max, ref_sum, ref_matches = ref_summary
+                if isinstance(est_min, int) and isinstance(ref_min, int):
+                    dmin = est_min - ref_min
+                else:
+                    dmin = _quantize(
+                        Decimal(str(est_min)) - Decimal(str(ref_min)))
+                if isinstance(est_max, int) and isinstance(ref_max, int):
+                    dmax = est_max - ref_max
+                else:
+                    dmax = _quantize(
+                        Decimal(str(est_max)) - Decimal(str(ref_max)))
+                delta = (dmin, dmax,
+                         est_sum - ref_sum, est_matches - ref_matches)
+            result.append((level, ix_min, iy_min, ix_max, iy_max, delta))
+
+    return tuple(result)
