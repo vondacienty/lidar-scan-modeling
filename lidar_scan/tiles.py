@@ -2963,3 +2963,197 @@ def update_tile_pyramid(pyramid: tuple,
             new_pyramid.append(tuple(level_tiles))
 
     return merge_tile_pyramids((pyramid, tuple(new_pyramid)))
+
+
+def update_tile_pyramid_windows(pyramid: tuple,
+                                points: Iterable[tuple | list],
+                                windows: tuple,
+                                cell_size: int | float = 1.0,
+                                tile_cells: int = 256,
+                                levels: int = 3) -> tuple:
+    """Add points to a tile pyramid, then select tiles intersecting windows.
+
+    Equivalent to ::
+
+        updated = update_tile_pyramid(pyramid, points, cell_size,
+                                      tile_cells, levels)
+        query_tile_pyramid_windows(updated, windows)
+
+    but ``points`` is consumed in a single pass (``iter()`` is called exactly
+    once and ``len()`` is never called on it): the new points are aggregated
+    into a pyramid exactly as in :func:`build_tile_pyramid`, combined with
+    ``pyramid`` as in :func:`merge_tile_pyramids`, and the windows are then
+    evaluated against the combined pyramid as in
+    :func:`query_tile_pyramid_windows`.
+
+    ``pyramid`` must be an outer tuple as produced by
+    :func:`build_tile_pyramid` with exactly ``levels`` levels: each level is a
+    tuple of ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples
+    sorted strictly by ``(tx, ty)`` with no duplicates, where the first six
+    fields and ``count`` are non-bool ints, ``zmin``/``zmax`` are finite
+    floats, and at level ``l`` every tile's bounds must be
+    ``(tx * N, ty * N, (tx + 1) * N - 1, (ty + 1) * N - 1)`` where
+    ``N = tile_cells * 2 ** l``.
+
+    Each point is a 5-item ``(x, y, z, intensity, sigma)`` tuple/list of
+    finite non-bool ints/floats with ``sigma > 0``; cell indices are
+    ``ix = floor(x / cell_size)``, ``iy = floor(y / cell_size)`` and at level
+    ``l`` each tile covers ``N = tile_cells * 2 ** l`` cells per axis.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max``; ``level`` must satisfy
+    ``0 <= level < levels``.
+
+    For each window, a tile of the combined pyramid matches when its closed
+    cell-index intervals intersect the window:
+    ``tile.ix1 >= ix_min and tile.ix0 <= ix_max and tile.iy1 >= iy_min and
+    tile.iy0 <= iy_max``. An empty ``points`` iterable queries ``pyramid``
+    unchanged.
+
+    Returns a tuple, in ``windows`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` tuples where ``tiles``
+    is a tuple of the combined pyramid's 9-tuples at that level, preserving
+    the level's existing order; a window with no matching tile gets an empty
+    ``tiles`` tuple and an empty ``windows`` tuple returns ``()``. The input
+    pyramid, points and windows are never modified, the result does not depend
+    on the order in which points arrive, and repeated calls return identical
+    results. ``zmin``/``zmax`` of newly aggregated tiles are Decimal
+    computations (``Decimal(str(v))``, precision 50, ``ROUND_HALF_EVEN``)
+    quantized to six decimal places as floats (negative zero normalized).
+
+    :raises TypeError: ``pyramid``/``windows`` is not a tuple, ``points`` is
+        not iterable, a window's or point's container/length/field types are
+        bad, or ``cell_size``/``tile_cells``/``levels`` have the wrong type.
+    :raises ValueError: a parameter or point field is non-finite,
+        ``cell_size``/``tile_cells``/``levels``/``sigma`` is non-positive, the
+        level count does not match ``pyramid``, the pyramid's structure,
+        ordering, duplicates, fields or cell bounds are bad, ``level`` is out
+        of range, the window bounds are inverted, or same-coordinate tiles
+        disagree on their cell bounds.
+    """
+    if not isinstance(pyramid, tuple):
+        raise TypeError("pyramid must be a tuple")
+    if isinstance(cell_size, bool) or not isinstance(cell_size, _NUMERIC_TYPES):
+        raise TypeError("cell_size must be a non-bool int or float")
+    if isinstance(cell_size, float) and not math.isfinite(cell_size):
+        raise ValueError("cell_size must be finite")
+    if isinstance(tile_cells, bool) or not isinstance(tile_cells, int):
+        raise TypeError("tile_cells must be a non-bool int")
+    if tile_cells <= 0:
+        raise ValueError("tile_cells must be positive")
+    if isinstance(levels, bool) or not isinstance(levels, int):
+        raise TypeError("levels must be a non-bool int")
+    if levels <= 0:
+        raise ValueError("levels must be positive")
+
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    _validate_pyramid(pyramid)
+    if len(pyramid) != levels:
+        raise ValueError("all pyramids must have the same number of levels")
+    for level, level_tiles in enumerate(pyramid):
+        width = tile_cells * 2 ** level
+        for tile in level_tiles:
+            tx, ty, ix0, iy0, ix1, iy1 = tile[0:6]
+            if (ix0, iy0, ix1, iy1) != (
+                tx * width, ty * width,
+                (tx + 1) * width - 1, (ty + 1) * width - 1,
+            ):
+                raise ValueError(
+                    "tile bounds must be (tx * N, ty * N, (tx + 1) * N - 1, "
+                    "(ty + 1) * N - 1) with N = tile_cells * 2 ** level"
+                )
+
+    for level, ix_min, iy_min, ix_max, iy_max in windows:
+        if level < 0 or level >= levels:
+            raise ValueError("level out of range")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+
+    # Single pass over ``points``: iter() is called exactly once, len() is
+    # never called on it, and every level is aggregated simultaneously. The
+    # new points are accumulated exactly as in build_tile_pyramid and the
+    # resulting pyramid is then combined with ``pyramid`` via
+    # merge_tile_pyramids before the windows are evaluated, guaranteeing
+    # identical results to update_tile_pyramid followed by
+    # query_tile_pyramid_windows.
+    point_iter = iter(points)
+
+    widths = [tile_cells * 2 ** level for level in range(levels)]
+    tiles_per_level: list[dict[tuple[int, int], list]] = [
+        {} for _ in range(levels)
+    ]
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        dcell = Decimal(str(cell_size))
+        if dcell <= 0:
+            raise ValueError("cell_size must be positive")
+
+        saw_point = False
+        for point in point_iter:
+            if not isinstance(point, (tuple, list)) or len(point) != 5:
+                raise TypeError("each point must be a tuple or list of 5 items "
+                                "(x, y, z, intensity, sigma)")
+
+            dx = _as_decimal(point[0])
+            dy = _as_decimal(point[1])
+            dz = _as_decimal(point[2])
+            _as_decimal(point[3])
+            dsigma = _as_decimal(point[4])
+            if dsigma <= 0:
+                raise ValueError("sigma must be positive")
+
+            ix = int((dx / dcell).to_integral_value(rounding=ROUND_FLOOR))
+            iy = int((dy / dcell).to_integral_value(rounding=ROUND_FLOOR))
+
+            for level, width in enumerate(widths):
+                key = (ix // width, iy // width)
+                tiles = tiles_per_level[level]
+                entry = tiles.get(key)
+                if entry is None:
+                    tiles[key] = [dz, dz, 1]
+                else:
+                    if dz < entry[0]:
+                        entry[0] = dz
+                    if dz > entry[1]:
+                        entry[1] = dz
+                    entry[2] += 1
+            saw_point = True
+
+        if not saw_point:
+            updated = pyramid
+        else:
+            new_pyramid = []
+            for width, tiles in zip(widths, tiles_per_level):
+                level_tiles = []
+                for (tx, ty), (zmin, zmax, count) in tiles.items():
+                    ix0 = tx * width
+                    iy0 = ty * width
+                    level_tiles.append((
+                        tx, ty,
+                        ix0, iy0,
+                        ix0 + width - 1, iy0 + width - 1,
+                        _quantize(zmin), _quantize(zmax),
+                        count,
+                    ))
+                level_tiles.sort(key=lambda item: (item[0], item[1]))
+                new_pyramid.append(tuple(level_tiles))
+            updated = merge_tile_pyramids((pyramid, tuple(new_pyramid)))
+
+    return query_tile_pyramid_windows(updated, windows)
