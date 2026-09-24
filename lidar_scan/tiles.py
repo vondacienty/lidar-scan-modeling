@@ -3170,6 +3170,85 @@ def merge_tile_pyramid_deltas(assessments: tuple) -> tuple:
     return tuple(merged_levels)
 
 
+def merge_tile_pyramid_delta_windows(assessments: tuple, windows: tuple) -> tuple:
+    """Merge delta assessments and select tiles intersecting cell-index windows.
+
+    Equivalent to
+    ``query_tile_pyramid_delta_windows(merge_tile_pyramid_deltas(assessments), windows)``.
+
+    ``assessments`` must be a tuple of outer assessments as produced by
+    :func:`assess_tile_pyramid_deltas`; every member must have the same number
+    of levels (possibly zero). Each level must be a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` 9-tuples, with the
+    first six fields and ``dcount`` non-bool ints satisfying ``ix0 <= ix1``
+    and ``iy0 <= iy1``, ``dzmin``/``dzmax`` finite floats, and tiles strictly
+    sorted by ``(tx, ty)`` without duplicates.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max``; ``level`` must satisfy
+    ``0 <= level < len(merged)`` where ``merged`` is the merged assessment.
+
+    Tiles are unioned per level and per ``(tx, ty)``. Tiles sharing a
+    coordinate must also share their ``(ix0, iy0, ix1, iy1)`` bounds; the
+    merged tile keeps that geometry, sums the ``dzmin``/``dzmax`` deltas of
+    the assessments that contain the coordinate (a missing tile contributes
+    zero) and sums ``dcount`` exactly. The float sums are Decimal
+    computations (precision 50, ``ROUND_HALF_EVEN``, each input converted via
+    ``Decimal(str(v))``) with the summands accumulated in ascending Decimal
+    order, quantized to six decimal places as floats (negative zero
+    normalized). For each window, a merged tile matches when its closed
+    cell-index intervals intersect the window: ``tile.ix1 >= ix_min and
+    tile.ix0 <= ix_max and tile.iy1 >= iy_min and tile.iy0 <= iy_max``.
+
+    Returns a tuple, in ``windows`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` tuples where ``tiles``
+    is a tuple of the merged assessment's 9-tuples at that level, sorted
+    lexicographically by ``(tx, ty)``; a window with no matching tile gets an
+    empty ``tiles`` tuple. An empty ``assessments`` tuple is only valid with
+    an empty ``windows`` tuple and returns ``()``. The result does not depend
+    on the order of the inputs and the inputs are never modified.
+
+    :raises TypeError: ``assessments``/``windows`` is not a tuple or a
+        window's container, length or field types are bad.
+    :raises ValueError: a member is not a valid assessment, the level counts
+        differ, same-coordinate tiles disagree on their cell bounds, ``level``
+        is out of range or the window bounds are inverted.
+    """
+    if not isinstance(assessments, tuple):
+        raise TypeError("assessments must be a tuple")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    merged = merge_tile_pyramid_deltas(assessments)
+
+    results = []
+    for level, ix_min, iy_min, ix_max, iy_max in windows:
+        if level < 0 or level >= len(merged):
+            raise ValueError("level out of range")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        matched = tuple(
+            tile for tile in merged[level]
+            if (tile[4] >= ix_min and tile[2] <= ix_max
+                and tile[5] >= iy_min and tile[3] <= iy_max)
+        )
+        results.append((level, ix_min, iy_min, ix_max, iy_max, matched))
+
+    return tuple(results)
+
+
 def update_tile_pyramid_stats(pyramid: tuple,
                               points: Iterable[tuple | list],
                               cell_size: int | float = 1.0,
