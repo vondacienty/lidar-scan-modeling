@@ -4514,3 +4514,196 @@ def assess_delta_summary(estimate: tuple, reference: tuple) -> tuple:
             result.append((level, ix_min, iy_min, ix_max, iy_max, delta))
 
     return tuple(result)
+
+
+def _validate_delta_assessment(assessment) -> None:
+    """Validate the tuple returned by :func:`assess_delta_summary`.
+
+    Every member must be a strict 6-tuple
+    ``(level, ix_min, iy_min, ix_max, iy_max, delta)`` whose first five fields
+    are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max``; the five-field keys must be strictly increasing with
+    no duplicates. ``delta`` is either ``None`` or a strict 4-tuple
+    ``(dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count)`` where
+    ``dmin_dzmin``/``dmax_dzmax`` are finite non-bool ints or floats (in
+    either order) and ``dsum_dcount``/``dmatch_count`` are non-bool ints.
+    """
+    prev_key = None
+    for window in assessment:
+        if not isinstance(window, tuple) or len(window) != 6:
+            raise ValueError(
+                "each window must be a 6-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max, delta)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window[:5]):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        level, ix_min, iy_min, ix_max, iy_max, delta = window
+        if level < 0:
+            raise ValueError("level must be >= 0")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        key = (level, ix_min, iy_min, ix_max, iy_max)
+        if prev_key is not None and key <= prev_key:
+            raise ValueError(
+                "windows must be sorted strictly by "
+                "(level, ix_min, iy_min, ix_max, iy_max) with no duplicate "
+                "keys"
+            )
+        prev_key = key
+
+        if delta is None:
+            continue
+        if not isinstance(delta, tuple) or len(delta) != 4:
+            raise ValueError(
+                "delta must be None or a 4-tuple "
+                "(dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count)"
+            )
+        dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count = delta
+        for name, value in (("dmin_dzmin", dmin_dzmin),
+                            ("dmax_dzmax", dmax_dzmax)):
+            if isinstance(value, bool) or not isinstance(value, _NUMERIC_TYPES):
+                raise ValueError(f"{name} must be a non-bool int or float")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        for name, value in (("dsum_dcount", dsum_dcount),
+                            ("dmatch_count", dmatch_count)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+
+
+def _format_number(value) -> str:
+    """Format a non-bool int in decimal or a finite float with six decimals."""
+    if isinstance(value, int):
+        return str(value)
+    return _format_z(value)
+
+
+def _format_delta_assessment_text(assessment) -> str:
+    """Build the canonical compact JSON text of a delta-assessment document."""
+    parts = ['{"windows":[']
+    for window_index, (level, ix_min, iy_min, ix_max, iy_max,
+                       delta) in enumerate(assessment):
+        if window_index:
+            parts.append(",")
+        parts.append("[")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",")
+        if delta is None:
+            parts.append("null")
+        else:
+            dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count = delta
+            parts.append("[")
+            parts.append(",".join((_format_number(dmin_dzmin),
+                                   _format_number(dmax_dzmax),
+                                   str(dsum_dcount),
+                                   str(dmatch_count))))
+            parts.append("]")
+        parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
+def encode_delta_assessment(assessment: tuple) -> str:
+    """Serialize the result of :func:`assess_delta_summary`.
+
+    ``assessment`` must be that function's returned tuple: a tuple, in
+    windows order, of strict 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, delta)`` whose first five fields
+    are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose five-field keys are strictly increasing
+    with no duplicates. ``delta`` is either ``None`` or a strict 4-tuple
+    ``(dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count)`` where
+    ``dmin_dzmin``/``dmax_dzmax`` are finite non-bool ints or floats (in
+    either order) and ``dsum_dcount``/``dmatch_count`` are non-bool ints.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``windows``: an array (in windows order) of six-value arrays, the last
+    value being ``null`` or a four-value delta array. Integers are decimal;
+    float deltas use exactly six decimal places (negative zero written as
+    ``0.000000``). The output has no whitespace, ASCII is not escaped and
+    ``NaN``/``Infinity`` never appear. An empty assessment encodes as
+    ``{"windows":[]}``. The input is never modified and repeated calls return
+    identical results.
+
+    :raises TypeError: ``assessment`` is not a tuple.
+    :raises ValueError: the structure, field types, level range, bounds, key
+        ordering, duplicates, delta shape or finiteness are bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    _validate_delta_assessment(assessment)
+    return _format_delta_assessment_text(assessment)
+
+
+def decode_delta_assessment(text: str) -> tuple:
+    """Deserialize canonical JSON produced by :func:`encode_delta_assessment`.
+
+    The document must be the compact encoder output: an object whose sole
+    top-level key is ``windows``; ``windows`` an array of strict six-value
+    arrays ``[level, ix_min, iy_min, ix_max, iy_max, delta]`` whose first five
+    values are non-bool ints with ``level >= 0``,
+    ``ix_min <= ix_max``/``iy_min <= iy_max`` and strictly increasing
+    five-field keys with no duplicates, and whose ``delta`` is either ``null``
+    or a strict four-value array
+    ``[dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count]`` with the first two
+    values finite non-bool ints or floats and the last two non-bool ints, and
+    whose spelling is exactly canonical (integers in decimal, floats with six
+    decimals, negative zero as ``0.000000``, no whitespace or extra keys, no
+    ``NaN``/``Infinity``).
+
+    Returns the outer windows-order tuple of 6-tuples (each non-null ``delta``
+    a 4-tuple); the empty document ``{"windows":[]}`` returns ``()``. The
+    input text is never modified and repeated calls return identical results.
+
+    :raises TypeError: ``text`` is not a ``str``.
+    :raises ValueError: the JSON syntax, key order, types, lengths, level
+        range, bounds, key ordering, duplicates, delta shape, finiteness,
+        numeric formatting or canonical re-encoding does not match.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("text is not valid JSON") from exc
+
+    if not isinstance(document, dict) or tuple(document) != ("windows",):
+        raise ValueError("top-level value must be an object with exactly the "
+                         "key 'windows'")
+    raw_windows = document["windows"]
+    if not isinstance(raw_windows, list):
+        raise ValueError("'windows' must be an array")
+
+    windows: list[tuple] = []
+    for raw_window in raw_windows:
+        if not isinstance(raw_window, list) or len(raw_window) != 6:
+            raise ValueError("each window must be an array of six values")
+        raw_delta = raw_window[5]
+        if raw_delta is not None:
+            if not isinstance(raw_delta, list) or len(raw_delta) != 4:
+                raise ValueError(
+                    "each window's delta must be null or an array of "
+                    "four values"
+                )
+            raw_delta = tuple(raw_delta)
+        windows.append(tuple(raw_window[:5]) + (raw_delta,))
+    result = tuple(windows)
+
+    # Structural rules: field types/finiteness, level range, window bounds,
+    # key ordering/duplicates and delta fields.
+    _validate_delta_assessment(result)
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal float formatting, leading zeros, -0,
+    # exponents and any other non-canonical spelling.
+    if _format_delta_assessment_text(result) != text:
+        raise ValueError("JSON text is not the canonical delta-assessment "
+                         "encoding")
+    return result
