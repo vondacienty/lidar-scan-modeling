@@ -5922,3 +5922,213 @@ def apply_tile_pyramid_deltas(base: tuple, deltas: tuple,
         results.append((level, ix_min, iy_min, ix_max, iy_max, matched))
 
     return tuple(results)
+
+
+def rollback_tile_pyramid_delta_windows(base: tuple, deltas: tuple,
+                                        windows: tuple) -> tuple:
+    """Subtract reorder-tolerant pyramid deltas and select tiles by windows.
+
+    Every coordinate of ``base`` is rolled back against the same-coordinate
+    tile of ``deltas``: ``zmin``/``zmax`` equal the base value minus the
+    same-coordinate delta value and ``count`` the base count minus the
+    same-coordinate ``dcount``; the rolled-back tiles are then filtered per
+    window.
+
+    ``base`` must be an outer tuple as produced by :func:`build_tile_pyramid`:
+    each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples sorted
+    strictly by ``(tx, ty)`` with no duplicates, where the first six fields and
+    ``count`` are non-bool ints with ``count >= 0``, ``zmin``/``zmax`` are
+    finite floats with ``zmin <= zmax`` and the bounds satisfy
+    ``ix0 <= ix1`` and ``iy0 <= iy1``.
+
+    ``deltas`` must be an outer tuple with the same number of levels as
+    ``base`` (an empty ``deltas`` queries ``base`` unchanged): each level is a
+    tuple, possibly empty, of
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` 9-tuples where the
+    first six fields and ``dcount`` are non-bool ints with ``ix0 <= ix1`` and
+    ``iy0 <= iy1`` and ``dzmin``/``dzmax`` are finite floats. At every level
+    the two inputs must contain the same ``(tx, ty)`` coordinates with
+    identical ``(ix0, iy0, ix1, iy1)`` bounds, but the delta tiles may be
+    presented in any order — matching is by ``(tx, ty)`` coordinate and
+    duplicate coordinates within a level are rejected; otherwise
+    ``ValueError`` is raised.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max``; ``level`` must satisfy
+    ``0 <= level < len(base)``.
+
+    For each window, a rolled-back tile matches when its closed cell-index
+    intervals intersect the window: ``tile.ix1 >= ix_min and
+    tile.ix0 <= ix_max and tile.iy1 >= iy_min and tile.iy0 <= iy_max``.
+
+    Returns a tuple, in ``windows`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` tuples where ``tiles``
+    is a tuple of rolled-back
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples preserving
+    ``base`` order; a window with no matching tile gets an empty ``tiles``
+    tuple and an empty ``windows`` tuple returns ``()``. The rollback
+    differences are Decimal computations (``Decimal(str(v))``, precision 50,
+    ``ROUND_HALF_EVEN``) kept as exact ints when both operands are integral
+    and otherwise quantized to six decimal places as floats (negative zero
+    normalized); ``count`` is subtracted exactly. Each resulting tile must
+    satisfy ``zmin <= zmax`` and ``count >= 0``; otherwise ``ValueError`` is
+    raised. The inputs are never modified and the result does not depend on
+    the order of ``deltas``.
+
+    :raises TypeError: ``base``/``deltas``/``windows`` is not a tuple or a
+        window's container, length or field types are bad.
+    :raises ValueError: the structure, ordering, duplicates, fields, cell
+        bounds, z bounds, counts, level counts or coordinate sets of
+        ``base``/``deltas`` are bad, a resulting tile violates
+        ``zmin <= zmax`` or ``count >= 0``, ``level`` is out of range, or the
+        window bounds are inverted.
+    """
+    if not isinstance(base, tuple):
+        raise TypeError("base must be a tuple")
+    if not isinstance(deltas, tuple):
+        raise TypeError("deltas must be a tuple")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    _validate_pyramid(base)
+
+    for level_tiles in base:
+        for tile in level_tiles:
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            if tile[6] > tile[7]:
+                raise ValueError("zmin must be <= zmax")
+            if tile[8] < 0:
+                raise ValueError("count must be >= 0")
+
+    # The delta tiles may be reordered within each level, so they are
+    # validated for structure, fields, bounds and duplicates here without
+    # requiring a sorted order.
+    for delta_level in deltas:
+        if not isinstance(delta_level, tuple):
+            raise ValueError("each deltas level must be a tuple")
+        seen_keys = set()
+        for tile in delta_level:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise ValueError(
+                    "each tile must be a 9-tuple "
+                    "(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)"
+                )
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and "
+                                     "dcount must be non-bool ints")
+            for value in tile[6:8]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("dzmin and dzmax must be finite floats")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            key = (tile[0], tile[1])
+            if key in seen_keys:
+                raise ValueError("each deltas level must not contain "
+                                 "duplicate (tx, ty) coordinates")
+            seen_keys.add(key)
+
+    if not deltas:
+        rolled_back = base
+    else:
+        if len(base) != len(deltas):
+            raise ValueError("base and deltas must have the same number of "
+                             "levels")
+
+        rolled_levels = []
+        with localcontext() as ctx:
+            ctx.prec = _PRECISION
+            ctx.rounding = ROUND_HALF_EVEN
+
+            for base_level, delta_level in zip(base, deltas):
+                delta_by_coord = {}
+                for delta_tile in delta_level:
+                    delta_by_coord[(delta_tile[0], delta_tile[1])] = \
+                        delta_tile
+                if len(delta_by_coord) != len(base_level):
+                    raise ValueError("base and deltas must contain the same "
+                                     "(tx, ty) tile coordinates at every "
+                                     "level")
+
+                level_result = []
+                for base_tile in base_level:
+                    (tx, ty, ix0, iy0, ix1, iy1,
+                     zmin, zmax, count) = base_tile
+                    delta_tile = delta_by_coord.get((tx, ty))
+                    if delta_tile is None:
+                        raise ValueError(
+                            "base and deltas must contain the same (tx, ty) "
+                            "tile coordinates at every level"
+                        )
+                    if base_tile[2:6] != delta_tile[2:6]:
+                        raise ValueError(
+                            "tiles with the same (tx, ty) must agree on "
+                            "(ix0, iy0, ix1, iy1)"
+                        )
+                    dzmin, dzmax, dcount = delta_tile[6], delta_tile[7], \
+                        delta_tile[8]
+
+                    base_zmin = Decimal(str(zmin))
+                    base_zmax = Decimal(str(zmax))
+                    dzmin_term = Decimal(str(dzmin))
+                    dzmax_term = Decimal(str(dzmax))
+                    if (base_zmin == base_zmin.to_integral_value()
+                            and dzmin_term == dzmin_term.to_integral_value()):
+                        new_zmin = int(base_zmin) - int(dzmin_term)
+                    else:
+                        new_zmin = _quantize(base_zmin - dzmin_term)
+                    if (base_zmax == base_zmax.to_integral_value()
+                            and dzmax_term == dzmax_term.to_integral_value()):
+                        new_zmax = int(base_zmax) - int(dzmax_term)
+                    else:
+                        new_zmax = _quantize(base_zmax - dzmax_term)
+                    new_count = count - dcount
+
+                    if isinstance(new_zmin, int) and isinstance(new_zmax, int):
+                        ordered = new_zmin <= new_zmax
+                    else:
+                        ordered = (Decimal(str(new_zmin))
+                                   <= Decimal(str(new_zmax)))
+                    if not ordered:
+                        raise ValueError(
+                            "resulting tile must satisfy zmin <= zmax")
+                    if new_count < 0:
+                        raise ValueError("resulting count must be >= 0")
+
+                    level_result.append((tx, ty, ix0, iy0, ix1, iy1,
+                                         new_zmin, new_zmax, new_count))
+                rolled_levels.append(tuple(level_result))
+
+        rolled_back = tuple(rolled_levels)
+
+    results = []
+    for level, ix_min, iy_min, ix_max, iy_max in windows:
+        if level < 0 or level >= len(rolled_back):
+            raise ValueError("level out of range")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        matched = tuple(
+            tile for tile in rolled_back[level]
+            if (tile[4] >= ix_min and tile[2] <= ix_max
+                and tile[5] >= iy_min and tile[3] <= iy_max)
+        )
+        results.append((level, ix_min, iy_min, ix_max, iy_max, matched))
+
+    return tuple(results)
