@@ -196,15 +196,15 @@ def test_non_integral_values_become_quantized_floats():
     assert isinstance(tile[7], float)
 
 
-def test_integral_values_are_exact_ints():
+def test_integral_results_are_floats_not_ints():
     base = ((_tile(zmin=10.0, zmax=20.0, count=8),),)
     deltas = ((_delta(dzmin=2.0, dzmax=-2.0, dcount=3),),)
     tile = apply_tile_pyramid_windows(
         base, deltas, ((0, 0, 0, 255, 255),))[0][5][0]
-    assert isinstance(tile[6], int)
-    assert isinstance(tile[7], int)
-    assert isinstance(tile[8], int)
-    assert tile[6:9] == (12, 18, 11)
+    assert isinstance(tile[6], float)
+    assert isinstance(tile[7], float)
+    assert isinstance(tile[8], int) and not isinstance(tile[8], bool)
+    assert tile[6:9] == (12.0, 18.0, 11)
 
 
 def test_zero_float_result_normalized_to_positive_zero():
