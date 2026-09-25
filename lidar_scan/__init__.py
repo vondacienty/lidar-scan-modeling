@@ -10,6 +10,7 @@ from .las import iter_las
 from .ply import iter_ply
 from .tiles import (aggregate_tile_pyramid_delta_windows,
                     aggregate_tile_region_stats, aggregate_tile_window_stats,
+                    apply_delta_assessment,
                     assess_delta_summary,
                     assess_tile_pyramid_deltas,
                     assess_tile_pyramid_stats,
@@ -56,6 +57,7 @@ from .voxel import fuse_voxels
 __all__ = ["__version__", "chm", "dem", "e57", "las", "ply", "tiles", "voxel",
            "aggregate_tile_pyramid_delta_windows",
            "aggregate_tile_region_stats", "aggregate_tile_window_stats",
+           "apply_delta_assessment",
            "assess_delta_summary", "assess_dem",
            "assess_tile_pyramid_deltas",
            "assess_tile_pyramid_stats",
