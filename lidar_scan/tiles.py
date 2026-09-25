@@ -5036,3 +5036,74 @@ def apply_delta_assessments(base: tuple, deltas: tuple) -> tuple:
                            (new_min, new_max, new_sum, new_matches)))
 
     return tuple(result)
+
+
+def query_delta_summary_windows(assessment: tuple, windows: tuple) -> tuple:
+    """Select delta-assessment entries intersecting cell-index windows.
+
+    ``assessment`` must be the tuple returned by
+    :func:`assess_delta_summary`: a tuple of strict 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, delta)`` whose first five
+    fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max``, whose five-field keys are strictly increasing with
+    no duplicates, and whose ``delta`` is either ``None`` or a strict 4-tuple
+    ``(dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count)`` where the first
+    two values are finite non-bool ints or floats and the last two are
+    non-bool ints.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``level >= 0``, ``ix_min <= ix_max`` and ``iy_min <= iy_max``.
+
+    For each window, an entry matches when it is at the window's level and
+    its closed cell-index intervals intersect the window:
+    ``entry.ix_max >= ix_min and entry.ix_min <= ix_max and
+    entry.iy_max >= iy_min and entry.iy_min <= iy_max``.
+
+    Returns a tuple, in ``windows`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, entries)`` tuples where
+    ``entries`` is a tuple of the matching stored 6-tuples, preserving the
+    assessment's existing order; a window with no matching entry gets an
+    empty ``entries`` tuple and an empty ``windows`` tuple returns ``()``.
+    The input is never modified and repeated calls return identical results.
+
+    :raises TypeError: ``assessment``/``windows`` is not a tuple or a
+        window's container, length or field types are bad.
+    :raises ValueError: a window's ``level`` is negative, the window bounds
+        are inverted, or the assessment's structure, ordering, duplicate
+        keys, field types, bounds or finiteness are bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    _validate_delta_assessment(assessment)
+
+    results = []
+    for level, ix_min, iy_min, ix_max, iy_max in windows:
+        if level < 0:
+            raise ValueError("level must be >= 0")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        matched = tuple(
+            entry for entry in assessment
+            if (entry[0] == level
+                and entry[3] >= ix_min and entry[1] <= ix_max
+                and entry[4] >= iy_min and entry[2] <= iy_max)
+        )
+        results.append((level, ix_min, iy_min, ix_max, iy_max, matched))
+
+    return tuple(results)
