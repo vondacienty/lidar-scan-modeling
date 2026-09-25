@@ -5107,3 +5107,141 @@ def apply_delta_assessments(base: tuple, deltas: tuple) -> tuple:
                            (new_min, new_max, new_sum, new_matches)))
 
     return tuple(result)
+
+
+def rollback_delta_assessments(base: tuple, deltas: tuple) -> tuple:
+    """Subtract a tuple of delta assessments from delta-window summaries.
+
+    ``base`` must be a tuple as returned by
+    :func:`aggregate_tile_pyramid_delta_windows`: members are strict 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, summary)`` whose first five
+    fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose five-field keys are strictly increasing
+    with no duplicates. ``summary`` is either ``None`` or a strict 4-tuple
+    ``S = (min_dzmin, max_dzmax, sum_dcount, match_count)`` where
+    ``min_dzmin``/``max_dzmax`` are finite non-bool ints or floats with
+    ``min_dzmin <= max_dzmax`` and ``sum_dcount``/``match_count`` are
+    non-bool ints with ``match_count > 0``.
+
+    ``deltas`` must be a tuple of assessments as returned by
+    :func:`assess_delta_summary`: each member is a tuple of the same strict
+    6-tuples with strictly increasing five-field keys, and ``delta`` is
+    either ``None`` or a strict 4-tuple
+    ``D = (dmin_dzmin, dmax_dzmax, dsum_dcount, dmatch_count)`` where the
+    first two values are finite non-bool ints or floats (in either order)
+    and the last two are non-bool ints of any sign. Every member assessment
+    must contain the same five-field keys as ``base`` and agree with
+    ``base`` on each key's value being ``None`` versus present; otherwise
+    ``ValueError`` is raised. An empty ``deltas`` returns ``base``.
+
+    Returns a tuple, in ``base`` order, of the same 6-tuples. A ``None``
+    value stays ``None``; otherwise the summary is ``S`` minus the sum of
+    every contributing ``D``, term by term. The two count differences are
+    exact ints; a minimum/maximum difference is an exact int when the base
+    value and every contributing term are ints, and otherwise a Decimal
+    computation (``Decimal(str(v))``, precision 50, ``ROUND_HALF_EVEN``)
+    where the contributing terms are summed in ascending Decimal order
+    before being subtracted, quantized to six decimal places as a float
+    (negative zero normalized). Each resulting summary must satisfy
+    ``min_dzmin <= max_dzmax`` and ``match_count > 0``; otherwise
+    ``ValueError`` is raised. The result does not depend on the order of
+    ``deltas`` and the inputs are never modified.
+
+    :raises TypeError: ``base`` or ``deltas`` is not a tuple.
+    :raises ValueError: a member of ``deltas`` is not a valid assessment,
+        or the structure, ordering, duplicate keys, field types, level
+        range, bounds, summary/delta shape, finiteness or ``match_count``
+        of any input are bad, the key sets or None states disagree, or a
+        resulting summary violates ``min_dzmin <= max_dzmax`` or
+        ``match_count > 0``.
+    """
+    if not isinstance(base, tuple):
+        raise TypeError("base must be a tuple")
+    if not isinstance(deltas, tuple):
+        raise TypeError("deltas must be a tuple")
+
+    _validate_delta_summary_entries(base)
+
+    for delta in deltas:
+        if not isinstance(delta, tuple):
+            raise ValueError("each delta must be a tuple as returned "
+                             "by assess_delta_summary")
+        _validate_delta_assessment(delta)
+
+    if not deltas:
+        return base
+
+    base_states = {window[:5]: window[5] is None for window in base}
+    for delta in deltas:
+        delta_states = {window[:5]: window[5] is None for window in delta}
+        if delta_states != base_states:
+            raise ValueError("base and each delta must contain the same "
+                             "keys with matching None states")
+
+    # key -> [dmin terms, dmax terms, dsum_dcount, dmatch_count] for keys
+    # whose summary is present; the per-field terms are collected so their
+    # accumulation order does not depend on the order of ``deltas``.
+    contributions: dict[tuple, list] = {}
+    for delta in deltas:
+        for window in delta:
+            value = window[5]
+            if value is None:
+                continue
+            key = window[:5]
+            entry = contributions.get(key)
+            if entry is None:
+                entry = [[], [], 0, 0]
+                contributions[key] = entry
+            entry[0].append(value[0])
+            entry[1].append(value[1])
+            entry[2] += value[2]
+            entry[3] += value[3]
+
+    result = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for level, ix_min, iy_min, ix_max, iy_max, summary in base:
+            if summary is None:
+                result.append((level, ix_min, iy_min, ix_max, iy_max, None))
+                continue
+            key = (level, ix_min, iy_min, ix_max, iy_max)
+            base_min, base_max, base_sum, base_matches = summary
+            dmin_terms, dmax_terms, dsum_dcount, dmatch_count = \
+                contributions[key]
+
+            min_terms = [base_min] + dmin_terms
+            if all(isinstance(term, int) for term in min_terms):
+                new_min = base_min - sum(dmin_terms)
+            else:
+                new_min = _quantize(
+                    Decimal(str(base_min)) - _sorted_sum(
+                        [Decimal(str(term)) for term in dmin_terms]))
+            max_terms = [base_max] + dmax_terms
+            if all(isinstance(term, int) for term in max_terms):
+                new_max = base_max - sum(dmax_terms)
+            else:
+                new_max = _quantize(
+                    Decimal(str(base_max)) - _sorted_sum(
+                        [Decimal(str(term)) for term in dmax_terms]))
+            new_sum = base_sum - dsum_dcount
+            new_matches = base_matches - dmatch_count
+
+            if isinstance(new_min, int) and isinstance(new_max, int):
+                ordered = new_min <= new_max
+            else:
+                ordered = (Decimal(str(new_min))
+                           <= Decimal(str(new_max)))
+            if not ordered:
+                raise ValueError(
+                    "resulting summary must satisfy min_dzmin <= "
+                    "max_dzmax"
+                )
+            if new_matches <= 0:
+                raise ValueError("resulting match_count must be > 0")
+
+            result.append((level, ix_min, iy_min, ix_max, iy_max,
+                           (new_min, new_max, new_sum, new_matches)))
+
+    return tuple(result)
