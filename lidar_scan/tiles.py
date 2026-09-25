@@ -7625,3 +7625,218 @@ def finalize_reconciliation_state(state: str, windows: tuple) -> str:
             parts.append("]")
     parts.append("]}")
     return "".join(parts)
+
+
+def _decode_finalized_report(text: str) -> list:
+    """Parse and validate a canonical :func:`finalize_reconciliation_state`
+    report.
+
+    Returns a list aligned with the report's windows whose entries are
+    ``(key, summary)`` with ``key`` a
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` tuple of ints and ``summary``
+    either ``None`` or ``(emin, emax, rmse, amean, n)`` with the first four
+    Decimals and ``n`` an int.
+
+    :raises ValueError: the JSON syntax or shape is bad, a value or field
+        type is bad, or the text is not the canonical finalize encoding.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("report is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"windows"}:
+        raise ValueError("report top-level value must be an object with only "
+                         "'windows'")
+    raw_windows = document["windows"]
+    if not isinstance(raw_windows, list):
+        raise ValueError("report 'windows' must be an array")
+
+    entries = []
+    for raw_window in raw_windows:
+        if not isinstance(raw_window, list) or len(raw_window) != 6:
+            raise ValueError("each report window must be an array of six "
+                             "values")
+        key = tuple(raw_window[:5])
+        for value in key:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("report window keys must be integers")
+        level, ix_min, iy_min, ix_max, iy_max = key
+        if level < 0:
+            raise ValueError("level must be non-negative")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+
+        raw_summary = raw_window[5]
+        if raw_summary is None:
+            entries.append((key, None))
+            continue
+        if not isinstance(raw_summary, list) or len(raw_summary) != 5:
+            raise ValueError("each report summary must be null or an array "
+                             "of five values")
+        emin, emax, rmse, amean, match_count = raw_summary
+        for name, value in (("emin", emin), ("emax", emax), ("rmse", rmse),
+                            ("amean", amean)):
+            if isinstance(value, bool) or not isinstance(value,
+                                                         (int, Decimal)):
+                raise ValueError(f"report {name} must be a number")
+            if not Decimal(value).is_finite():
+                raise ValueError(f"report {name} must be finite")
+        if isinstance(match_count, bool) or not isinstance(match_count, int):
+            raise ValueError("report n must be an integer")
+        if match_count < 1:
+            raise ValueError("report n must be a positive integer")
+        emin, emax, rmse, amean = (Decimal(emin), Decimal(emax),
+                                   Decimal(rmse), Decimal(amean))
+        if rmse < 0 or amean < 0:
+            raise ValueError("report rmse and amean must be non-negative")
+        entries.append((key, (emin, emax, rmse, amean, match_count)))
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal number formatting, negative zero as
+    # anything but ``0.000000``, leading zeros, exponents and any other
+    # non-canonical spelling.
+    try:
+        canonical = _format_finalized_report(entries)
+    except InvalidOperation as exc:
+        raise ValueError("report is not the canonical finalize encoding") \
+            from exc
+    if canonical != text:
+        raise ValueError("report is not the canonical finalize encoding")
+    return entries
+
+
+def _format_finalized_report(entries: list) -> str:
+    """Serialize finalized report entries to canonical JSON (no gate flags)."""
+    parts = ['{"windows":[']
+    for index, (key, summary) in enumerate(entries):
+        if index:
+            parts.append(",")
+        level, ix_min, iy_min, ix_max, iy_max = key
+        parts.append("[")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",")
+        if summary is None:
+            parts.append("null")
+        else:
+            emin, emax, rmse, amean, match_count = summary
+            parts.append("[")
+            parts.append(",".join((_format_decimal6(emin),
+                                   _format_decimal6(emax),
+                                   _format_decimal6(rmse),
+                                   _format_decimal6(amean),
+                                   str(match_count))))
+            parts.append("]")
+        parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
+def gate_report(report: str, limits: tuple) -> str:
+    """Gate a finalized reconciliation report against per-window limits.
+
+    ``report`` must be the canonical compact JSON returned by
+    :func:`finalize_reconciliation_state`: its sole top-level key is
+    ``windows`` with entries ``[level, ix_min, iy_min, ix_max, iy_max, R]``;
+    the five key fields are non-bool integers with ``level >= 0`` and
+    ``ix_min <= ix_max``/``iy_min <= iy_max``; ``R`` is either ``null`` or
+    ``[emin, emax, rmse, amean, n]`` whose first four values are finite
+    fixed six-decimal numbers (negative zero written as ``0.000000``) with
+    ``rmse >= 0`` and ``amean >= 0`` and whose ``n`` is a positive non-bool
+    decimal integer.
+
+    ``limits`` must be the 4-tuple
+    ``(max_abs, max_rmse, max_amean, min_n)``: ``max_abs``, ``max_rmse`` and
+    ``max_amean`` are finite non-bool int/float values ``>= 0`` and
+    ``min_n`` is a positive non-bool int.
+
+    A window passes only when ``R`` is non-null, ``|emin|`` and ``|emax|``
+    are ``<= max_abs``, ``rmse <= max_rmse``, ``amean <= max_amean`` and
+    ``n >= min_n``; limit comparisons are exact Decimals derived via
+    ``Decimal(str(value))``.
+
+    Returns a canonical compact JSON string with exactly two keys in the
+    order ``windows``, ``passed``. Each window keeps its original five key
+    fields followed by ``R`` and a lowercase per-window boolean; ``passed``
+    is the conjunction of every window's boolean (``true`` for an empty
+    window set). Integers are decimal, the four ``R`` numbers use exactly
+    six decimal places (negative zero written as ``0.000000``),
+    ``NaN``/``Infinity`` never appear and the string has no trailing
+    newline. The inputs are never modified.
+
+    :raises TypeError: ``report`` is not a ``str``, ``limits`` is not a
+        tuple, or its structure or field types are bad.
+    :raises ValueError: ``limits`` values are bad, or the report's JSON,
+        structure, values or canonical formatting are bad.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(limits, tuple):
+        raise TypeError("limits must be a tuple")
+    if len(limits) != 4:
+        raise TypeError(
+            "limits must be a 4-tuple "
+            "(max_abs, max_rmse, max_amean, min_n)"
+        )
+    max_abs, max_rmse, max_amean, min_n = limits
+    for name, value in (("max_abs", max_abs), ("max_rmse", max_rmse),
+                        ("max_amean", max_amean)):
+        if isinstance(value, bool) or not isinstance(value,
+                                                     _NUMERIC_TYPES):
+            raise TypeError(f"{name} must be a non-bool int or float")
+    if isinstance(min_n, bool) or not isinstance(min_n, int):
+        raise TypeError("min_n must be a non-bool int")
+
+    for name, value in (("max_abs", max_abs), ("max_rmse", max_rmse),
+                        ("max_amean", max_amean)):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+    if min_n < 1:
+        raise ValueError("min_n must be a positive integer")
+
+    entries = _decode_finalized_report(report)
+
+    max_abs_d = Decimal(str(max_abs))
+    max_rmse_d = Decimal(str(max_rmse))
+    max_amean_d = Decimal(str(max_amean))
+
+    parts = ['{"windows":[']
+    all_passed = True
+    for index, (key, summary) in enumerate(entries):
+        if index:
+            parts.append(",")
+        level, ix_min, iy_min, ix_max, iy_max = key
+        parts.append("[")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",")
+        if summary is None:
+            parts.append("null,false")
+            all_passed = False
+        else:
+            emin, emax, rmse, amean, match_count = summary
+            passed = (abs(emin) <= max_abs_d and abs(emax) <= max_abs_d
+                      and rmse <= max_rmse_d and amean <= max_amean_d
+                      and match_count >= min_n)
+            all_passed = all_passed and passed
+            parts.append("[")
+            parts.append(",".join((_format_decimal6(emin),
+                                   _format_decimal6(emax),
+                                   _format_decimal6(rmse),
+                                   _format_decimal6(amean),
+                                   str(match_count))))
+            parts.append(",")
+            parts.append("true" if passed else "false")
+            parts.append("]")
+        parts.append("]")
+    parts.append('],"passed":')
+    parts.append("true" if all_passed else "false")
+    parts.append("}")
+    return "".join(parts)
