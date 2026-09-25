@@ -6523,3 +6523,186 @@ def decode_rollback_tile_pyramid_delta_windows(text: str) -> tuple:
         raise ValueError("JSON text is not the canonical "
                          "rollback-delta-windows encoding")
     return result
+
+
+def _validate_summary_result(result) -> None:
+    """Validate the tuple returned by :func:`summarize_tile_pyramid_windows`.
+
+    Every member must be a 6-tuple
+    ``(level, ix_min, iy_min, ix_max, iy_max, summary)`` whose first five
+    fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose ``summary`` is either ``None`` or a
+    strict 5-tuple
+    ``(bias_min, bias_max, abs_error_mean, z_score_rms, count_delta)`` where
+    the first four values are finite floats with ``bias_min <= bias_max``
+    and ``abs_error_mean``/``z_score_rms`` >= 0 and ``count_delta`` is a
+    non-bool int.
+    """
+    for window in result:
+        if not isinstance(window, tuple) or len(window) != 6:
+            raise ValueError(
+                "each window must be a 6-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max, summary)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window[:5]):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        level, ix_min, iy_min, ix_max, iy_max, summary = window
+        if level < 0:
+            raise ValueError("level must be >= 0")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        if summary is None:
+            continue
+        if not isinstance(summary, tuple) or len(summary) != 5:
+            raise ValueError(
+                "summary must be None or a 5-tuple "
+                "(bias_min, bias_max, abs_error_mean, z_score_rms, "
+                "count_delta)"
+            )
+        bias_min, bias_max, abs_error_mean, z_score_rms, count_delta = summary
+        for name, value in (("bias_min", bias_min),
+                            ("bias_max", bias_max),
+                            ("abs_error_mean", abs_error_mean),
+                            ("z_score_rms", z_score_rms)):
+            if not isinstance(value, float) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite float")
+        if bias_min > bias_max:
+            raise ValueError("summary must satisfy bias_min <= bias_max")
+        if abs_error_mean < 0:
+            raise ValueError("abs_error_mean must be >= 0")
+        if z_score_rms < 0:
+            raise ValueError("z_score_rms must be >= 0")
+        if isinstance(count_delta, bool) or not isinstance(count_delta, int):
+            raise ValueError("count_delta must be a non-bool int")
+
+
+def _format_summary_text(result) -> str:
+    """Build the canonical compact JSON text of a window-summary document."""
+    parts = ['{"windows":[']
+    for window_index, (level, ix_min, iy_min, ix_max, iy_max,
+                       summary) in enumerate(result):
+        if window_index:
+            parts.append(",")
+        parts.append("[")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",")
+        if summary is None:
+            parts.append("null")
+        else:
+            bias_min, bias_max, abs_error_mean, z_score_rms, count_delta = (
+                summary)
+            parts.append("[")
+            parts.append(",".join((_format_z(bias_min),
+                                   _format_z(bias_max),
+                                   _format_z(abs_error_mean),
+                                   _format_z(z_score_rms),
+                                   str(count_delta))))
+            parts.append("]")
+        parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
+def encode_summary(result: tuple) -> str:
+    """Serialize the result of :func:`summarize_tile_pyramid_windows`.
+
+    ``result`` must be that function's returned tuple: a tuple, in windows
+    order, of strict 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, summary)`` whose first five
+    fields are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose ``summary`` is either ``None`` or a
+    strict 5-tuple
+    ``(bias_min, bias_max, abs_error_mean, z_score_rms, count_delta)`` where
+    the first four values are finite floats with ``bias_min <= bias_max``
+    and ``abs_error_mean``/``z_score_rms`` >= 0 and ``count_delta`` is a
+    non-bool int.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``windows``: an array (in windows order) of six-value arrays, the last
+    value being ``null`` or a five-value summary array. Integers are
+    decimal; the four floats use exactly six decimal places (negative zero
+    written as ``0.000000``). The output has no whitespace, ASCII is not
+    escaped and ``NaN``/``Infinity`` never appear. An empty result encodes
+    as ``{"windows":[]}``. The input is never modified.
+
+    :raises TypeError: ``result`` is not a tuple.
+    :raises ValueError: the structure, field types, level range, bounds,
+        summary shape, finiteness or value ranges are bad.
+    """
+    if not isinstance(result, tuple):
+        raise TypeError("result must be a tuple")
+    _validate_summary_result(result)
+    return _format_summary_text(result)
+
+
+def decode_summary(text: str) -> tuple:
+    """Deserialize canonical JSON produced by :func:`encode_summary`.
+
+    The document must be the compact encoder output: an object whose sole
+    top-level key is ``windows``; ``windows`` an array of strict six-value
+    arrays ``[level, ix_min, iy_min, ix_max, iy_max, summary]`` whose first
+    five values are non-bool ints with ``level >= 0``,
+    ``ix_min <= ix_max``/``iy_min <= iy_max`` and whose ``summary`` is
+    either ``null`` or a strict five-value array
+    ``[bias_min, bias_max, abs_error_mean, z_score_rms, count_delta]`` with
+    the first four values finite floats with ``bias_min <= bias_max`` and
+    ``abs_error_mean``/``z_score_rms`` >= 0 and ``count_delta`` a non-bool
+    int, and whose spelling is exactly canonical (integers in decimal, the
+    floats with six decimals, negative zero as ``0.000000``, no whitespace
+    or extra keys, no ``NaN``/``Infinity``).
+
+    Returns the outer windows-order tuple of 6-tuples (each non-null
+    ``summary`` a 5-tuple); the empty document ``{"windows":[]}`` returns
+    ``()``. The input text is never modified.
+
+    :raises TypeError: ``text`` is not a ``str``.
+    :raises ValueError: the JSON syntax, key order, types, lengths, level
+        range, bounds, summary shape, finiteness, value ranges, numeric
+        formatting or canonical re-encoding does not match.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("text is not valid JSON") from exc
+
+    if not isinstance(document, dict) or tuple(document) != ("windows",):
+        raise ValueError("top-level value must be an object with exactly the "
+                         "key 'windows'")
+    raw_windows = document["windows"]
+    if not isinstance(raw_windows, list):
+        raise ValueError("'windows' must be an array")
+
+    windows: list[tuple] = []
+    for raw_window in raw_windows:
+        if not isinstance(raw_window, list) or len(raw_window) != 6:
+            raise ValueError("each window must be an array of six values")
+        raw_summary = raw_window[5]
+        if raw_summary is not None:
+            if not isinstance(raw_summary, list) or len(raw_summary) != 5:
+                raise ValueError(
+                    "each window's summary must be null or an array of "
+                    "five values"
+                )
+            raw_summary = tuple(raw_summary)
+        windows.append(tuple(raw_window[:5]) + (raw_summary,))
+    result = tuple(windows)
+
+    # Structural rules: field types/finiteness, level range, window bounds,
+    # summary fields and value ranges.
+    _validate_summary_result(result)
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal float formatting, leading zeros, -0,
+    # exponents and any other non-canonical spelling.
+    if _format_summary_text(result) != text:
+        raise ValueError("JSON text is not the canonical summary encoding")
+    return result
