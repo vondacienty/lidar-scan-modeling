@@ -5450,6 +5450,128 @@ def rollback_tile_pyramid_windows(base: tuple, deltas: tuple,
     return tuple(results)
 
 
+def apply_tile_pyramid(base: tuple, deltas: tuple) -> tuple:
+    """Add per-tile pyramid deltas to a base tile pyramid.
+
+    ``base`` must be an outer tuple as produced by :func:`build_tile_pyramid`:
+    each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples sorted
+    strictly by ``(tx, ty)`` with no duplicates, where the first six fields and
+    ``count`` are non-bool ints with ``count >= 0``, ``zmin``/``zmax`` are
+    finite floats with ``zmin <= zmax`` and the bounds satisfy
+    ``ix0 <= ix1`` and ``iy0 <= iy1``.
+
+    ``deltas`` must be an outer tuple as produced by
+    :func:`assess_tile_pyramid_deltas` with the same number of levels as
+    ``base``: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` 9-tuples sorted
+    strictly by ``(tx, ty)`` with no duplicates, where the first six fields and
+    ``dcount`` are non-bool ints with ``ix0 <= ix1`` and ``iy0 <= iy1`` and
+    ``dzmin``/``dzmax`` are finite floats. At every level the two inputs must
+    contain the same ``(tx, ty)`` coordinates with identical
+    ``(ix0, iy0, ix1, iy1)`` bounds; otherwise ``ValueError`` is raised. An
+    empty ``deltas`` returns ``base``.
+
+    Returns a tuple, in level order, of tuples in ``base`` order: the
+    geometry is taken unchanged from each base tile and ``zmin``/``zmax``
+    equal the base value plus the same-coordinate delta value, ``count`` the
+    base count plus the same-coordinate ``dcount``. The float additions are
+    Decimal computations (``Decimal(str(v))``, precision 50,
+    ``ROUND_HALF_EVEN``); when the base value and the delta value are
+    integral the result is kept as an exact int, otherwise it is quantized to
+    six decimal places and converted to a float (negative zero normalized).
+    Each resulting tile must satisfy ``zmin <= zmax`` and ``count >= 0``;
+    otherwise ``ValueError`` is raised. The inputs are never modified and the
+    result does not depend on the order of ``deltas``.
+
+    :raises TypeError: ``base`` or ``deltas`` is not a tuple.
+    :raises ValueError: the level counts differ or the structure, ordering,
+        duplicates, fields, cell bounds, z bounds, counts, coordinate sets or
+        shared cell bounds of either input are bad, or a resulting tile
+        violates ``zmin <= zmax`` or ``count >= 0``.
+    """
+    if not isinstance(base, tuple):
+        raise TypeError("base must be a tuple")
+    if not isinstance(deltas, tuple):
+        raise TypeError("deltas must be a tuple")
+
+    _validate_pyramid(base)
+    _validate_pyramid_deltas(deltas)
+
+    for level_tiles in base:
+        for tile in level_tiles:
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            if tile[6] > tile[7]:
+                raise ValueError("zmin must be <= zmax")
+            if tile[8] < 0:
+                raise ValueError("count must be >= 0")
+
+    if not deltas:
+        return base
+
+    if len(base) != len(deltas):
+        raise ValueError("base and deltas must have the same number of levels")
+    for base_level, delta_level in zip(base, deltas):
+        if len(base_level) != len(delta_level):
+            raise ValueError("base and deltas must contain the same (tx, ty) "
+                             "tile coordinates at every level")
+        for base_tile, delta_tile in zip(base_level, delta_level):
+            if base_tile[0:2] != delta_tile[0:2]:
+                raise ValueError("base and deltas must contain the same "
+                                 "(tx, ty) tile coordinates at every level")
+            if base_tile[2:6] != delta_tile[2:6]:
+                raise ValueError(
+                    "tiles with the same (tx, ty) must agree on "
+                    "(ix0, iy0, ix1, iy1)"
+                )
+
+    result_levels = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for base_level, delta_level in zip(base, deltas):
+            level_result = []
+            for base_tile, delta_tile in zip(base_level, delta_level):
+                tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count = base_tile
+                dzmin, dzmax, dcount = delta_tile[6], delta_tile[7], \
+                    delta_tile[8]
+
+                base_zmin = Decimal(str(zmin))
+                base_zmax = Decimal(str(zmax))
+                dzmin_term = Decimal(str(dzmin))
+                dzmax_term = Decimal(str(dzmax))
+                if (base_zmin == base_zmin.to_integral_value()
+                        and dzmin_term == dzmin_term.to_integral_value()):
+                    new_zmin = int(base_zmin) + int(dzmin_term)
+                else:
+                    new_zmin = _quantize(base_zmin + dzmin_term)
+                if (base_zmax == base_zmax.to_integral_value()
+                        and dzmax_term == dzmax_term.to_integral_value()):
+                    new_zmax = int(base_zmax) + int(dzmax_term)
+                else:
+                    new_zmax = _quantize(base_zmax + dzmax_term)
+                new_count = count + dcount
+
+                if isinstance(new_zmin, int) and isinstance(new_zmax, int):
+                    ordered = new_zmin <= new_zmax
+                else:
+                    ordered = (Decimal(str(new_zmin))
+                               <= Decimal(str(new_zmax)))
+                if not ordered:
+                    raise ValueError("resulting tile must satisfy zmin <= zmax")
+                if new_count < 0:
+                    raise ValueError("resulting count must be >= 0")
+
+                level_result.append((tx, ty, ix0, iy0, ix1, iy1,
+                                     new_zmin, new_zmax, new_count))
+            result_levels.append(tuple(level_result))
+
+    return tuple(result_levels)
+
+
 def apply_tile_pyramid_windows(base: tuple, deltas: tuple,
                                windows: tuple) -> tuple:
     """Add per-tile pyramid deltas and select tiles intersecting windows.
