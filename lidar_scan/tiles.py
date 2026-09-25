@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterable
-from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, localcontext
+from decimal import (Decimal, InvalidOperation, ROUND_FLOOR,
+                     ROUND_HALF_EVEN, localcontext)
 
 _PRECISION = 50
 _QUANTUM = Decimal("0.000001")
+_MICRO = Decimal(10) ** 6
 _NUMERIC_TYPES = (int, float)
 
 
@@ -7220,3 +7222,231 @@ def encode_reconciliation_windows(assessment: tuple, windows: tuple) -> str:
             parts.append("]")
     parts.append("]}")
     return "".join(parts)
+
+
+def _format_decimal6(value: Decimal) -> str:
+    """Format a Decimal with exactly six decimals (``-0`` normalized)."""
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        text = format(value.quantize(_QUANTUM), "f")
+    return "0.000000" if text == "-0.000000" else text
+
+
+def _decode_reconciliation_state(text: str, windows: tuple) -> list:
+    """Parse and validate a canonical reconciliation accumulation state.
+
+    Returns a list aligned with ``windows`` whose entries are ``None`` or
+    ``[emin, emax, qsum, asum, n]`` where ``emin``/``emax`` are Decimals and
+    the other fields are ints.
+
+    :raises ValueError: the JSON syntax or shape is bad, the text is not the
+        canonical encoding, or the window keys do not match ``windows`` in
+        order.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("state is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"windows"}:
+        raise ValueError("state top-level value must be an object with only "
+                         "'windows'")
+    raw_windows = document["windows"]
+    if not isinstance(raw_windows, list) or len(raw_windows) != len(windows):
+        raise ValueError("state must contain one entry per window in the "
+                         "same order")
+
+    entries = []
+    for raw_window, expected in zip(raw_windows, windows):
+        if not isinstance(raw_window, list) or len(raw_window) != 6:
+            raise ValueError("each state window must be an array of six "
+                             "values")
+        key = raw_window[:5]
+        for value in key:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("state window keys must be integers")
+        if tuple(key) != tuple(expected):
+            raise ValueError("state window keys must match windows in order")
+
+        raw_summary = raw_window[5]
+        if raw_summary is None:
+            entries.append(None)
+            continue
+        if not isinstance(raw_summary, list) or len(raw_summary) != 5:
+            raise ValueError("each state summary must be null or an array "
+                             "of five values")
+        emin, emax = raw_summary[0], raw_summary[1]
+        qsum, asum, match_count = raw_summary[2:5]
+        for value in (emin, emax):
+            if isinstance(value, bool) or not isinstance(value,
+                                                         (int, Decimal)):
+                raise ValueError("state emin/emax must be numbers")
+        for value in (qsum, asum, match_count):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("state qsum, asum and n must be integers")
+        if match_count < 1 or qsum < 0 or asum < 0:
+            raise ValueError("state summary requires n >= 1, qsum >= 0 and "
+                             "asum >= 0")
+        entries.append([Decimal(emin), Decimal(emax),
+                        qsum, asum, match_count])
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal error formatting, negative zero as
+    # anything but ``0.000000``, leading zeros, exponents and any other
+    # non-canonical spelling.
+    try:
+        canonical = _format_reconciliation_state(entries, windows)
+    except InvalidOperation as exc:
+        raise ValueError("state is not the canonical reconciliation "
+                         "accumulation encoding") from exc
+    if canonical != text:
+        raise ValueError("state is not the canonical reconciliation "
+                         "accumulation encoding")
+    return entries
+
+
+def _format_reconciliation_state(entries: list, windows: tuple) -> str:
+    """Serialize accumulation entries aligned with ``windows`` to JSON."""
+    parts = ['{"windows":[']
+    for index, (window, entry) in enumerate(zip(windows, entries)):
+        if index:
+            parts.append(",")
+        level, ix_min, iy_min, ix_max, iy_max = window
+        parts.append("[")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",")
+        if entry is None:
+            parts.append("null")
+        else:
+            emin, emax, qsum, asum, match_count = entry
+            parts.append("[")
+            parts.append(",".join((_format_decimal6(emin),
+                                   _format_decimal6(emax),
+                                   str(qsum), str(asum), str(match_count))))
+            parts.append("]")
+        parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
+def accumulate_reconciliation(state, assessment: tuple,
+                              windows: tuple) -> str:
+    """Accumulate windowed reconciliation error summaries across batches.
+
+    ``assessment`` and ``windows`` follow exactly the validation, exceptions
+    and closed-interval intersection contract of
+    :func:`query_tile_reconciliation_windows`: ``assessment`` is the outer
+    reconciliation tuple of levels of
+    ``(tx, ty, ix0, iy0, ix1, iy1, err_zmin, err_zmax, err_count)`` 9-tuples
+    and each window is a ``(level, ix_min, iy_min, ix_max, iy_max)``
+    5-tuple; a tile matches when its cell-index intervals intersect the
+    window.
+
+    ``state`` is either ``None`` (the first batch) or a previous return
+    value of this function. The state must be canonical JSON and its window
+    keys must equal ``windows`` in order.
+
+    For each window the summary is ``S = [emin, emax, qsum, asum, n]`` where
+    each matched error ``v`` is converted via ``Decimal(str(v))`` and, at
+    precision 50 with ``ROUND_HALF_EVEN``, quantized to six decimal places
+    and multiplied by ``10 ** 6`` to give the integer micro-unit ``u``;
+    ``emin`` is the minimum quantized ``err_zmin``, ``emax`` the maximum
+    quantized ``err_zmax``, ``qsum`` accumulates ``u ** 2`` for both errors,
+    ``asum`` is the sum of ``abs(err_count)`` and ``n`` is the match count.
+    Accumulation merges the extremes and the three integer totals with the
+    prior state; a window with no matches leaves its prior entry unchanged,
+    and ``None`` initializes every window with ``null``.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``windows``: an array (in ``windows`` order) whose values are the five
+    window fields followed by ``S`` (``null`` when nothing has matched).
+    Integers are decimal; ``emin``/``emax`` use exactly six decimal places
+    (negative zero written as ``0.000000``); the output has no whitespace,
+    ASCII is not escaped and ``NaN``/``Infinity`` never appear. An empty
+    ``windows`` tuple returns ``{"windows":[]}``. Splitting one batch into
+    several batches or presenting them in another order gives byte-identical
+    results. The inputs are never modified.
+
+    :raises TypeError: ``state`` is neither ``None`` nor a ``str``, or
+        ``assessment``/``windows`` is not a tuple (including bad window
+        container, length or field types).
+    :raises ValueError: ``state`` is not canonical or its window keys do not
+        match ``windows`` in order, ``level`` is out of range, the window
+        bounds are inverted, or the assessment's structure, ordering,
+        duplicates, fields, cell bounds or finiteness are bad.
+    """
+    if state is not None and not isinstance(state, str):
+        raise TypeError("state must be None or a str")
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    if state is None:
+        entries = [None] * len(windows)
+    else:
+        entries = _decode_reconciliation_state(state, windows)
+
+    _validate_reconciliation(assessment)
+
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for index, (level, ix_min, iy_min, ix_max,
+                    iy_max) in enumerate(windows):
+            if level < 0 or level >= len(assessment):
+                raise ValueError("level out of range")
+            if ix_min > ix_max or iy_min > iy_max:
+                raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                                 "and iy_min <= iy_max")
+
+            err_zmins = []
+            err_zmaxs = []
+            qsum = 0
+            asum = 0
+            match_count = 0
+            for tile in assessment[level]:
+                if (tile[4] >= ix_min and tile[2] <= ix_max
+                        and tile[5] >= iy_min and tile[3] <= iy_max):
+                    err_zmin = Decimal(str(tile[6])).quantize(_QUANTUM)
+                    err_zmax = Decimal(str(tile[7])).quantize(_QUANTUM)
+                    err_zmins.append(err_zmin)
+                    err_zmaxs.append(err_zmax)
+                    u_min = int(err_zmin * _MICRO)
+                    u_max = int(err_zmax * _MICRO)
+                    qsum += u_min * u_min + u_max * u_max
+                    asum += abs(tile[8])
+                    match_count += 1
+
+            if not match_count:
+                continue
+
+            emin = min(err_zmins)
+            emax = max(err_zmaxs)
+            previous = entries[index]
+            if previous is None:
+                entries[index] = [emin, emax, qsum, asum, match_count]
+            else:
+                previous[0] = min(previous[0], emin)
+                previous[1] = max(previous[1], emax)
+                previous[2] += qsum
+                previous[3] += asum
+                previous[4] += match_count
+
+    return _format_reconciliation_state(entries, windows)
