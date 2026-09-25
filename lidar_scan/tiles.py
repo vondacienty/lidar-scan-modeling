@@ -2728,6 +2728,80 @@ def decode_tile_pyramid_assessment(text: str) -> tuple:
     return assessment
 
 
+def summarize_tile_pyramid_assessment(assessment: tuple) -> tuple:
+    """Summarize each level of a :func:`assess_tile_pyramid_stats` result.
+
+    ``assessment`` must be the outer tuple returned by
+    :func:`assess_tile_pyramid_stats`: each level is a tuple of 11-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, bias, abs_error, combined_sigma, z_score,
+    count_delta)`` with ``(tx, ty)`` strictly increasing and with no
+    duplicates, where the first six fields and ``count_delta`` are non-bool
+    ints satisfying ``ix0 <= ix1`` and ``iy0 <= iy1``, and ``bias``,
+    ``abs_error``, ``combined_sigma`` and ``z_score`` are finite floats with
+    ``combined_sigma > 0`` and ``abs_error >= 0``.
+
+    Returns a tuple, in level order, of
+    ``(level, bias_min, bias_max, abs_error_mean, z_score_rms,
+    count_delta_sum)`` tuples where ``level`` is the level index,
+    ``bias_min``/``bias_max`` are the level's minimum and maximum ``bias``,
+    ``abs_error_mean`` is the mean ``abs_error``,
+    ``z_score_rms`` is ``sqrt(mean(z_score**2))`` and ``count_delta_sum`` is
+    the exact int sum of the ``count_delta`` values. The four float metrics
+    are Decimal computations (each input converted via ``Decimal(str(v))``,
+    precision 50, ``ROUND_HALF_EVEN``) with summation terms added in ascending
+    Decimal order (so the results do not depend on tile presentation order
+    beyond the level each tile belongs to), quantized to six decimal places as
+    floats (negative zero normalized). An empty level summarizes as
+    ``(level, None, None, None, None, 0)``; an empty assessment ``()`` returns
+    ``()``. The input is never modified.
+
+    :raises TypeError: ``assessment`` is not a tuple.
+    :raises ValueError: the structure, ordering, duplicates, fields, cell
+        bounds, finiteness, ``combined_sigma`` positivity or ``abs_error``
+        non-negativity are bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    if len(assessment) == 0:
+        return ()
+
+    _validate_pyramid_assessment(assessment)
+    for level_tiles in assessment:
+        for tile in level_tiles:
+            if tile[7] < 0:
+                raise ValueError("abs_error must be non-negative")
+
+    summaries = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for level, level_tiles in enumerate(assessment):
+            if not level_tiles:
+                summaries.append((level, None, None, None, None, 0))
+                continue
+            biases = [Decimal(str(tile[6])) for tile in level_tiles]
+            abs_error_terms = [Decimal(str(tile[7])) for tile in level_tiles]
+            z_score_terms = [Decimal(str(tile[9])) for tile in level_tiles]
+            count_terms = [Decimal(tile[10]) for tile in level_tiles]
+            z_squared_terms = [z * z for z in z_score_terms]
+            tile_count = Decimal(len(level_tiles))
+
+            abs_error_mean = _sorted_sum(abs_error_terms) / tile_count
+            z_score_rms = (_sorted_sum(z_squared_terms)
+                           / tile_count).sqrt()
+            summaries.append((
+                level,
+                _quantize(min(biases)),
+                _quantize(max(biases)),
+                _quantize(abs_error_mean),
+                _quantize(z_score_rms),
+                int(_sorted_sum(count_terms)),
+            ))
+
+    return tuple(summaries)
+
+
 def _validate_pyramid_deltas(assessment) -> None:
     """Validate the outer tuple returned by :func:`assess_tile_pyramid_deltas`.
 
