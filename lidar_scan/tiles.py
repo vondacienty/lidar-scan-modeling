@@ -7104,3 +7104,119 @@ def query_tile_reconciliation_windows(assessment: tuple,
         results.append((level, ix_min, iy_min, ix_max, iy_max, matched))
 
     return tuple(results)
+
+
+def encode_reconciliation_windows(assessment: tuple, windows: tuple) -> str:
+    """Encode windowed reconciliation summaries as canonical compact JSON.
+
+    ``assessment`` must be the outer tuple returned by
+    :func:`reconcile_tile_pyramid`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, err_zmin, err_zmax, err_count)`` 9-tuples
+    sorted strictly by ``(tx, ty)`` with no duplicates, where the first six
+    fields and ``err_count`` are non-bool ints with ``ix0 <= ix1`` and
+    ``iy0 <= iy1``, and ``err_zmin``/``err_zmax`` are finite floats.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max``; ``level`` must satisfy
+    ``0 <= level < len(assessment)``.
+
+    For each window, a tile matches when its closed cell-index intervals
+    intersect the window: ``tile.ix1 >= ix_min and tile.ix0 <= ix_max and
+    tile.iy1 >= iy_min and tile.iy0 <= iy_max``.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``windows``: an array (in ``windows`` order) of six-value arrays
+    ``[level, ix_min, iy_min, ix_max, iy_max, summary]``. A window with no
+    matching tile gets ``summary = null``; otherwise ``summary`` is the
+    five-value array
+    ``[err_zmin_min, err_zmax_max, z_rmse, abs_count_sum, match_count]``
+    where ``err_zmin_min``/``err_zmax_max`` are the extremes of the matched
+    tiles' ``err_zmin``/``err_zmax``,
+    ``z_rmse = sqrt(sum(err_zmin**2 + err_zmax**2) / (2 * match_count))``,
+    ``abs_count_sum`` is the exact int sum of ``abs(err_count)`` and
+    ``match_count`` is the number of matched tiles. The float values are
+    Decimal computations (each input converted via ``Decimal(str(v))``,
+    precision 50, ``ROUND_HALF_EVEN``) with the square terms added in
+    ascending Decimal order, quantized to six decimal places. Integers are
+    decimal; floats use exactly six decimal places (negative zero written as
+    ``0.000000``). The output has no whitespace, ASCII is not escaped and
+    ``NaN``/``Infinity`` never appear. An empty ``windows`` tuple encodes as
+    ``{"windows":[]}``. The inputs are never modified and repeated calls
+    return byte-identical strings.
+
+    :raises TypeError: ``assessment``/``windows`` is not a tuple or a window's
+        container, length or field types are bad.
+    :raises ValueError: ``level`` is out of range, the window bounds are
+        inverted, or the assessment's structure, ordering, duplicates, fields,
+        cell bounds or finiteness are bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    _validate_reconciliation(assessment)
+
+    parts = ['{"windows":[']
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for window_index, (level, ix_min, iy_min, ix_max,
+                           iy_max) in enumerate(windows):
+            if level < 0 or level >= len(assessment):
+                raise ValueError("level out of range")
+            if ix_min > ix_max or iy_min > iy_max:
+                raise ValueError("window bounds must satisfy "
+                                 "ix_min <= ix_max and iy_min <= iy_max")
+
+            err_zmins = []
+            err_zmaxs = []
+            square_terms = []
+            abs_count_sum = 0
+            match_count = 0
+            for tile in assessment[level]:
+                if (tile[4] >= ix_min and tile[2] <= ix_max
+                        and tile[5] >= iy_min and tile[3] <= iy_max):
+                    err_zmin = Decimal(str(tile[6]))
+                    err_zmax = Decimal(str(tile[7]))
+                    err_zmins.append(err_zmin)
+                    err_zmaxs.append(err_zmax)
+                    square_terms.append(err_zmin * err_zmin)
+                    square_terms.append(err_zmax * err_zmax)
+                    abs_count_sum += abs(tile[8])
+                    match_count += 1
+
+            if window_index:
+                parts.append(",")
+            parts.append("[")
+            parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                                   str(ix_max), str(iy_max))))
+            parts.append(",")
+            if not match_count:
+                parts.append("null")
+            else:
+                z_rmse = (_sorted_sum(square_terms)
+                          / Decimal(2 * match_count)).sqrt()
+                parts.append("[")
+                parts.append(",".join((_format_z(_quantize(min(err_zmins))),
+                                       _format_z(_quantize(max(err_zmaxs))),
+                                       _format_z(_quantize(z_rmse)),
+                                       str(abs_count_sum),
+                                       str(match_count))))
+                parts.append("]")
+            parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
