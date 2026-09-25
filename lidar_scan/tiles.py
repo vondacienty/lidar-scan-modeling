@@ -6885,3 +6885,157 @@ def reconcile_tile_pyramid(base: tuple, deltas: tuple,
             reconciled_levels.append(tuple(level_result))
 
     return tuple(reconciled_levels)
+
+
+def _validate_tile_reconciliation(assessment) -> None:
+    """Validate the outer tuple returned by :func:`reconcile_tile_pyramid`.
+
+    Every level must be a tuple of strict 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, err_zmin, err_zmax, err_count)``: the
+    first six fields and ``err_count`` are non-bool ints with
+    ``ix0 <= ix1`` and ``iy0 <= iy1``; ``err_zmin``/``err_zmax`` are finite
+    floats; and the tiles are sorted strictly by ``(tx, ty)`` with no
+    duplicates.
+    """
+    for level_tiles in assessment:
+        if not isinstance(level_tiles, tuple):
+            raise ValueError("each reconciliation level must be a tuple")
+        prev_key = None
+        for tile in level_tiles:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise ValueError(
+                    "each tile must be a 9-tuple "
+                    "(tx, ty, ix0, iy0, ix1, iy1, err_zmin, err_zmax, "
+                    "err_count)"
+                )
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and "
+                                     "err_count must be non-bool ints")
+            for value in tile[6:8]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("err_zmin and err_zmax must be finite "
+                                     "floats")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("each reconciliation level must be sorted "
+                                 "by (tx, ty) with no duplicate coordinates")
+            prev_key = key
+
+
+def encode_tile_reconciliation(assessment: tuple) -> str:
+    """Serialize the result of :func:`reconcile_tile_pyramid`.
+
+    ``assessment`` must be the outer tuple returned by
+    :func:`reconcile_tile_pyramid`: each level is a tuple of 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, err_zmin, err_zmax, err_count)`` with
+    tiles sorted strictly by ``(tx, ty)`` and no duplicates, where the
+    first six fields and ``err_count`` are non-bool ints satisfying
+    ``ix0 <= ix1`` and ``iy0 <= iy1``, and ``err_zmin``/``err_zmax`` are
+    finite floats.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``levels``: an array (in level order) of arrays of tile arrays in the
+    tiles' stored order. Integers are decimal; ``err_zmin``/``err_zmax``
+    use exactly six decimal places (negative zero written as ``0.000000``).
+    The output has no whitespace, ASCII is not escaped and
+    ``NaN``/``Infinity`` never appear. An empty assessment encodes as
+    ``{"levels":[]}``. The input is never modified and repeated calls
+    return identical results.
+
+    :raises TypeError: ``assessment`` is not a tuple.
+    :raises ValueError: the structure, ordering, duplicates, fields, cell
+        bounds or finiteness are bad.
+    """
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    _validate_tile_reconciliation(assessment)
+
+    parts = ['{"levels":[']
+    for level_index, level_tiles in enumerate(assessment):
+        if level_index:
+            parts.append(",")
+        parts.append("[")
+        for tile_index, tile in enumerate(level_tiles):
+            if tile_index:
+                parts.append(",")
+            (tx, ty, ix0, iy0, ix1, iy1,
+             err_zmin, err_zmax, err_count) = tile
+            parts.append("[")
+            parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
+                                   str(ix1), str(iy1), _format_z(err_zmin),
+                                   _format_z(err_zmax), str(err_count))))
+            parts.append("]")
+        parts.append("]")
+    parts.append(']}')
+    return "".join(parts)
+
+
+def decode_tile_reconciliation(text: str) -> tuple:
+    """Deserialize canonical JSON produced by :func:`encode_tile_reconciliation`.
+
+    The document must be the compact encoder output: an object whose sole
+    top-level key is ``levels``; ``levels`` an array (in level order) of
+    arrays of strict nine-item tiles
+    ``[tx, ty, ix0, iy0, ix1, iy1, err_zmin, err_zmax, err_count]`` whose
+    first six fields and ``err_count`` are non-bool ints with
+    ``ix0 <= ix1`` and ``iy0 <= iy1``, whose ``err_zmin``/``err_zmax`` are
+    finite floats, and whose ``(tx, ty)`` coordinates are strictly
+    increasing with no duplicates within each level, and whose spelling is
+    exactly canonical (integers in decimal, errors with six decimals,
+    negative zero as ``0.000000``, no whitespace or extra keys, no
+    ``NaN``/``Infinity``).
+
+    Returns the outer level-order tuple of tuples of 9-tuples in the
+    document's order; the empty document ``{"levels":[]}`` returns ``()``.
+    The input text is never modified and repeated calls return identical
+    results.
+
+    :raises TypeError: ``text`` is not a ``str``.
+    :raises ValueError: the JSON syntax, key order, level/tile shape, field
+        types, bounds, ordering, duplicates, finiteness, numeric formatting
+        or canonical re-encoding does not match.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("text is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"levels"}:
+        raise ValueError("top-level value must be an object with only "
+                         "'levels'")
+    raw_levels = document["levels"]
+    if not isinstance(raw_levels, list):
+        raise ValueError("'levels' must be an array")
+
+    levels: list[tuple] = []
+    for raw_tiles in raw_levels:
+        if not isinstance(raw_tiles, list):
+            raise ValueError("each level must be an array of tiles")
+        tiles: list[tuple] = []
+        for raw_tile in raw_tiles:
+            if not isinstance(raw_tile, list) or len(raw_tile) != 9:
+                raise ValueError("each tile must be an array of nine values")
+            tiles.append(tuple(raw_tile))
+        levels.append(tuple(tiles))
+    assessment = tuple(levels)
+
+    # Structural rules: tuple levels, field types/finiteness, cell bounds,
+    # (tx, ty) sort order and no duplicates.
+    _validate_tile_reconciliation(assessment)
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal error formatting, leading zeros, -0,
+    # exponents and any other non-canonical spelling.
+    if encode_tile_reconciliation(assessment) != text:
+        raise ValueError("JSON text is not the canonical reconciliation "
+                         "encoding")
+    return assessment
