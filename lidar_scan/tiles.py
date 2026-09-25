@@ -7450,3 +7450,82 @@ def accumulate_reconciliation(state, assessment: tuple,
                 previous[4] += match_count
 
     return _format_reconciliation_state(entries, windows)
+
+
+def merge_reconciliation_states(states: tuple, windows: tuple) -> str:
+    """Merge canonical reconciliation accumulation states.
+
+    ``states`` must be a tuple (possibly empty) of ``str`` values, each a
+    previous return value of :func:`accumulate_reconciliation`: canonical
+    compact JSON whose sole top-level key is ``windows`` with one entry per
+    window in ``windows`` order, each entry holding the five window fields
+    followed by ``S`` (``null`` or
+    ``[emin, emax, qsum, asum, n]`` with ``emin``/``emax`` written with
+    exactly six decimal places and the other three values non-negative or
+    positive decimal integers).
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool
+    ints with ``level >= 0`` and ``ix_min <= ix_max``, ``iy_min <= iy_max``.
+
+    Per window, ``null`` summaries contribute nothing: the merged ``S`` is
+    ``null`` only when every state's summary is ``null`` (including when
+    ``states`` is empty); otherwise ``emin`` is the smallest value,
+    ``emax`` the largest and ``qsum``/``asum``/``n`` are the exact integer
+    sums. Returns the same canonical compact JSON format as
+    :func:`accumulate_reconciliation`; an empty ``windows`` tuple returns
+    ``{"windows":[]}``. The result is independent of the order and grouping
+    of ``states`` and the inputs are never modified.
+
+    :raises TypeError: ``states``/``windows`` is not a tuple, a state member
+        is not a ``str``, or a window's container, length or field types are
+        bad.
+    :raises ValueError: ``level`` is negative, the window bounds are
+        inverted, or a state is not valid canonical JSON, has the wrong
+        structure or values, its windows do not match ``windows`` in order,
+        or its canonical re-encoding is not byte-for-byte identical.
+    """
+    if not isinstance(states, tuple):
+        raise TypeError("states must be a tuple")
+    for state in states:
+        if not isinstance(state, str):
+            raise TypeError("each state must be a str")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    for level, ix_min, iy_min, ix_max, iy_max in windows:
+        if level < 0:
+            raise ValueError("level must be non-negative")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+
+    merged = [None] * len(windows)
+    for state in states:
+        entries = _decode_reconciliation_state(state, windows)
+        for index, entry in enumerate(entries):
+            if entry is None:
+                continue
+            current = merged[index]
+            if current is None:
+                # Copy so the decoded state's list is never mutated.
+                merged[index] = list(entry)
+            else:
+                current[0] = min(current[0], entry[0])
+                current[1] = max(current[1], entry[1])
+                current[2] += entry[2]
+                current[3] += entry[3]
+                current[4] += entry[4]
+
+    return _format_reconciliation_state(merged, windows)
