@@ -7104,3 +7104,97 @@ def query_tile_reconciliation_windows(assessment: tuple,
         results.append((level, ix_min, iy_min, ix_max, iy_max, matched))
 
     return tuple(results)
+
+
+def encode_reconciliation_windows(assessment: tuple, windows: tuple) -> str:
+    """Serialize per-window reconciliation summaries over cell-index windows.
+
+    ``assessment`` and ``windows`` follow exactly the contracts of
+    :func:`query_tile_reconciliation_windows` (same input validation and the
+    same closed-interval intersection rule): ``assessment`` is the outer tuple
+    returned by :func:`reconcile_tile_pyramid` and ``windows`` is a tuple of
+    5-tuples ``(level, ix_min, iy_min, ix_max, iy_max)`` of non-bool ints with
+    ``ix_min <= ix_max``, ``iy_min <= iy_max`` and
+    ``0 <= level < len(assessment)``.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``windows``: an array, in ``windows`` order, of six-value arrays
+    ``[level, ix_min, iy_min, ix_max, iy_max, summary]``. A window with no
+    matching tile has ``summary`` of ``null``; otherwise ``summary`` is the
+    five-value array
+    ``[err_zmin_min, err_zmax_max, z_rmse, abs_count_sum, match_count]`` where
+    ``err_zmin_min`` is the minimum matching tile ``err_zmin``,
+    ``err_zmax_max`` the maximum matching tile ``err_zmax`` (extrema compared
+    via ``Decimal(str(v))``), ``z_rmse`` is
+    ``sqrt(sum(err_zmin**2 + err_zmax**2) / (2 * match_count))`` with the
+    squared terms summed in ascending order, ``abs_count_sum`` is the exact
+    int sum of ``abs(err_count)`` and ``match_count`` the int number of
+    matching tiles.
+
+    All float arithmetic uses ``Decimal(str(v))`` at precision 50 with
+    ``ROUND_HALF_EVEN``; the squared terms are summed in ascending order and
+    every resulting float is quantized to six decimal places (negative zero
+    normalized). Integers are decimal; floats use exactly six decimal places.
+    The output has no whitespace, ASCII is not escaped and
+    ``NaN``/``Infinity`` never appear. An empty ``windows`` tuple encodes as
+    ``{"windows":[]}``. The inputs are never modified and repeated calls
+    return byte-identical results.
+
+    :raises TypeError: ``assessment``/``windows`` is not a tuple or a window's
+        container, length or field types are bad.
+    :raises ValueError: ``level`` is out of range, the window bounds are
+        inverted, or the assessment's structure, ordering, duplicates, fields,
+        cell bounds or finiteness are bad.
+    """
+    # Reuse the query so validation, level/bounds checks and the intersection
+    # rule stay identical to ``query_tile_reconciliation_windows``.
+    queried = query_tile_reconciliation_windows(assessment, windows)
+
+    parts = ['{"windows":[']
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for window_index, (level, ix_min, iy_min, ix_max, iy_max,
+                           matched) in enumerate(queried):
+            if window_index:
+                parts.append(",")
+            parts.append("[")
+            parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                                   str(ix_max), str(iy_max))))
+            parts.append(",")
+            if not matched:
+                parts.append("null")
+            else:
+                min_err_zmin = None
+                max_err_zmax = None
+                squared_terms = []
+                abs_count_sum = 0
+                match_count = 0
+                for tile in matched:
+                    err_zmin = Decimal(str(tile[6]))
+                    err_zmax = Decimal(str(tile[7]))
+                    if min_err_zmin is None or err_zmin < min_err_zmin:
+                        min_err_zmin = err_zmin
+                    if max_err_zmax is None or err_zmax > max_err_zmax:
+                        max_err_zmax = err_zmax
+                    squared_terms.append(err_zmin * err_zmin)
+                    squared_terms.append(err_zmax * err_zmax)
+                    abs_count_sum += abs(tile[8])
+                    match_count += 1
+
+                sum_squared = _sorted_sum(squared_terms).quantize(_QUANTUM)
+                z_rmse = (sum_squared / Decimal(2 * match_count)).sqrt()
+
+                parts.append("[")
+                parts.append(",".join((
+                    _format_z(_quantize(min_err_zmin)),
+                    _format_z(_quantize(max_err_zmax)),
+                    _format_z(_quantize(z_rmse)),
+                    str(abs_count_sum),
+                    str(match_count),
+                )))
+                parts.append("]")
+            parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
