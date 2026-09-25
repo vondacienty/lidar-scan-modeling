@@ -4192,6 +4192,172 @@ def decode_tile_pyramid_delta_windows(text: str) -> tuple:
     return result
 
 
+def _validate_rollback_pyramid_delta_windows(result) -> None:
+    """Validate the tuple returned by
+    :func:`rollback_tile_pyramid_delta_windows`.
+
+    Every member must be a 6-tuple
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` whose first five fields
+    are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose ``tiles`` is a tuple of strict 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)``: the first six fields
+    and ``count`` non-bool ints with ``count >= 0``, ``zmin``/``zmax`` finite
+    floats with ``zmin <= zmax``, ``ix0 <= ix1``/``iy0 <= iy1`` and the tiles
+    strictly sorted by ``(tx, ty)`` with no duplicates.
+    """
+    for window in result:
+        if not isinstance(window, tuple) or len(window) != 6:
+            raise ValueError(
+                "each window must be a 6-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max, tiles)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window[:5]):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a non-bool int")
+        level, ix_min, iy_min, ix_max, iy_max, tiles = window
+        if level < 0:
+            raise ValueError("level must be >= 0")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        if not isinstance(tiles, tuple):
+            raise ValueError("tiles must be a tuple")
+        prev_key = None
+        for tile in tiles:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise ValueError(
+                    "each tile must be a 9-tuple "
+                    "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)"
+                )
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(
+                        "tx, ty, ix0, iy0, ix1, iy1 and count must be "
+                        "non-bool ints"
+                    )
+            for value in tile[6:8]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("zmin and zmax must be finite floats")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            if tile[6] > tile[7]:
+                raise ValueError("zmin must be <= zmax")
+            if tile[8] < 0:
+                raise ValueError("count must be >= 0")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("tiles must be sorted by (tx, ty) with no "
+                                 "duplicate coordinates")
+            prev_key = key
+
+
+def encode_rollback_tile_pyramid_delta_windows(result: tuple) -> str:
+    """Serialize the result of :func:`rollback_tile_pyramid_delta_windows`.
+
+    ``result`` must be the tuple returned by
+    :func:`rollback_tile_pyramid_delta_windows`: a tuple, in windows order, of
+    strict 6-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` whose first five fields
+    are non-bool ints with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max`` and whose ``tiles`` is a tuple of strict 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` with the first six
+    fields and ``count`` non-bool ints with ``count >= 0``, ``zmin``/``zmax``
+    finite floats with ``zmin <= zmax``, ``ix0 <= ix1``/``iy0 <= iy1`` and the
+    tiles strictly sorted by ``(tx, ty)`` with no duplicates.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``windows``: an array (in windows order) of six-value arrays, the last
+    value being an array of nine-value tiles in the tiles' stored order.
+    Integers are decimal; ``zmin``/``zmax`` use exactly six decimal places
+    (negative zero written as ``0.000000``). The output has no whitespace,
+    ASCII is not escaped and ``NaN``/``Infinity`` never appear. An empty
+    result encodes as ``{"windows":[]}``. The input is never modified.
+
+    :raises TypeError: ``result`` is not a tuple.
+    :raises ValueError: the structure, field types, ordering, duplicates,
+        cell bounds, z bounds, counts, level range or non-finite values are
+        bad.
+    """
+    if not isinstance(result, tuple):
+        raise TypeError("result must be a tuple")
+    _validate_rollback_pyramid_delta_windows(result)
+    return _format_pyramid_windows_text(result)
+
+
+def decode_rollback_tile_pyramid_delta_windows(text: str) -> tuple:
+    """Deserialize canonical JSON produced by
+    :func:`encode_rollback_tile_pyramid_delta_windows`.
+
+    The document must be the compact encoder output: an object whose sole
+    top-level key is ``windows``; ``windows`` an array of strict six-value
+    arrays ``[level, ix_min, iy_min, ix_max, iy_max, tiles]`` whose first five
+    values are non-bool ints with ``level >= 0``,
+    ``ix_min <= ix_max``/``iy_min <= iy_max`` and whose ``tiles`` is an array
+    of strict nine-value tiles
+    ``[tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count]`` with the first six
+    fields and ``count`` non-bool ints with ``count >= 0``, ``zmin``/``zmax``
+    finite floats with ``zmin <= zmax``, ``ix0 <= ix1``/``iy0 <= iy1`` and the
+    tiles strictly sorted by ``(tx, ty)`` with no duplicates, and whose
+    spelling is exactly canonical (integers in decimal, ``zmin``/``zmax`` with
+    six decimals, negative zero as ``0.000000``, no whitespace or extra keys,
+    no ``NaN``/``Infinity``).
+
+    Returns the outer windows-order tuple of 6-tuples (each ``tiles`` field a
+    tuple of 9-tuples in the document's order); the empty document
+    ``{"windows":[]}`` returns ``()``. The input text is never modified.
+
+    :raises TypeError: ``text`` is not a ``str``.
+    :raises ValueError: the JSON syntax, key order, types, lengths, bounds,
+        level range, ordering, duplicates, finiteness, counts, numeric
+        formatting or canonical re-encoding does not match.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("text is not valid JSON") from exc
+
+    if not isinstance(document, dict) or tuple(document) != ("windows",):
+        raise ValueError("top-level value must be an object with exactly the "
+                         "key 'windows'")
+    raw_windows = document["windows"]
+    if not isinstance(raw_windows, list):
+        raise ValueError("'windows' must be an array")
+
+    windows: list[tuple] = []
+    for raw_window in raw_windows:
+        if not isinstance(raw_window, list) or len(raw_window) != 6:
+            raise ValueError("each window must be an array of six values")
+        raw_tiles = raw_window[5]
+        if not isinstance(raw_tiles, list):
+            raise ValueError("each window's tiles must be an array")
+        tiles = []
+        for raw_tile in raw_tiles:
+            if not isinstance(raw_tile, list) or len(raw_tile) != 9:
+                raise ValueError("each tile must be an array of nine values")
+            tiles.append(tuple(raw_tile))
+        windows.append(tuple(raw_window[:5]) + (tuple(tiles),))
+    result = tuple(windows)
+
+    # Structural rules: field types/finiteness, level range, window and tile
+    # bounds, z bounds, counts, (tx, ty) sort order, no duplicates.
+    _validate_rollback_pyramid_delta_windows(result)
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal z formatting, leading zeros, -0,
+    # exponents and any other non-canonical spelling.
+    if _format_pyramid_windows_text(result) != text:
+        raise ValueError("JSON text is not the canonical rollback "
+                         "pyramid-delta-windows encoding")
+    return result
+
+
 def _validate_delta_summary_result(result) -> None:
     """Validate the tuple returned by
     :func:`aggregate_tile_pyramid_delta_windows`.
