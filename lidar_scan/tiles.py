@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterable
-from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, localcontext
+from decimal import (Decimal, InvalidOperation, ROUND_FLOOR,
+                     ROUND_HALF_EVEN, localcontext)
 
 _PRECISION = 50
 _QUANTUM = Decimal("0.000001")
@@ -7220,3 +7221,246 @@ def encode_reconciliation_windows(assessment: tuple, windows: tuple) -> str:
             parts.append("]")
     parts.append("]}")
     return "".join(parts)
+
+
+def _format_micro(value: int) -> str:
+    """Format an integer count of 1e-6 units with exactly six decimals."""
+    sign = "-" if value < 0 else ""
+    whole, frac = divmod(abs(value), 1_000_000)
+    return f"{sign}{whole}.{frac:06d}"
+
+
+def _decode_reconciliation_accumulation(text: str) -> list:
+    """Parse and validate a canonical :func:`accumulate_reconciliation` state.
+
+    Returns a list, in window order, of ``(key, stats)`` pairs where ``key``
+    is the ``(level, ix_min, iy_min, ix_max, iy_max)`` tuple and ``stats`` is
+    ``None`` or an ``(emin_u, emax_u, qsum, asum, n)`` tuple of ints (the
+    extremes expressed in 1e-6 units).
+    """
+    try:
+        document = json.loads(text, parse_float=Decimal,
+                              parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("state is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"windows"}:
+        raise ValueError("top-level value must be an object with only "
+                         "'windows'")
+    raw_windows = document["windows"]
+    if not isinstance(raw_windows, list):
+        raise ValueError("'windows' must be an array")
+
+    entries: list[tuple] = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+        for raw_entry in raw_windows:
+            if not isinstance(raw_entry, list) or len(raw_entry) != 6:
+                raise ValueError("each window entry must be an array of six "
+                                 "values")
+            key = raw_entry[:5]
+            for value in key:
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("window fields must be non-bool ints")
+            summary = raw_entry[5]
+            if summary is None:
+                entries.append((tuple(key), None))
+                continue
+            if not isinstance(summary, list) or len(summary) != 5:
+                raise ValueError("each summary must be null or an array of "
+                                 "five values")
+            emin, emax, qsum, asum, n = summary
+            micros = []
+            for value in (emin, emax):
+                if isinstance(value, bool) or not isinstance(value, Decimal):
+                    raise ValueError("emin and emax must be six-decimal "
+                                     "numbers")
+                if not value.is_finite():
+                    raise ValueError("emin and emax must be finite")
+                try:
+                    quantized = value.quantize(_QUANTUM)
+                except InvalidOperation as exc:
+                    raise ValueError("emin and emax must have at most six "
+                                     "decimal places") from exc
+                if value != quantized:
+                    raise ValueError("emin and emax must have at most six "
+                                     "decimal places")
+                micros.append(int(quantized * 1_000_000))
+            for value in (qsum, asum, n):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("qsum, asum and n must be non-bool ints")
+            if qsum < 0 or asum < 0 or n < 1:
+                raise ValueError("qsum and asum must be non-negative and n "
+                                 "must be positive")
+            entries.append((tuple(key), (micros[0], micros[1], qsum, asum,
+                                         n)))
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal error formatting, leading zeros, -0,
+    # exponents and any other non-canonical spelling.
+    if _encode_reconciliation_accumulation(entries) != text:
+        raise ValueError("state is not the canonical accumulation encoding")
+    return entries
+
+
+def _encode_reconciliation_accumulation(entries: list) -> str:
+    """Encode parsed ``(key, stats)`` accumulation entries as canonical JSON."""
+    parts = ['{"windows":[']
+    for index, (key, stats) in enumerate(entries):
+        if index:
+            parts.append(",")
+        parts.append("[")
+        parts.append(",".join(str(value) for value in key))
+        parts.append(",")
+        if stats is None:
+            parts.append("null")
+        else:
+            emin_u, emax_u, qsum, asum, n = stats
+            parts.append("[")
+            parts.append(",".join((_format_micro(emin_u),
+                                   _format_micro(emax_u), str(qsum),
+                                   str(asum), str(n))))
+            parts.append("]")
+        parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
+def accumulate_reconciliation(state, assessment: tuple,
+                              windows: tuple) -> str:
+    """Accumulate windowed reconciliation summaries into a canonical state.
+
+    ``state`` is ``None`` (start a fresh accumulation) or a string previously
+    returned by this function. When not ``None`` it must be the canonical
+    compact JSON encoding: an object whose sole top-level key is ``windows``,
+    an array (in ``windows`` order) of six-value arrays
+    ``[level, ix_min, iy_min, ix_max, iy_max, summary]`` with ``summary``
+    either ``null`` or ``[emin, emax, qsum, asum, n]`` (integers in decimal,
+    ``emin``/``emax`` with exactly six decimal places, negative zero written
+    as ``0.000000``, no whitespace, no ``NaN``/``Infinity``), and its window
+    keys must equal ``windows`` exactly and in the same order.
+
+    ``assessment`` must be the outer tuple returned by
+    :func:`reconcile_tile_pyramid`: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, err_zmin, err_zmax, err_count)`` 9-tuples
+    sorted strictly by ``(tx, ty)`` with no duplicates, where the first six
+    fields and ``err_count`` are non-bool ints with ``ix0 <= ix1`` and
+    ``iy0 <= iy1``, and ``err_zmin``/``err_zmax`` are finite floats.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max``; ``level`` must satisfy
+    ``0 <= level < len(assessment)``.
+
+    For each window, a tile matches when its closed cell-index intervals
+    intersect the window: ``tile.ix1 >= ix_min and tile.ix0 <= ix_max and
+    tile.iy1 >= iy_min and tile.iy0 <= iy_max``.
+
+    Each matched tile's errors are converted via ``Decimal(str(v))``,
+    quantized to six decimal places (precision 50, ``ROUND_HALF_EVEN``) and
+    multiplied by 10**6 to an integer ``u``. The window summary is
+    ``[emin, emax, qsum, asum, n]`` where ``emin``/``emax`` are the extremes
+    of the matched tiles' ``err_zmin``/``err_zmax``, ``qsum`` is the exact
+    integer sum of ``u**2`` over both errors of every matched tile, ``asum``
+    is the exact integer sum of ``abs(err_count)`` and ``n`` is the number of
+    matched tiles. Merging a previous state takes the extreme of the
+    extremes and adds the three integers; a window with no new matches keeps
+    its previous summary, and one with no matches at all gets ``null``.
+    Splitting the tiles into batches or permuting them yields identical
+    results.
+
+    Returns the canonical compact JSON string whose sole top-level key is
+    ``windows``: an array (in ``windows`` order) of six-value arrays
+    ``[level, ix_min, iy_min, ix_max, iy_max, summary]``. Integers are
+    decimal; ``emin``/``emax`` use exactly six decimal places (negative zero
+    written as ``0.000000``). The output has no whitespace, ASCII is not
+    escaped and ``NaN``/``Infinity`` never appear. An empty ``windows``
+    tuple returns ``{"windows":[]}``. The inputs are never modified and
+    repeated calls return byte-identical strings.
+
+    :raises TypeError: ``state`` is not ``None`` or a ``str``,
+        ``assessment``/``windows`` is not a tuple, or a window's container,
+        length or field types are bad.
+    :raises ValueError: ``state`` is not the canonical encoding or its window
+        keys do not match ``windows``; ``level`` is out of range, the window
+        bounds are inverted, or the assessment's structure, ordering,
+        duplicates, fields, cell bounds or finiteness are bad.
+    """
+    if state is not None and not isinstance(state, str):
+        raise TypeError("state must be None or a str")
+    if not isinstance(assessment, tuple):
+        raise TypeError("assessment must be a tuple")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    _validate_reconciliation(assessment)
+
+    for level, ix_min, iy_min, ix_max, iy_max in windows:
+        if level < 0 or level >= len(assessment):
+            raise ValueError("level out of range")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+
+    previous = (_decode_reconciliation_accumulation(state)
+                if state is not None else None)
+    if previous is not None:
+        keys_match = (len(previous) == len(windows)
+                      and all(key == tuple(window)
+                              for (key, _), window in zip(previous, windows)))
+        if not keys_match:
+            raise ValueError("state windows do not match windows")
+
+    entries = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for index, (level, ix_min, iy_min, ix_max,
+                    iy_max) in enumerate(windows):
+            emin_u = None
+            emax_u = None
+            qsum = 0
+            asum = 0
+            n = 0
+            for tile in assessment[level]:
+                if (tile[4] >= ix_min and tile[2] <= ix_max
+                        and tile[5] >= iy_min and tile[3] <= iy_max):
+                    u_zmin = int(Decimal(str(tile[6])).quantize(_QUANTUM)
+                                 * 1_000_000)
+                    u_zmax = int(Decimal(str(tile[7])).quantize(_QUANTUM)
+                                 * 1_000_000)
+                    emin_u = u_zmin if emin_u is None else min(emin_u, u_zmin)
+                    emax_u = u_zmax if emax_u is None else max(emax_u, u_zmax)
+                    qsum += u_zmin * u_zmin + u_zmax * u_zmax
+                    asum += abs(tile[8])
+                    n += 1
+            if previous is not None:
+                prior = previous[index][1]
+                if prior is not None:
+                    if n:
+                        emin_u = min(emin_u, prior[0])
+                        emax_u = max(emax_u, prior[1])
+                        qsum += prior[2]
+                        asum += prior[3]
+                        n += prior[4]
+                    else:
+                        emin_u, emax_u, qsum, asum, n = prior
+            stats = None if not n else (emin_u, emax_u, qsum, asum, n)
+            entries.append((tuple(windows[index]), stats))
+
+    return _encode_reconciliation_accumulation(entries)

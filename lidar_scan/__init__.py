@@ -8,7 +8,8 @@ from .dem import assess_dem, build_dem, build_dsm, merge_dems
 from .e57 import iter_e57
 from .las import iter_las
 from .ply import iter_ply
-from .tiles import (aggregate_tile_pyramid_delta_windows,
+from .tiles import (accumulate_reconciliation,
+                    aggregate_tile_pyramid_delta_windows,
                     aggregate_tile_region_stats, aggregate_tile_window_stats,
                     apply_delta_assessment,
                     apply_delta_assessments,
@@ -76,6 +77,7 @@ from .tiles import (aggregate_tile_pyramid_delta_windows,
 from .voxel import fuse_voxels
 
 __all__ = ["__version__", "chm", "dem", "e57", "las", "ply", "tiles", "voxel",
+           "accumulate_reconciliation",
            "aggregate_tile_pyramid_delta_windows",
            "aggregate_tile_region_stats", "aggregate_tile_window_stats",
            "apply_delta_assessment",
