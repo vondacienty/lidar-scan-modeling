@@ -6707,3 +6707,181 @@ def decode_rollback_tile_pyramid_delta_windows(text: str) -> tuple:
         raise ValueError("JSON text is not the canonical "
                          "rollback-delta-windows encoding")
     return result
+
+
+def reconcile_tile_pyramid(base: tuple, deltas: tuple,
+                           candidate: tuple) -> tuple:
+    """Compare a candidate pyramid against base-plus-deltas expectations.
+
+    Every coordinate of ``base`` is combined with the same-coordinate tile of
+    ``deltas`` to form the expected tile: expected ``zmin``/``zmax`` equal the
+    base value plus the same-coordinate delta value and expected ``count``
+    the base count plus the same-coordinate ``dcount``. Each expected tile is
+    then compared with the same-coordinate tile of ``candidate`` and the
+    per-tile error (candidate minus expected) is returned.
+
+    ``base`` must be an outer tuple as produced by :func:`build_tile_pyramid`:
+    each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples sorted
+    strictly by ``(tx, ty)`` with no duplicates, where the first six fields
+    and ``count`` are non-bool ints with ``count >= 0``, ``zmin``/``zmax``
+    are finite floats with ``zmin <= zmax`` and the bounds satisfy
+    ``ix0 <= ix1`` and ``iy0 <= iy1``.
+
+    ``deltas`` must be an outer tuple as produced by
+    :func:`assess_tile_pyramid_deltas` with the same number of levels as
+    ``base``: each level is a tuple of
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` 9-tuples where the
+    first six fields and ``dcount`` are non-bool ints with ``ix0 <= ix1`` and
+    ``iy0 <= iy1`` and ``dzmin``/``dzmax`` are finite floats. At every level
+    the delta tiles must contain the same ``(tx, ty)`` coordinates with
+    identical ``(ix0, iy0, ix1, iy1)`` bounds as ``base``, but they may be
+    presented in any order — matching is by ``(tx, ty)`` coordinate;
+    otherwise ``ValueError`` is raised.
+
+    ``candidate`` must be an outer tuple with the same structure as ``base``
+    and the same number of levels; at every level it must contain the same
+    ``(tx, ty)`` coordinates with identical ``(ix0, iy0, ix1, iy1)`` bounds
+    as ``base``, otherwise ``ValueError`` is raised.
+
+    Returns a tuple, in ``base`` level and tile order, of tuples of
+    ``(tx, ty, ix0, iy0, ix1, iy1, err_zmin, err_zmax, err_count)`` 9-tuples
+    where ``err_zmin``/``err_zmax`` equal the candidate value minus the
+    expected value and ``err_count`` the candidate count minus the expected
+    count. The expectations are Decimal computations
+    (``Decimal(str(v))``, precision 50, ``ROUND_HALF_EVEN``) and the errors
+    are quantized to six decimal places and converted to floats (negative
+    zero is normalized to ``0.0``); the counts are exact. An expected tile
+    with ``zmin > zmax`` or ``count < 0`` raises ``ValueError``. The inputs
+    are never modified and the result does not depend on the order of
+    ``deltas``.
+
+    :raises TypeError: ``base``/``deltas``/``candidate`` is not a tuple.
+    :raises ValueError: the structure, ordering, duplicates, fields, cell
+        bounds, z bounds, counts, level counts or coordinate sets of
+        ``base``/``deltas``/``candidate`` are bad, or an expected tile
+        violates ``zmin <= zmax`` or ``count >= 0``.
+    """
+    if not isinstance(base, tuple):
+        raise TypeError("base must be a tuple")
+    if not isinstance(deltas, tuple):
+        raise TypeError("deltas must be a tuple")
+    if not isinstance(candidate, tuple):
+        raise TypeError("candidate must be a tuple")
+
+    _validate_pyramid(base)
+    _validate_pyramid(candidate)
+
+    for pyramid in (base, candidate):
+        for level_tiles in pyramid:
+            for tile in level_tiles:
+                if tile[4] < tile[2] or tile[5] < tile[3]:
+                    raise ValueError("tile bounds must satisfy ix0 <= ix1 "
+                                     "and iy0 <= iy1")
+                if tile[6] > tile[7]:
+                    raise ValueError("zmin must be <= zmax")
+                if tile[8] < 0:
+                    raise ValueError("count must be >= 0")
+
+    # The delta tiles may be reordered within each level, so they are
+    # validated for structure, fields, bounds and duplicates here without
+    # requiring a sorted order.
+    for delta_level in deltas:
+        if not isinstance(delta_level, tuple):
+            raise ValueError("each deltas level must be a tuple")
+        seen_keys = set()
+        for tile in delta_level:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise ValueError(
+                    "each tile must be a 9-tuple "
+                    "(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)"
+                )
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and "
+                                     "dcount must be non-bool ints")
+            for value in tile[6:8]:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("dzmin and dzmax must be finite floats")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            key = (tile[0], tile[1])
+            if key in seen_keys:
+                raise ValueError("each deltas level must not contain "
+                                 "duplicate (tx, ty) coordinates")
+            seen_keys.add(key)
+
+    if len(base) != len(deltas):
+        raise ValueError("base and deltas must have the same number of "
+                         "levels")
+    if len(base) != len(candidate):
+        raise ValueError("base and candidate must have the same number of "
+                         "levels")
+
+    reconciled_levels = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for base_level, delta_level, candidate_level in zip(base, deltas,
+                                                            candidate):
+            delta_by_coord = {}
+            for delta_tile in delta_level:
+                delta_by_coord[(delta_tile[0], delta_tile[1])] = delta_tile
+            if len(delta_by_coord) != len(base_level):
+                raise ValueError("base and deltas must contain the same "
+                                 "(tx, ty) tile coordinates at every level")
+            if len(candidate_level) != len(base_level):
+                raise ValueError("base and candidate must contain the same "
+                                 "(tx, ty) tile coordinates at every level")
+
+            level_result = []
+            for base_tile, candidate_tile in zip(base_level,
+                                                 candidate_level):
+                (tx, ty, ix0, iy0, ix1, iy1,
+                 zmin, zmax, count) = base_tile
+                if candidate_tile[0:2] != (tx, ty):
+                    raise ValueError(
+                        "base and candidate must contain the same (tx, ty) "
+                        "tile coordinates at every level"
+                    )
+                if candidate_tile[2:6] != base_tile[2:6]:
+                    raise ValueError(
+                        "tiles with the same (tx, ty) must agree on "
+                        "(ix0, iy0, ix1, iy1)"
+                    )
+                delta_tile = delta_by_coord.get((tx, ty))
+                if delta_tile is None:
+                    raise ValueError(
+                        "base and deltas must contain the same (tx, ty) "
+                        "tile coordinates at every level"
+                    )
+                if delta_tile[2:6] != base_tile[2:6]:
+                    raise ValueError(
+                        "tiles with the same (tx, ty) must agree on "
+                        "(ix0, iy0, ix1, iy1)"
+                    )
+                dzmin, dzmax, dcount = delta_tile[6], delta_tile[7], \
+                    delta_tile[8]
+
+                expected_zmin = Decimal(str(zmin)) + Decimal(str(dzmin))
+                expected_zmax = Decimal(str(zmax)) + Decimal(str(dzmax))
+                expected_count = count + dcount
+                if expected_zmin > expected_zmax:
+                    raise ValueError(
+                        "expected tile must satisfy zmin <= zmax")
+                if expected_count < 0:
+                    raise ValueError("expected count must be >= 0")
+
+                err_zmin = _quantize(
+                    Decimal(str(candidate_tile[6])) - expected_zmin)
+                err_zmax = _quantize(
+                    Decimal(str(candidate_tile[7])) - expected_zmax)
+                err_count = candidate_tile[8] - expected_count
+
+                level_result.append((tx, ty, ix0, iy0, ix1, iy1,
+                                     err_zmin, err_zmax, err_count))
+            reconciled_levels.append(tuple(level_result))
+
+    return tuple(reconciled_levels)
