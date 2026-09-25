@@ -7532,3 +7532,96 @@ def merge_reconciliation_states(states: tuple, windows: tuple) -> str:
                 current[4] += entry[4]
 
     return _format_reconciliation_state(merged, windows)
+
+
+def finalize_reconciliation_state(state: str, windows: tuple) -> str:
+    """Finalize a merged reconciliation accumulation state as a report.
+
+    ``state`` must be canonical JSON in the
+    :func:`merge_reconciliation_states` format: the compact document whose
+    sole top-level key is ``windows`` with one entry per window in
+    ``windows`` order, each entry being the five window fields followed by
+    either ``null`` or ``[emin, emax, qsum, asum, n]`` with
+    ``emin``/``emax`` fixed six-decimal finite numbers (negative zero written
+    as ``0.000000``) and ``qsum``, ``asum`` and ``n`` non-bool decimal
+    integers with ``qsum >= 0``, ``asum >= 0`` and ``n > 0``; re-encoding the
+    parsed state must reproduce it byte for byte.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max`` and ``level >= 0``.
+
+    Returns a canonical compact JSON string whose sole top-level key is
+    ``windows``: an array (in ``windows`` order) of six-value arrays
+    ``[level, ix_min, iy_min, ix_max, iy_max, report]``. A window whose
+    summary is ``null`` gets ``report = null``; otherwise ``report`` is the
+    five-value array ``[emin, emax, rmse, amean, n]`` where
+    ``rmse = sqrt(qsum / (2 * n)) / 10 ** 6`` and ``amean = asum / n``. Every
+    value except ``n`` is a Decimal computation (precision 50,
+    ``ROUND_HALF_EVEN``) written with exactly six decimal places (negative
+    zero written as ``0.000000``); ``n`` is a decimal integer. The output has
+    no whitespace, ASCII is not escaped and ``NaN``/``Infinity`` never
+    appear. An empty ``windows`` tuple returns ``{"windows":[]}``. The inputs
+    are never modified and repeated calls return byte-identical strings.
+
+    :raises TypeError: ``state`` is not a ``str`` or ``windows`` is not a
+        tuple (including bad window container, length or field types).
+    :raises ValueError: ``level`` is negative, the window bounds are
+        inverted, or the state's JSON, structure, values, window keys or
+        canonical formatting are bad.
+    """
+    if not isinstance(state, str):
+        raise TypeError("state must be a str")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    for level, ix_min, iy_min, ix_max, iy_max in windows:
+        if level < 0:
+            raise ValueError("level must be non-negative")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+
+    entries = _decode_reconciliation_state(state, windows)
+
+    parts = ['{"windows":[']
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for index, (window, entry) in enumerate(zip(windows, entries)):
+            if index:
+                parts.append(",")
+            level, ix_min, iy_min, ix_max, iy_max = window
+            parts.append("[")
+            parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                                   str(ix_max), str(iy_max))))
+            parts.append(",")
+            if entry is None:
+                parts.append("null")
+            else:
+                emin, emax, qsum, asum, match_count = entry
+                rmse = ((Decimal(qsum) / Decimal(2 * match_count)).sqrt()
+                        / _MICRO)
+                amean = Decimal(asum) / Decimal(match_count)
+                parts.append("[")
+                parts.append(",".join((_format_decimal6(emin),
+                                       _format_decimal6(emax),
+                                       _format_decimal6(rmse),
+                                       _format_decimal6(amean),
+                                       str(match_count))))
+                parts.append("]")
+            parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
