@@ -5366,3 +5366,85 @@ def rollback_tile_pyramid_deltas(base: tuple, deltas: tuple) -> tuple:
             result_levels.append(tuple(level_result))
 
     return tuple(result_levels)
+
+
+def rollback_tile_pyramid_windows(base: tuple, deltas: tuple,
+                                  windows: tuple) -> tuple:
+    """Subtract per-tile pyramid deltas and select tiles intersecting windows.
+
+    Equivalent to
+    ``query_tile_pyramid_windows(rollback_tile_pyramid_deltas(base, deltas), windows)``:
+    every coordinate of ``base`` is rolled back against the same-coordinate
+    tile of ``deltas`` exactly as in :func:`rollback_tile_pyramid_deltas`,
+    then the rolled-back tiles are filtered per window.
+
+    ``base`` and ``deltas`` must satisfy the full contract of
+    :func:`rollback_tile_pyramid_deltas`: outer tuples with the same number of
+    levels and, at every level, the same ``(tx, ty)`` coordinates with
+    identical ``(ix0, iy0, ix1, iy1)`` bounds; an empty ``deltas`` queries
+    ``base`` unchanged.
+
+    ``windows`` must be a tuple of 5-tuples
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose fields are non-bool ints
+    with ``ix_min <= ix_max`` and ``iy_min <= iy_max``; ``level`` must satisfy
+    ``0 <= level < len(base)``.
+
+    For each window, a rolled-back tile matches when its closed cell-index
+    intervals intersect the window: ``tile.ix1 >= ix_min and
+    tile.ix0 <= ix_max and tile.iy1 >= iy_min and tile.iy0 <= iy_max``.
+
+    Returns a tuple, in ``windows`` order, of
+    ``(level, ix_min, iy_min, ix_max, iy_max, tiles)`` tuples where ``tiles``
+    is a tuple of rolled-back
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` 9-tuples preserving
+    ``base`` order; a window with no matching tile gets an empty ``tiles``
+    tuple and an empty ``windows`` tuple returns ``()``. The rollback
+    differences are Decimal computations (``Decimal(str(v))``, precision 50,
+    ``ROUND_HALF_EVEN``) kept as exact ints when both operands are integral
+    and otherwise quantized to six decimal places as floats (negative zero
+    normalized). The inputs are never modified and the result does not depend
+    on the order of ``deltas``.
+
+    :raises TypeError: ``base``/``deltas``/``windows`` is not a tuple or a
+        window's container, length or field types are bad.
+    :raises ValueError: the structure, ordering, duplicates, fields, cell
+        bounds, z bounds, counts, level counts or coordinate sets of
+        ``base``/``deltas`` are bad, a resulting tile violates
+        ``zmin <= zmax`` or ``count >= 0``, ``level`` is out of range, or the
+        window bounds are inverted.
+    """
+    if not isinstance(base, tuple):
+        raise TypeError("base must be a tuple")
+    if not isinstance(deltas, tuple):
+        raise TypeError("deltas must be a tuple")
+    if not isinstance(windows, tuple):
+        raise TypeError("windows must be a tuple")
+
+    for window in windows:
+        if not isinstance(window, tuple) or len(window) != 5:
+            raise TypeError(
+                "each window must be a 5-tuple "
+                "(level, ix_min, iy_min, ix_max, iy_max)"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), window):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be a non-bool int")
+
+    rolled_back = rollback_tile_pyramid_deltas(base, deltas)
+
+    results = []
+    for level, ix_min, iy_min, ix_max, iy_max in windows:
+        if level < 0 or level >= len(rolled_back):
+            raise ValueError("level out of range")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("window bounds must satisfy ix_min <= ix_max "
+                             "and iy_min <= iy_max")
+        matched = tuple(
+            tile for tile in rolled_back[level]
+            if (tile[4] >= ix_min and tile[2] <= ix_max
+                and tile[5] >= iy_min and tile[3] <= iy_max)
+        )
+        results.append((level, ix_min, iy_min, ix_max, iy_max, matched))
+
+    return tuple(results)
