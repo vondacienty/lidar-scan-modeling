@@ -1597,6 +1597,220 @@ def assess_tile_pyramid_deltas(estimate: tuple, reference: tuple) -> tuple:
     return tuple(pyramid)
 
 
+def _is_finite_number(value) -> bool:
+    """Return whether ``value`` is a non-bool int or a finite float."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, int) or (
+        isinstance(value, float) and math.isfinite(value))
+
+
+def _validate_rollback_base(base) -> None:
+    """Validate the base pyramid of :func:`rollback_tile_pyramid_deltas`.
+
+    Every level must be a tuple of strict 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)``: the first six
+    fields and ``count`` are non-bool ints with ``count >= 0``,
+    ``ix0 <= ix1`` and ``iy0 <= iy1``; ``zmin``/``zmax`` are non-bool ints
+    or finite floats with ``zmin <= zmax``; and the tiles are sorted
+    strictly by ``(tx, ty)`` with no duplicates.
+    """
+    for level_tiles in base:
+        if not isinstance(level_tiles, tuple):
+            raise ValueError("each pyramid level must be a tuple")
+        prev_key = None
+        for tile in level_tiles:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise ValueError("each tile must be a 9-tuple "
+                                 "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, "
+                                 "count)")
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and count "
+                                     "must be non-bool ints")
+            for value in tile[6:8]:
+                if not _is_finite_number(value):
+                    raise ValueError("zmin and zmax must be finite non-bool "
+                                     "ints or floats")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            if tile[6] > tile[7]:
+                raise ValueError("zmin must be <= zmax")
+            if tile[8] < 0:
+                raise ValueError("count must be >= 0")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("each pyramid level must be sorted by "
+                                 "(tx, ty) with no duplicate coordinates")
+            prev_key = key
+
+
+def _validate_rollback_deltas(deltas) -> None:
+    """Validate the deltas pyramid of :func:`rollback_tile_pyramid_deltas`.
+
+    Every level must be a tuple of strict 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)``: the first six
+    fields and ``dcount`` are non-bool ints with ``ix0 <= ix1`` and
+    ``iy0 <= iy1``; ``dzmin``/``dzmax`` are non-bool ints or finite floats
+    in either order; and the tiles are sorted strictly by ``(tx, ty)`` with
+    no duplicates.
+    """
+    for level_tiles in deltas:
+        if not isinstance(level_tiles, tuple):
+            raise ValueError("each deltas level must be a tuple")
+        prev_key = None
+        for tile in level_tiles:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise ValueError(
+                    "each tile must be a 9-tuple "
+                    "(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)"
+                )
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("tx, ty, ix0, iy0, ix1, iy1 and "
+                                     "dcount must be non-bool ints")
+            for value in tile[6:8]:
+                if not _is_finite_number(value):
+                    raise ValueError("dzmin and dzmax must be finite non-bool "
+                                     "ints or floats")
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            key = (tile[0], tile[1])
+            if prev_key is not None and key <= prev_key:
+                raise ValueError("each deltas level must be sorted by "
+                                 "(tx, ty) with no duplicate coordinates")
+            prev_key = key
+
+
+def rollback_tile_pyramid_deltas(base: tuple, deltas: tuple) -> tuple:
+    """Subtract pyramid delta assessments from a base tile pyramid.
+
+    ``base`` must be an outer tuple as produced by :func:`build_tile_pyramid`
+    and ``deltas`` an outer tuple as produced by
+    :func:`assess_tile_pyramid_deltas`, with the same number of levels: each
+    level is a tuple of 9-tuples
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` for the base and
+    ``(tx, ty, ix0, iy0, ix1, iy1, dzmin, dzmax, dcount)`` for the deltas,
+    with tiles sorted strictly by ``(tx, ty)`` with no duplicates. In both,
+    the first six fields (and ``count``/``dcount``) are non-bool ints with
+    ``ix0 <= ix1`` and ``iy0 <= iy1``; the base also requires ``count >= 0``
+    and ``zmin <= zmax``, while the four z fields are finite non-bool ints or
+    floats (``dzmin``/``dzmax`` in either order). At every level each delta
+    must only reference coordinates present in ``base`` with identical
+    ``(ix0, iy0, ix1, iy1)`` bounds; otherwise ``ValueError`` is raised. An
+    empty ``deltas`` returns ``base``.
+
+    Returns a tuple, in level order, of tuples in ``base`` order of
+    9-tuples with unchanged geometry: for every base tile,
+    ``zmin = base.zmin - sum(dzmin)``, ``zmax = base.zmax - sum(dzmax)`` and
+    ``count = base.count - sum(dcount)`` over the deltas sharing the tile's
+    coordinates (a missing delta contributes zero). The differences are
+    Decimal computations (``Decimal(str(v))``, precision 50,
+    ``ROUND_HALF_EVEN``) with the contributing delta terms summed in
+    ascending Decimal order before being subtracted; they stay exact ints
+    when the base value and every contributing term are ints, and are
+    otherwise quantized to six decimal places as floats (negative zero
+    normalized). Each resulting tile must satisfy ``zmin <= zmax`` and
+    ``count >= 0``; otherwise ``ValueError`` is raised. The result does not
+    depend on the order of ``deltas`` and the inputs are never modified.
+
+    :raises TypeError: ``base`` or ``deltas`` is not a tuple.
+    :raises ValueError: the level counts differ or the structure, ordering,
+        duplicates, fields, cell bounds, z bounds, coordinate sets or shared
+        cell bounds of either input are bad, or a resulting tile violates
+        ``zmin <= zmax`` or ``count >= 0``.
+    """
+    if not isinstance(base, tuple):
+        raise TypeError("base must be a tuple")
+    if not isinstance(deltas, tuple):
+        raise TypeError("deltas must be a tuple")
+
+    _validate_rollback_base(base)
+    _validate_rollback_deltas(deltas)
+
+    if not deltas:
+        return base
+
+    if len(deltas) != len(base):
+        raise ValueError("base and deltas must have the same number of levels")
+
+    # (level, (tx, ty)) -> [dzmin terms, dzmax terms, dcount]; the per-tile
+    # Decimal summands are collected and sorted so the result does not depend
+    # on the order in which the deltas are presented.
+    contributions: dict[tuple, list] = {}
+    for level, delta_level in enumerate(deltas):
+        base_index = {(tile[0], tile[1]): tile for tile in base[level]}
+        for tile in delta_level:
+            key = (tile[0], tile[1])
+            base_tile = base_index.get(key)
+            if base_tile is None:
+                raise ValueError(
+                    "every delta coordinate must exist in base at every level"
+                )
+            if tile[2:6] != base_tile[2:6]:
+                raise ValueError(
+                    "tiles with the same (tx, ty) must agree on "
+                    "(ix0, iy0, ix1, iy1)"
+                )
+            entry = contributions.get((level, key))
+            if entry is None:
+                entry = [[], [], 0]
+                contributions[(level, key)] = entry
+            entry[0].append(tile[6])
+            entry[1].append(tile[7])
+            entry[2] += tile[8]
+
+    pyramid = []
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for level, level_tiles in enumerate(base):
+            result_tiles = []
+            for tile in level_tiles:
+                tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count = tile
+                entry = contributions.get((level, (tx, ty)))
+                if entry is None:
+                    result_tiles.append(tile)
+                    continue
+                dzmin_terms, dzmax_terms, dcount = entry
+
+                if all(isinstance(term, int) for term in dzmin_terms) \
+                        and isinstance(zmin, int):
+                    new_zmin = zmin - sum(dzmin_terms)
+                else:
+                    new_zmin = _quantize(
+                        Decimal(str(zmin)) - _sorted_sum(
+                            [Decimal(str(term)) for term in dzmin_terms]))
+                if all(isinstance(term, int) for term in dzmax_terms) \
+                        and isinstance(zmax, int):
+                    new_zmax = zmax - sum(dzmax_terms)
+                else:
+                    new_zmax = _quantize(
+                        Decimal(str(zmax)) - _sorted_sum(
+                            [Decimal(str(term)) for term in dzmax_terms]))
+                new_count = count - dcount
+
+                if isinstance(new_zmin, int) and isinstance(new_zmax, int):
+                    ordered = new_zmin <= new_zmax
+                else:
+                    ordered = (Decimal(str(new_zmin))
+                               <= Decimal(str(new_zmax)))
+                if not ordered:
+                    raise ValueError("resulting zmin must be <= zmax")
+                if new_count < 0:
+                    raise ValueError("resulting count must be >= 0")
+
+                result_tiles.append(
+                    (tx, ty, ix0, iy0, ix1, iy1,
+                     new_zmin, new_zmax, new_count))
+            pyramid.append(tuple(result_tiles))
+
+    return tuple(pyramid)
+
+
 def assess_tile_pyramid_windows(estimate: tuple, reference: tuple,
                                 windows: tuple) -> tuple:
     """Assess matched tiles inside cell-index windows across pyramid levels.
