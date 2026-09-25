@@ -5394,14 +5394,13 @@ def apply_tile_pyramid(base: tuple, deltas: tuple) -> tuple:
     geometry is taken unchanged from each base tile and ``zmin``/``zmax``
     equal the base value plus the same-coordinate delta value, ``count`` the
     base count plus the same-coordinate ``dcount``. The float sums are Decimal
-    computations (``Decimal(str(v))``, precision 50, ``ROUND_HALF_EVEN``);
-    when the base value and the delta value are integral the result is kept as
-    an exact int, otherwise it is quantized to six decimal places and
-    converted to a float (negative zero normalized). Each resulting tile must
-    satisfy ``zmin <= zmax`` and ``count >= 0``; otherwise ``ValueError`` is
-    raised. The inputs are never modified and the result does not depend on
-    the order in which matching tiles are presented beyond the levels' stored
-    order.
+    computations (``Decimal(str(v))``, precision 50, ``ROUND_HALF_EVEN``),
+    quantized to six decimal places and converted to finite floats; even an
+    integral result is returned as a float (never an int) and negative zero is
+    normalized to ``0.0``. Each resulting tile must satisfy ``zmin <= zmax``
+    and ``count >= 0``; otherwise ``ValueError`` is raised. The inputs are
+    never modified and the returned pyramid can be passed directly to
+    :func:`query_tile_pyramid` and :func:`query_tile_pyramid_windows`.
 
     :raises TypeError: ``base`` or ``deltas`` is not a tuple.
     :raises ValueError: the level counts differ or the structure, ordering,
@@ -5462,24 +5461,13 @@ def apply_tile_pyramid(base: tuple, deltas: tuple) -> tuple:
                 base_zmax = Decimal(str(zmax))
                 dzmin_term = Decimal(str(dzmin))
                 dzmax_term = Decimal(str(dzmax))
-                if (base_zmin == base_zmin.to_integral_value()
-                        and dzmin_term == dzmin_term.to_integral_value()):
-                    new_zmin = int(base_zmin) + int(dzmin_term)
-                else:
-                    new_zmin = _quantize(base_zmin + dzmin_term)
-                if (base_zmax == base_zmax.to_integral_value()
-                        and dzmax_term == dzmax_term.to_integral_value()):
-                    new_zmax = int(base_zmax) + int(dzmax_term)
-                else:
-                    new_zmax = _quantize(base_zmax + dzmax_term)
+                new_zmin = _quantize(base_zmin + dzmin_term)
+                new_zmax = _quantize(base_zmax + dzmax_term)
                 new_count = count + dcount
 
-                if isinstance(new_zmin, int) and isinstance(new_zmax, int):
-                    ordered = new_zmin <= new_zmax
-                else:
-                    ordered = (Decimal(str(new_zmin))
-                               <= Decimal(str(new_zmax)))
-                if not ordered:
+                if not (math.isfinite(new_zmin) and math.isfinite(new_zmax)):
+                    raise ValueError("resulting zmin and zmax must be finite")
+                if new_zmin > new_zmax:
                     raise ValueError("resulting tile must satisfy zmin <= zmax")
                 if new_count < 0:
                     raise ValueError("resulting count must be >= 0")
