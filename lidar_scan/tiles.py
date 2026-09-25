@@ -7625,3 +7625,235 @@ def finalize_reconciliation_state(state: str, windows: tuple) -> str:
             parts.append("]")
     parts.append("]}")
     return "".join(parts)
+
+
+def _decode_gate_report(text: str) -> list:
+    """Parse and validate a canonical finalized reconciliation report.
+
+    Returns the report windows as a list of
+    ``[level, ix_min, iy_min, ix_max, iy_max, summary]`` where ``summary`` is
+    ``None`` or ``[emin, emax, rmse, amean, n]`` with the four metrics as
+    Decimals and ``n`` an int.
+
+    :raises ValueError: the JSON syntax or shape is bad, a value violates the
+        report contract, or the text is not the canonical encoding.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("report is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"windows"}:
+        raise ValueError("report top-level value must be an object with only "
+                         "'windows'")
+    raw_windows = document["windows"]
+    if not isinstance(raw_windows, list):
+        raise ValueError("report 'windows' must be an array")
+
+    windows = []
+    for raw_window in raw_windows:
+        if not isinstance(raw_window, list) or len(raw_window) != 6:
+            raise ValueError("each report window must be an array of six "
+                             "values")
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), raw_window[:5]):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"report {name} must be a non-bool integer")
+        level, ix_min, iy_min, ix_max, iy_max = raw_window[:5]
+        if level < 0:
+            raise ValueError("report level must be non-negative")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("report window bounds must satisfy ix_min <= "
+                             "ix_max and iy_min <= iy_max")
+
+        raw_summary = raw_window[5]
+        summary = None
+        if raw_summary is not None:
+            if not isinstance(raw_summary, list) or len(raw_summary) != 5:
+                raise ValueError("each report summary must be null or an "
+                                 "array of five values")
+            metrics_raw = list(raw_summary[:4])
+            match_count = raw_summary[4]
+            for name, value in zip(("emin", "emax", "rmse", "amean"),
+                                   metrics_raw):
+                if isinstance(value, bool) or not isinstance(value,
+                                                             (int, Decimal)):
+                    raise ValueError(f"report {name} must be a number")
+            metrics = [Decimal(value) for value in metrics_raw]
+            for name, value in zip(("emin", "emax", "rmse", "amean"),
+                                   metrics):
+                if not value.is_finite():
+                    raise ValueError(f"report {name} must be finite")
+            if isinstance(match_count, bool) or not isinstance(match_count,
+                                                               int):
+                raise ValueError("report n must be a non-bool integer")
+            if match_count < 1:
+                raise ValueError("report n must be a positive integer")
+            if metrics[2] < 0 or metrics[3] < 0:
+                raise ValueError("report rmse and amean must be "
+                                 "non-negative")
+            summary = [*metrics, match_count]
+
+        windows.append([level, ix_min, iy_min, ix_max, iy_max, summary])
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal metric formatting, negative zero as
+    # anything but ``0.000000``, leading zeros, exponents and any other
+    # non-canonical spelling.
+    canonical = _format_finalized_report(windows)
+    if canonical != text:
+        raise ValueError("report is not the canonical reconciliation "
+                         "finalization encoding")
+    return windows
+
+
+def _format_finalized_report(windows: list) -> str:
+    """Serialize report windows in the finalization (input) format."""
+    parts = ['{"windows":[']
+    for index, window in enumerate(windows):
+        if index:
+            parts.append(",")
+        level, ix_min, iy_min, ix_max, iy_max, summary = window
+        parts.append("[")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",")
+        if summary is None:
+            parts.append("null")
+        else:
+            emin, emax, rmse, amean, match_count = summary
+            parts.append("[")
+            parts.append(",".join((_format_decimal6(emin),
+                                   _format_decimal6(emax),
+                                   _format_decimal6(rmse),
+                                   _format_decimal6(amean),
+                                   str(match_count))))
+            parts.append("]")
+        parts.append("]")
+    parts.append("]}")
+    return "".join(parts)
+
+
+def _format_gate_report(windows: list, passed_flags: list,
+                        passed: bool) -> str:
+    """Serialize gated report windows to the compact two-key JSON document."""
+    parts = ['{"windows":[']
+    for index, (window, window_passed) in enumerate(zip(windows,
+                                                        passed_flags)):
+        if index:
+            parts.append(",")
+        level, ix_min, iy_min, ix_max, iy_max, summary = window
+        parts.append("[")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",")
+        if summary is None:
+            parts.append("null")
+        else:
+            emin, emax, rmse, amean, match_count = summary
+            parts.append("[")
+            parts.append(",".join((_format_decimal6(emin),
+                                   _format_decimal6(emax),
+                                   _format_decimal6(rmse),
+                                   _format_decimal6(amean),
+                                   str(match_count))))
+            parts.append("]")
+        parts.append(",true]" if window_passed else ",false]")
+    parts.append('],"passed":')
+    parts.append("true}" if passed else "false}")
+    return "".join(parts)
+
+
+def gate_report(report: str, limits: tuple) -> str:
+    """Apply acceptance limits to a finalized reconciliation report.
+
+    ``report`` must be canonical JSON in the
+    :func:`finalize_reconciliation_state` format: the compact document whose
+    sole top-level key is ``windows`` with one six-value array
+    ``[level, ix_min, iy_min, ix_max, iy_max, R]`` per window. The five window
+    fields are non-bool integers with ``level >= 0``, ``ix_min <= ix_max`` and
+    ``iy_min <= iy_max``; ``R`` is either ``null`` or
+    ``[emin, emax, rmse, amean, n]`` where the four metrics are finite
+    numbers written with exactly six decimal places (negative zero written as
+    ``0.000000``), ``rmse``/``amean`` are non-negative and ``n`` is a positive
+    non-bool decimal integer; re-encoding the parsed report must reproduce it
+    byte for byte.
+
+    ``limits`` is a 4-tuple ``(max_abs, max_rmse, max_amean, min_n)``; the
+    first three are finite non-bool non-negative ``int``/``float`` values and
+    ``min_n`` is a positive non-bool integer.
+
+    A window passes only when its ``R`` is not ``null`` and
+    ``abs(emin) <= max_abs``, ``abs(emax) <= max_abs``,
+    ``rmse <= max_rmse``, ``amean <= max_amean`` and ``n >= min_n``. Boundary
+    comparisons are exact: the six-decimal report metrics and the limits are
+    compared as ``Decimal(str(value))``.
+
+    Returns a canonical compact JSON string with exactly the two keys
+    ``windows`` and ``passed`` in that order: each window keeps its five
+    integer fields and ``R`` in order, followed by the lowercase boolean
+    ``true``/``false`` for that window, and the overall ``passed`` is true only
+    when every window passes; an empty window set yields
+    ``{"windows":[],"passed":true}``. Integers are decimal, the four metrics
+    use exactly six decimal places, ``NaN``/``Infinity`` never appear and the
+    output has no whitespace or trailing newline. The inputs are never
+    modified and repeated calls return byte-identical strings.
+
+    :raises TypeError: ``report`` is not a ``str``, ``limits`` is not a tuple,
+        or ``limits`` has a bad length or field type.
+    :raises ValueError: a limit value is out of range, or the report's JSON,
+        structure, values or canonical formatting are bad.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(limits, tuple):
+        raise TypeError("limits must be a tuple")
+    if len(limits) != 4:
+        raise TypeError(
+            "limits must be a 4-tuple (max_abs, max_rmse, max_amean, min_n)"
+        )
+
+    for index, name in enumerate(("max_abs", "max_rmse", "max_amean")):
+        value = limits[index]
+        if isinstance(value, bool) or not isinstance(value, _NUMERIC_TYPES):
+            raise TypeError(f"{name} must be a non-bool int or float")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+    min_n = limits[3]
+    if isinstance(min_n, bool) or not isinstance(min_n, int):
+        raise TypeError("min_n must be a non-bool integer")
+    if min_n < 1:
+        raise ValueError("min_n must be a positive integer")
+
+    windows = _decode_gate_report(report)
+    max_abs = Decimal(str(limits[0]))
+    max_rmse = Decimal(str(limits[1]))
+    max_amean = Decimal(str(limits[2]))
+
+    passed_flags = []
+    overall_passed = True
+    with localcontext() as ctx:
+        ctx.prec = _PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+        for window in windows:
+            summary = window[5]
+            if summary is None:
+                window_passed = False
+            else:
+                emin, emax, rmse, amean, match_count = summary
+                window_passed = (
+                    abs(emin) <= max_abs
+                    and abs(emax) <= max_abs
+                    and rmse <= max_rmse
+                    and amean <= max_amean
+                    and match_count >= min_n
+                )
+            passed_flags.append(window_passed)
+            overall_passed = overall_passed and window_passed
+
+    return _format_gate_report(windows, passed_flags, overall_passed)
