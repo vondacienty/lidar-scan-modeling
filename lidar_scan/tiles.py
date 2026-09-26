@@ -12955,3 +12955,98 @@ def execute_checkout_recovery(plan: str, state=None, max_units=None) -> str:
         units[-1][0][4] if units else plan_snapshot)
     return _format_checkout_recovery_state(
         common, direction, target, records, snapshot, complete)
+
+
+def build_recovery_receipt(plan: str, states: tuple) -> str:
+    """Build a receipt summarizing a recovery execution of a plan.
+
+    ``plan`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`plan_checkout_recovery`. ``states`` must be a ``tuple``
+    whose items are each a ``str`` byte-for-byte matching a canonical
+    output of :func:`execute_checkout_recovery` for that same plan, given
+    in execution order: every state is re-validated against the plan and
+    each state's ``confirmed`` must strictly exceed the previous state's,
+    so every state extends the confirmed prefix by at least one unit.
+
+    Returns the canonical compact JSON document with exactly the five
+    top-level keys ``direction``, ``start``, ``end``, ``segments`` and
+    ``complete`` in that order. ``direction`` is the plan's active
+    recovery arm (``"pending"``, ``"missing"`` or ``"none"``). ``start``
+    is the ``before`` snapshot of the first unit to confirm, or the
+    plan's ``snapshot`` when the plan holds no units. ``end`` is the
+    last state's ``snapshot``, or ``start`` when ``states`` is empty.
+    ``segments`` holds one ``[from, to, batches]`` row per state in
+    order: ``from`` is zero for the first state and the previous state's
+    ``confirmed`` afterwards, ``to`` is the state's own ``confirmed``
+    and ``batches`` flattens the audit rows of the records the state
+    newly confirmed into ``[id, status]`` rows (ids never repeat).
+    ``complete`` is true exactly when every unit of the active arm is
+    confirmed and ``end`` byte-for-byte equals the plan's ``snapshot``;
+    a plan without units is always complete. Snapshots are embedded as
+    objects or ``null``; the output uses ``ensure_ascii=False``, no
+    whitespace and no trailing newline, and repeated calls return a
+    byte-identical document.
+
+    :raises TypeError: ``plan`` is not a ``str``, ``states`` is not a
+        ``tuple``, or an item of ``states`` is not a ``str``.
+    :raises ValueError: the plan or a state is malformed or not its
+        canonical encoding, the plan's ``missing`` and ``pending`` are
+        both non-empty, a state's ``common`` or ``direction`` does not
+        match the plan, the ``confirmed`` counts do not strictly
+        increase, the records do not continuously extend the confirmed
+        prefix, or a state's snapshot breaks the snapshot chain.
+    """
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(states, tuple):
+        raise TypeError("states must be a tuple")
+    for state in states:
+        if not isinstance(state, str):
+            raise TypeError("each state must be a str")
+    common, missing, pending, plan_snapshot = \
+        _decode_checkout_recovery_plan(plan)
+    if missing and pending:
+        raise ValueError("the plan forks: both missing and pending units "
+                         "remain")
+    if pending:
+        direction = "pending"
+        units = pending
+    elif missing:
+        direction = "missing"
+        units = missing
+    else:
+        direction = "none"
+        units = []
+    start = units[0][0][3] if units else plan_snapshot
+    segments = []
+    end = start
+    previous_confirmed = 0
+    for index, state in enumerate(states):
+        confirmed, records, snapshot = _decode_checkout_recovery_state(
+            state, common, direction, units, plan_snapshot)
+        if index and confirmed <= previous_confirmed:
+            raise ValueError('state "confirmed" values must strictly '
+                             "increase")
+        batches = []
+        for _range_row, segment in records[previous_confirmed:confirmed]:
+            batches.extend(segment)
+        segments.append((previous_confirmed, confirmed, batches))
+        previous_confirmed = confirmed
+        end = snapshot
+    complete = previous_confirmed == len(units) and end == plan_snapshot
+    parts = ['{"direction":', _json_string(direction), ',"start":']
+    parts.append("null" if start is None else start)
+    parts.append(',"end":')
+    parts.append("null" if end is None else end)
+    parts.append(',"segments":[')
+    segment_texts = []
+    for from_, to_, batches in segments:
+        segment_texts.append(
+            "[" + str(from_) + "," + str(to_) + ",["
+            + ",".join(_checkout_audit_row_text(row) for row in batches)
+            + "]]")
+    parts.append(",".join(segment_texts))
+    parts.append('],"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
