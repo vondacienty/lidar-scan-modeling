@@ -11471,32 +11471,18 @@ def delivery_log(entries: tuple) -> str:
     return "".join(parts)
 
 
-def read_commit(log: str, id: str, before: bool = False) -> str:
-    """Read one commit's snapshot from a :func:`delivery_log` document.
+def _decode_commit_log(log: str) -> list:
+    """Parse and fully recompute a canonical :func:`delivery_log` document.
 
-    ``log`` must be a ``str`` byte-for-byte matching the canonical output
-    of :func:`delivery_log`; the whole chain is recomputed and validated
-    (identifiers, parent linkage, snapshot linkage and every stored
-    ``result`` against :func:`commit_delivery_updates`). ``id`` must be a
-    ``str`` matching ``[A-Za-z0-9._-]+`` and name a commit in the log.
+    Returns one tuple ``(id, parent, snapshot, target, plan, result_snapshot)``
+    per commit in log order, with the four documents kept as their raw
+    canonical text spans and ``parent`` ``None`` for the first commit.
+    Identifiers, parent linkage, snapshot linkage and every stored result are
+    validated by recomputing the whole log with :func:`delivery_log`.
 
-    With ``before`` false (the default) returns the canonical encoding of
-    the matching commit's ``result.snapshot``; with ``before`` true
-    returns the canonical encoding of its ``snapshot``.
-
-    :raises TypeError: ``log``, ``id`` or ``before`` has the wrong type.
-    :raises ValueError: ``id`` is not a valid commit identifier or names
-        no commit in the log, or the log document, its chain or a
-        recomputed result does not match.
+    :raises ValueError: the document is malformed, not canonical, breaks the
+        chain, or a recomputed result does not match.
     """
-    if not isinstance(log, str):
-        raise TypeError("log must be a str")
-    if not isinstance(id, str):
-        raise TypeError("id must be a str")
-    if not isinstance(before, bool):
-        raise TypeError("before must be a bool")
-    if _COMMIT_ID_RE.fullmatch(id) is None:
-        raise ValueError(f"invalid commit id {id!r}")
     try:
         node = _parse_json_node(log, _skip_json_ws(log, 0))
     except ValueError as exc:
@@ -11534,10 +11520,133 @@ def read_commit(log: str, id: str, before: bool = False) -> str:
         result_nodes.append(row[5])
     if delivery_log(tuple(entries)) != log:
         raise ValueError("log does not match the recomputed delivery log")
+    decoded = []
     for entry, result_node in zip(entries, result_nodes):
-        if entry[0] == id:
-            if before:
-                return entry[2]
-            snapshot_node = result_node[0]["snapshot"]
-            return log[snapshot_node[1]:snapshot_node[2]]
+        snapshot_node = result_node[0]["snapshot"]
+        result_snapshot = log[snapshot_node[1]:snapshot_node[2]]
+        decoded.append((entry[0], entry[1], entry[2], entry[3], entry[4],
+                        result_snapshot))
+    return decoded
+
+
+def read_commit(log: str, id: str, before: bool = False) -> str:
+    """Read one commit's snapshot from a :func:`delivery_log` document.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log`; the whole chain is recomputed and validated
+    (identifiers, parent linkage, snapshot linkage and every stored
+    ``result`` against :func:`commit_delivery_updates`). ``id`` must be a
+    ``str`` matching ``[A-Za-z0-9._-]+`` and name a commit in the log.
+
+    With ``before`` false (the default) returns the canonical encoding of
+    the matching commit's ``result.snapshot``; with ``before`` true
+    returns the canonical encoding of its ``snapshot``.
+
+    :raises TypeError: ``log``, ``id`` or ``before`` has the wrong type.
+    :raises ValueError: ``id`` is not a valid commit identifier or names
+        no commit in the log, or the log document, its chain or a
+        recomputed result does not match.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(id, str):
+        raise TypeError("id must be a str")
+    if not isinstance(before, bool):
+        raise TypeError("before must be a bool")
+    if _COMMIT_ID_RE.fullmatch(id) is None:
+        raise ValueError(f"invalid commit id {id!r}")
+    decoded = _decode_commit_log(log)
+    for commit_id, _parent, snapshot, _target, _plan, result_snapshot \
+            in decoded:
+        if commit_id == id:
+            return snapshot if before else result_snapshot
     raise ValueError(f"no commit with id {id!r}")
+
+
+def plan_delivery_checkout(log: str, source: str, target: str) -> str:
+    """Plan a checkout between two commits of a :func:`delivery_log` chain.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log`; the whole chain is recomputed and validated
+    (identifiers, parent linkage, snapshot linkage and every stored
+    ``result`` against :func:`commit_delivery_updates`). ``source`` and
+    ``target`` must each be a ``str`` matching ``[A-Za-z0-9._-]+`` naming
+    a commit in the log, and the two commits must lie on one parent chain
+    (one must be an ancestor of the other, a commit being its own
+    ancestor).
+
+    Returns the canonical compact JSON document
+    ``{"source":...,"target":...,"direction":...,"steps":[...],
+    "snapshot":...}`` with exactly these five top-level keys in that
+    order. ``direction`` is ``"forward"`` when ``source`` is an ancestor
+    of ``target`` but differs from it, ``"rollback"`` when ``target`` is
+    an ancestor of ``source`` but differs from it, and ``"none"`` when
+    ``source`` and ``target`` are the same commit.
+
+    For a forward checkout the ``steps`` list collects, in log order,
+    every commit strictly after ``source`` up to and including
+    ``target``; for a rollback it collects, in reverse log order, every
+    commit from ``source`` down to and including the commit strictly
+    after ``target``. Each step is strictly
+    ``[id, action, before, after]``: ``action`` repeats ``direction``,
+    and ``before``/``after`` embed canonical snapshot objects -- the
+    commit's input ``snapshot`` and its ``result.snapshot`` for a forward
+    step, swapped for a rollback step (the result snapshot first, the
+    input snapshot second).
+
+    The final ``snapshot`` embeds ``target``'s ``result.snapshot``. A
+    same-commit checkout carries an empty ``steps`` list. The output
+    uses ``ensure_ascii=False``, no whitespace and no trailing newline;
+    the inputs are never modified and repeated calls return a
+    byte-identical document.
+
+    :raises TypeError: ``log``, ``source`` or ``target`` is not a ``str``.
+    :raises ValueError: an identifier is invalid or names no commit, the
+        log document, its chain or a recomputed result does not match, or
+        the two commits share no ancestor relationship.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(source, str):
+        raise TypeError("source must be a str")
+    if not isinstance(target, str):
+        raise TypeError("target must be a str")
+    if _COMMIT_ID_RE.fullmatch(source) is None:
+        raise ValueError(f"invalid commit id {source!r}")
+    if _COMMIT_ID_RE.fullmatch(target) is None:
+        raise ValueError(f"invalid commit id {target!r}")
+    decoded = _decode_commit_log(log)
+    index_by_id = {}
+    for position, row in enumerate(decoded):
+        index_by_id[row[0]] = position
+    if source not in index_by_id:
+        raise ValueError(f"no commit with id {source!r}")
+    if target not in index_by_id:
+        raise ValueError(f"no commit with id {target!r}")
+    source_pos = index_by_id[source]
+    target_pos = index_by_id[target]
+    if source_pos == target_pos:
+        direction = "none"
+        selected = []
+    elif source_pos < target_pos:
+        direction = "forward"
+        selected = decoded[source_pos + 1:target_pos + 1]
+    else:
+        direction = "rollback"
+        selected = list(reversed(decoded[target_pos + 1:source_pos + 1]))
+    parts = ["{", _json_string("source"), ":", _json_string(source),
+             ",", _json_string("target"), ":", _json_string(target),
+             ',"direction":', _json_string(direction), ',"steps":[']
+    for step_index, (commit_id, _parent, snapshot, _target_doc, _plan,
+                    result_snapshot) in enumerate(selected):
+        if step_index:
+            parts.append(",")
+        parts.append("[" + _json_string(commit_id) + ","
+                     + _json_string(direction) + ",")
+        if direction == "rollback":
+            parts.append(result_snapshot + "," + snapshot)
+        else:
+            parts.append(snapshot + "," + result_snapshot)
+        parts.append("]")
+    parts.append('],"snapshot":' + decoded[target_pos][5] + "}")
+    return "".join(parts)
