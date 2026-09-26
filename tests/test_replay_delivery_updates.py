@@ -395,3 +395,69 @@ def test_changed_flag_must_match():
     with pytest.raises(ValueError):
         replay_delivery_updates(_tampered(
             equal_plan, lambda doc: doc.__setitem__("changed", True)))
+
+
+# ---------------------------------------------------------------------------
+# operation ordering and version-chain rules
+# ---------------------------------------------------------------------------
+
+def test_operations_must_be_strictly_sorted():
+    before = _ready_p(((0, "1"), (1, "2")))
+    after = _ready_p(((0, "1"), (1, "2"), (2, "3")))
+    plan_text = plan_delivery_updates(
+        before, after, (("p", 0, 0), ("p", 2, 2), ("q", 0, 0)))
+    document = copy.deepcopy(json.loads(plan_text))
+
+    reversed_doc = copy.deepcopy(document)
+    reversed_doc["operations"].reverse()
+    with pytest.raises(ValueError):
+        replay_delivery_updates(json.dumps(
+            reversed_doc, ensure_ascii=False, separators=(",", ":")))
+
+    duplicate_doc = copy.deepcopy(document)
+    duplicate_doc["operations"][1][1] = 0
+    duplicate_doc["operations"][1][2] = 0
+    with pytest.raises(ValueError):
+        replay_delivery_updates(json.dumps(
+            duplicate_doc, ensure_ascii=False, separators=(",", ":")))
+
+    swapped_doc = copy.deepcopy(document)
+    swapped_doc["operations"][0], swapped_doc["operations"][2] = \
+        swapped_doc["operations"][2], swapped_doc["operations"][0]
+    with pytest.raises(ValueError):
+        replay_delivery_updates(json.dumps(
+            swapped_doc, ensure_ascii=False, separators=(",", ":")))
+
+
+def test_side_versions_must_chain_previous():
+    before = _ready_p(((0, "1"), (1, "2"), (2, "3")))
+    after = _ready_p(((0, "1"), (1, "2"), (2, "3"), (3, "4")))
+    plan_text = plan_delivery_updates(before, after, (("p", 0, 3),))
+    row = lambda doc: doc["operations"][0]
+
+    # broken chain on the base side
+    with pytest.raises(ValueError):
+        replay_delivery_updates(_tampered(
+            plan_text,
+            lambda doc: row(doc)[3][0][1].__setitem__(1, "zzz")))
+    with pytest.raises(ValueError):
+        replay_delivery_updates(_tampered(
+            plan_text,
+            lambda doc: row(doc)[3][0][2].__setitem__(1, None)))
+    # broken chain on the target side
+    with pytest.raises(ValueError):
+        replay_delivery_updates(_tampered(
+            plan_text,
+            lambda doc: row(doc)[7][0][1].__setitem__(1, "zzz")))
+    with pytest.raises(ValueError):
+        replay_delivery_updates(_tampered(
+            plan_text,
+            lambda doc: row(doc)[7][0][3].__setitem__(1, None)))
+
+
+def test_mid_range_chains_still_replay():
+    before = _ready_p(((0, "1"), (1, "2"), (2, "3")))
+    after = _ready_p(((0, "1"), (1, "2"), (2, "3"), (3, "4")))
+    plan_text = plan_delivery_updates(before, after, (("p", 1, 3),))
+    result = json.loads(replay_delivery_updates(plan_text))
+    assert result["results"][0][0] == "p"

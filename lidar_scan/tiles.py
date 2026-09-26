@@ -10557,6 +10557,9 @@ def _decode_plan_range_side(value, batch_min, batch_max, side):
         if versions and record[0] <= versions[-1][0]:
             raise ValueError(f"the {side} range versions must be sorted "
                              "uniquely by batch")
+        if versions and record[1] != versions[-1][2]:
+            raise ValueError(f"the {side} range previous must equal the "
+                             "version of the preceding version entry")
         if record[2] in seen_versions:
             raise ValueError(f"the {side} range reuses version "
                              f"{record[2]!r}")
@@ -10652,43 +10655,23 @@ def _replay_update_actions(value, base, batch_min, batch_max):
     return present
 
 
-def replay_delivery_updates(plan: str) -> str:
-    """Replay a :func:`plan_delivery_updates` document into its result.
+def _parse_delivery_plan(plan: str) -> tuple:
+    """Parse and fully validate a :func:`plan_delivery_updates` document.
 
-    ``plan`` must be a ``str`` byte-for-byte matching the canonical
-    output of :func:`plan_delivery_updates`. Each operation's actions are
-    replayed in their given (ascending-batch) order over the operation's
-    base: only ``["add", A]``, ``["remove", B]`` and
-    ``["replace", B, A]`` are allowed, with ``A``/``B`` four-value
-    version records whose batches lie inside the range; an add's batch must be
-    absent from the base, a remove/replace ``B`` must equal the base
-    record at that batch, and a replace keeps the same batch. Records are
-    then sorted by batch and the maximal closed gap intervals inside the
-    range are recomputed; the receipt/ready pairs' second items replace
-    the base values. The replayed range result must equal the operation's
-    target, the two pairs' first items must equal the base receipt/ready
-    values, and the top-level ``changed`` flag must be true exactly when
-    at least one operation's base and target differ.
+    Returns ``(document, operations)`` where ``document`` is the parsed
+    plan object and ``operations`` is a list (in plan order) of
+    ``[product, batch_min, batch_max, action_count, base, target,
+    raw_target]`` items: ``action_count`` is the number of actions the
+    operation carries, ``base``/``target`` are its normalized range
+    results (``None`` on a null side) and ``raw_target`` is the target as
+    parsed from the plan text.
 
-    Returns the canonical compact JSON document
-    ``{"results":[...],"changed":...}`` with exactly these two top-level
-    keys in this order; ``results`` holds one
-    ``[product, batch_min, batch_max, action_count, target]`` array per
-    operation in the operations' original order, where ``action_count`` is
-    the number of replayed actions. An empty plan is
-    ``{"results":[],"changed":false}``. The output uses decimal integers,
-    lowercase booleans and canonical ``null``, with no whitespace, no
-    ``NaN``/``Infinity`` and no trailing newline. The input is never
-    modified and repeated calls return a byte-identical document.
-
-    :raises TypeError: ``plan`` is not a ``str``.
-    :raises ValueError: ``plan`` is not the canonical
-        :func:`plan_delivery_updates` encoding or fails any of the
-        replay consistency checks above.
+    :raises ValueError: the JSON syntax or shape is bad, a value violates
+        the plan contract, the operations are not in strictly ascending
+        ``(product, batch_min, batch_max)`` order, a side's version chain
+        breaks its ``previous`` links, the replay does not reproduce the
+        target, or the text is not the canonical plan encoding.
     """
-    if not isinstance(plan, str):
-        raise TypeError("plan must be a str")
-
     try:
         document = json.loads(plan, parse_constant=_reject_constant,
                              parse_float=Decimal)
@@ -10708,7 +10691,7 @@ def replay_delivery_updates(plan: str) -> str:
     if not isinstance(changed, bool):
         raise ValueError("plan 'changed' must be a boolean")
 
-    results = []
+    operations = []
     any_base_differs = False
     for raw_operation in raw_operations:
         if (not isinstance(raw_operation, list)
@@ -10731,6 +10714,10 @@ def replay_delivery_updates(plan: str) -> str:
             raise ValueError("operation batch bounds must be non-negative")
         if batch_min > batch_max:
             raise ValueError("operation batch_min must not exceed batch_max")
+        if operations and (product, batch_min, batch_max) <= (
+                operations[-1][0], operations[-1][1], operations[-1][2]):
+            raise ValueError("operations must be sorted strictly by "
+                             "(product, batch_min, batch_max)")
 
         base = _decode_plan_range_side(raw_base, batch_min, batch_max,
                                           "base")
@@ -10790,8 +10777,8 @@ def replay_delivery_updates(plan: str) -> str:
             if replayed != target:
                 raise ValueError("replaying the actions must reproduce the target")
 
-        results.append([product, batch_min, batch_max, len(raw_actions),
-                      raw_target])
+        operations.append([product, batch_min, batch_max, len(raw_actions),
+                           base, target, raw_target])
 
     if changed != any_base_differs:
         raise ValueError("plan 'changed' must be true exactly when any base "
@@ -10815,9 +10802,147 @@ def replay_delivery_updates(plan: str) -> str:
         raise ValueError("plan is not the canonical plan_delivery_updates "
                          "encoding")
 
+    return document, operations
+
+
+def replay_delivery_updates(plan: str) -> str:
+    """Replay a :func:`plan_delivery_updates` document into its result.
+
+    ``plan`` must be a ``str`` byte-for-byte matching the canonical
+    output of :func:`plan_delivery_updates`. Its operations must be in
+    strictly ascending order by ``(product, batch_min, batch_max)``. On
+    both the base and target side, versions must be in strictly ascending
+    ``batch`` order and, from the second entry onward, each ``previous``
+    must equal the ``version`` of the entry before it. Each operation's
+    actions are
+    replayed in their given (ascending-batch) order over the operation's
+    base: only ``["add", A]``, ``["remove", B]`` and
+    ``["replace", B, A]`` are allowed, with ``A``/``B`` four-value
+    version records whose batches lie inside the range; an add's batch must be
+    absent from the base, a remove/replace ``B`` must equal the base
+    record at that batch, and a replace keeps the same batch. Records are
+    then sorted by batch and the maximal closed gap intervals inside the
+    range are recomputed; the receipt/ready pairs' second items replace
+    the base values. The replayed range result must equal the operation's
+    target, the two pairs' first items must equal the base receipt/ready
+    values, and the top-level ``changed`` flag must be true exactly when
+    at least one operation's base and target differ.
+
+    Returns the canonical compact JSON document
+    ``{"results":[...],"changed":...}`` with exactly these two top-level
+    keys in this order; ``results`` holds one
+    ``[product, batch_min, batch_max, action_count, target]`` array per
+    operation in the operations' original order, where ``action_count`` is
+    the number of replayed actions. An empty plan is
+    ``{"results":[],"changed":false}``. The output uses decimal integers,
+    lowercase booleans and canonical ``null``, with no whitespace, no
+    ``NaN``/``Infinity`` and no trailing newline. The input is never
+    modified and repeated calls return a byte-identical document.
+
+    :raises TypeError: ``plan`` is not a ``str``.
+    :raises ValueError: ``plan`` is not the canonical
+        :func:`plan_delivery_updates` encoding or fails any of the
+        replay consistency checks above.
+    """
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+
+    document, operations = _parse_delivery_plan(plan)
+    changed = document["changed"]
+    results = [[product, batch_min, batch_max, action_count, raw_target]
+               for (product, batch_min, batch_max, action_count,
+                    _base, _target, raw_target) in operations]
+
     document_out = {"results": results, "changed": changed}
     return json.dumps(document_out, ensure_ascii=False,
                      separators=(",", ":"), allow_nan=False)
+
+
+def apply_delivery_updates(snapshot: str, plan: str) -> str:
+    """Apply a replayed delivery update plan to a delivery snapshot.
+
+    ``snapshot`` must be a ``str`` byte-for-byte matching the canonical
+    output of :func:`build_delivery_snapshot` and ``plan`` a ``str`` that
+    passes :func:`replay_delivery_updates` (the canonical
+    :func:`plan_delivery_updates` encoding with operations in strictly
+    ascending ``(product, batch_min, batch_max)`` order and valid
+    ``previous`` chains on both sides). Every operation is checked first
+    (preflight): the snapshot's current range result for the operation's
+    ``(product, batch_min, batch_max)`` key is compared with the plan's
+    target and base. When it equals the target the operation is
+    ``unchanged``, otherwise when it equals the base it is ``applied``,
+    and otherwise it is a ``conflict``.
+
+    When at least one operation conflicts, nothing is applied: each
+    conflicting result row carries ``status`` ``"conflict"`` and
+    ``reason`` ``"mismatch"``, every other row carries ``status``
+    ``"aborted"`` and ``reason`` ``"conflict"``, every row's ``state`` is
+    the snapshot's current range result and the top-level ``applied``
+    flag is ``false``. When no operation conflicts, every row carries an
+    empty ``reason``, a ``state`` equal to the plan's target and
+    ``applied`` ``true`` (with ``status`` ``"unchanged"`` or
+    ``"applied"`` as above), and the top-level ``applied`` flag is
+    ``true``.
+
+    Returns the canonical compact JSON document
+    ``{"results":[...],"applied":...}`` with exactly these two top-level
+    keys in this order; ``results`` preserves the plan's operation order
+    and each row is
+    ``[product, batch_min, batch_max, status, reason, state]``, with
+    ``state`` the range result recursively converted to JSON arrays
+    (``null`` for an absent product). An empty plan yields
+    ``{"results":[],"applied":true}``. The output uses decimal integers,
+    lowercase booleans and canonical ``null``, with no whitespace, no
+    ``NaN``/``Infinity`` and no trailing newline. The inputs are never
+    modified and repeated calls return a byte-identical document.
+
+    :raises TypeError: ``snapshot`` or ``plan`` is not a ``str``.
+    :raises ValueError: ``snapshot`` is not the canonical delivery
+        snapshot encoding or ``plan`` fails :func:`replay_delivery_updates`.
+    """
+    if not isinstance(snapshot, str):
+        raise TypeError("snapshot must be a str")
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+
+    products, _snapshot_ready = _decode_delivery_snapshot(snapshot)
+    _document, operations = _parse_delivery_plan(plan)
+
+    checked = []
+    any_conflict = False
+    for (product, batch_min, batch_max, _action_count,
+         base, target, raw_target) in operations:
+        current_json = _ranges_result_to_json(_delivery_range_result(
+            products, product, batch_min, batch_max))
+        if current_json == raw_target:
+            status = "unchanged"
+        elif current_json == _ranges_result_to_json(base):
+            status = "applied"
+        else:
+            status = "conflict"
+            any_conflict = True
+        checked.append([product, batch_min, batch_max, status,
+                        current_json, raw_target])
+
+    results = []
+    for (product, batch_min, batch_max, status, current_json,
+         raw_target) in checked:
+        if any_conflict:
+            if status == "conflict":
+                reason = "mismatch"
+            else:
+                status = "aborted"
+                reason = "conflict"
+            state = current_json
+        else:
+            reason = ""
+            state = raw_target
+        results.append([product, batch_min, batch_max, status, reason,
+                        state])
+
+    document_out = {"results": results, "applied": not any_conflict}
+    return json.dumps(document_out, ensure_ascii=False,
+                      separators=(",", ":"), allow_nan=False)
 
 
 def update_delivery_snapshot(snapshot: str, changes: str,
