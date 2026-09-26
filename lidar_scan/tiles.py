@@ -10418,6 +10418,316 @@ def plan_delivery_updates(before: str, after: str, ranges: tuple) -> str:
                       separators=(",", ":"), allow_nan=False)
 
 
+def _reject_float(raw: str):
+    """Reject JSON non-integer numbers in documents that forbid them."""
+    raise ValueError(f"non-integer JSON number is not allowed: {raw}")
+
+
+def _range_gaps(records, batch_min, batch_max):
+    """Maximal closed intervals of range batches carrying no record."""
+    gaps = []
+    expected = batch_min
+    for record in records:
+        batch = record[0]
+        if batch > expected:
+            gaps.append([expected, batch - 1])
+        expected = batch + 1
+    if expected <= batch_max:
+        gaps.append([expected, batch_max])
+    return gaps
+
+
+def _check_plan_version_record(record, batch_min, batch_max):
+    """Validate one four-field version record of a delivery update plan."""
+    if not isinstance(record, list) or len(record) != 4:
+        raise ValueError("version records must be arrays of four values")
+    batch, previous, version, passed = record
+    if isinstance(batch, bool) or not isinstance(batch, int):
+        raise ValueError("version record batch must be a non-bool int")
+    if not batch_min <= batch <= batch_max:
+        raise ValueError("version record batch must lie inside the "
+                         "operation range")
+    if previous is not None and not isinstance(previous, str):
+        raise ValueError("version record previous must be null or a str")
+    if not isinstance(version, str):
+        raise ValueError("version record version must be a str")
+    if not isinstance(passed, bool):
+        raise ValueError("version record passed must be a boolean")
+
+
+def _check_plan_receipt(receipt):
+    """Validate a nullable five-field range receipt of an update plan."""
+    if receipt is None:
+        return
+    if not isinstance(receipt, list) or len(receipt) != 5:
+        raise ValueError("a range receipt must be null or an array of "
+                         "five values")
+    action, current, target, history, final = receipt
+    if not isinstance(action, str):
+        raise ValueError("receipt action must be a str")
+    if not isinstance(current, str):
+        raise ValueError("receipt current must be a str")
+    if target is not None and not isinstance(target, str):
+        raise ValueError("receipt target must be null or a str")
+    if not isinstance(history, list):
+        raise ValueError("receipt history must be an array")
+    for entry in history:
+        if (not isinstance(entry, list) or len(entry) != 2
+                or not isinstance(entry[0], str)
+                or not isinstance(entry[1], str)):
+            raise ValueError("receipt history entries must be "
+                             "[status, reason] str pairs")
+    if not isinstance(final, str):
+        raise ValueError("receipt final must be a str")
+
+
+def _check_plan_side(value, batch_min, batch_max):
+    """Validate a nullable range-query result embedded in an update plan."""
+    if value is None:
+        return
+    if not isinstance(value, list) or len(value) != 4:
+        raise ValueError("base/target must be null or an array of four "
+                         "values")
+    versions, gaps, receipt, ready = value
+    if not isinstance(versions, list):
+        raise ValueError("base/target versions must be an array")
+    previous_batch = None
+    previous_version = None
+    for record in versions:
+        _check_plan_version_record(record, batch_min, batch_max)
+        if previous_batch is not None:
+            if record[0] <= previous_batch:
+                raise ValueError("base/target versions must be ordered "
+                                 "uniquely by ascending batch")
+            if record[1] != previous_version:
+                raise ValueError("version record previous must link the "
+                                 "preceding record's version")
+        previous_batch = record[0]
+        previous_version = record[2]
+    if not isinstance(gaps, list):
+        raise ValueError("base/target gaps must be an array")
+    for gap in gaps:
+        if (not isinstance(gap, list) or len(gap) != 2
+                or isinstance(gap[0], bool) or not isinstance(gap[0], int)
+                or isinstance(gap[1], bool) or not isinstance(gap[1], int)):
+            raise ValueError("base/target gaps must be [first, last] "
+                             "non-bool int intervals")
+    if gaps != _range_gaps(versions, batch_min, batch_max):
+        raise ValueError("base/target gaps must be the maximal intervals "
+                         "of range batches carrying no version")
+    _check_plan_receipt(receipt)
+    if not isinstance(ready, bool):
+        raise ValueError("base/target ready must be a boolean")
+
+
+def replay_delivery_updates(plan: str) -> str:
+    """Replay and verify a delivery update plan, summarizing each operation.
+
+    ``plan`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`plan_delivery_updates`; every structural and semantic
+    invariant of that document is verified (the operation rows sorted
+    uniquely by their ``(product, batch_min, batch_max)`` key, the
+    embedded ``base``/``target`` range-query results internally
+    consistent, and the document canonically encoded).
+
+    Each operation's ``actions`` are replayed over its ``base``: the
+    actions must be ordered by ascending ``batch`` and be exactly
+    ``["add", A]``, ``["remove", B]`` or ``["replace", B, A]`` where
+    ``A``/``B`` are four-field version records whose ``batch`` lies in the
+    operation's closed range. An ``add``'s ``batch`` must not already
+    exist, a ``remove``/``replace``'s ``B`` must match the record
+    currently held for its ``batch`` (i.e. the ``base`` record), and a
+    ``replace``'s ``A`` and ``B`` must share their ``batch``. After
+    replaying, the records are reordered by ``batch``, the maximal gap
+    intervals inside the range are recomputed, and the second entries of
+    the ``receipt`` and ``ready`` pairs replace the original values; the
+    result must equal ``target`` (a ``null`` ``target`` requiring no
+    remaining records and ``null`` second entries). Both pairs' first
+    entries must equal the ``base`` values (``null`` when ``base`` is
+    ``null``), and the top-level ``changed`` flag must be true exactly
+    when at least one operation's ``base`` and ``target`` differ.
+
+    Returns the canonical compact JSON document
+    ``{"results":[...],"changed":...}`` with exactly these two top-level
+    keys in this order. ``results`` holds one
+    ``[product, batch_min, batch_max, action_count, target]`` array per
+    operation in the plan's original order, where ``action_count`` is the
+    number of replayed actions and ``target`` the operation's verified
+    target (``null`` for an absent product); ``changed`` echoes the
+    plan's verified flag. An empty plan yields
+    ``{"results":[],"changed":false}``.
+
+    The output uses ``ensure_ascii=False``, decimal integers, lowercase
+    booleans and canonical ``null``, with no whitespace, no
+    ``NaN``/``Infinity`` and no trailing newline. The input is never
+    modified and repeated calls return a byte-identical document.
+
+    :raises TypeError: ``plan`` is not a ``str``.
+    :raises ValueError: ``plan`` is not the canonical
+        :func:`plan_delivery_updates` encoding, an action is malformed or
+        out of order, a replay precondition is violated, the replayed
+        result differs from ``target``, a ``receipt``/``ready`` pair does
+        not start from the ``base`` values, or ``changed`` is
+        inconsistent.
+    """
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+
+    try:
+        document = json.loads(plan, parse_constant=_reject_constant,
+                              parse_float=_reject_float)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("plan is not valid JSON") from exc
+
+    if (not isinstance(document, dict)
+            or list(document) != ["operations", "changed"]):
+        raise ValueError("plan top-level value must be an object with "
+                         "only 'operations' and 'changed' in that order")
+    operations = document["operations"]
+    if not isinstance(operations, list):
+        raise ValueError("plan 'operations' must be an array")
+    changed = document["changed"]
+    if not isinstance(changed, bool):
+        raise ValueError("plan 'changed' must be a boolean")
+
+    results = []
+    any_changed = False
+    previous_key = None
+    for row in operations:
+        if not isinstance(row, list) or len(row) != 8:
+            raise ValueError("each plan operation must be an array of "
+                             "eight values")
+        (product, batch_min, batch_max, base, actions, receipt_pair,
+         ready_pair, target) = row
+        if not isinstance(product, str):
+            raise ValueError("operation product must be a str")
+        if isinstance(batch_min, bool) or not isinstance(batch_min, int):
+            raise ValueError("operation batch_min must be a non-bool int")
+        if isinstance(batch_max, bool) or not isinstance(batch_max, int):
+            raise ValueError("operation batch_max must be a non-bool int")
+        if batch_min < 0 or batch_max < 0:
+            raise ValueError("batch bounds must be non-negative")
+        if batch_min > batch_max:
+            raise ValueError("batch_min must not exceed batch_max")
+        key = (product, batch_min, batch_max)
+        if previous_key is not None and key <= previous_key:
+            raise ValueError("operations must be sorted uniquely by "
+                             "(product, batch_min, batch_max)")
+        previous_key = key
+
+        _check_plan_side(base, batch_min, batch_max)
+        _check_plan_side(target, batch_min, batch_max)
+
+        if not isinstance(actions, list):
+            raise ValueError("operation actions must be an array")
+        if not isinstance(receipt_pair, list) or len(receipt_pair) != 2:
+            raise ValueError("operation receipt must be a [base, target] "
+                             "pair")
+        if not isinstance(ready_pair, list) or len(ready_pair) != 2:
+            raise ValueError("operation ready must be a [base, target] "
+                             "pair")
+        receipt_first, receipt_second = receipt_pair
+        ready_first, ready_second = ready_pair
+        _check_plan_receipt(receipt_first)
+        _check_plan_receipt(receipt_second)
+        for side in (ready_first, ready_second):
+            if side is not None and not isinstance(side, bool):
+                raise ValueError("ready pair entries must be null or "
+                                 "boolean")
+
+        records = {}
+        if base is not None:
+            for record in base[0]:
+                records[record[0]] = record
+        previous_action_batch = None
+        for action in actions:
+            if (not isinstance(action, list) or not action
+                    or not isinstance(action[0], str)):
+                raise ValueError("each action must be a non-empty array "
+                                 "starting with its kind")
+            kind = action[0]
+            if kind == "add" and len(action) == 2:
+                _check_plan_version_record(action[1], batch_min, batch_max)
+                batch = action[1][0]
+            elif kind == "remove" and len(action) == 2:
+                _check_plan_version_record(action[1], batch_min, batch_max)
+                batch = action[1][0]
+            elif kind == "replace" and len(action) == 3:
+                _check_plan_version_record(action[1], batch_min, batch_max)
+                _check_plan_version_record(action[2], batch_min, batch_max)
+                if action[1][0] != action[2][0]:
+                    raise ValueError("replace records must share their "
+                                     "batch")
+                batch = action[1][0]
+            else:
+                raise ValueError("each action must be ['add', A], "
+                                 "['remove', B] or ['replace', B, A]")
+            if (previous_action_batch is not None
+                    and batch <= previous_action_batch):
+                raise ValueError("actions must be ordered by ascending "
+                                 "batch")
+            previous_action_batch = batch
+            if kind == "add":
+                if batch in records:
+                    raise ValueError("add batch must not already exist")
+                records[batch] = action[1]
+            elif kind == "remove":
+                if records.get(batch) != action[1]:
+                    raise ValueError("remove record must match the base "
+                                     "record")
+                del records[batch]
+            else:
+                if records.get(batch) != action[1]:
+                    raise ValueError("replace record must match the base "
+                                     "record")
+                records[batch] = action[2]
+
+        base_receipt = None if base is None else base[2]
+        base_ready = None if base is None else base[3]
+        if receipt_first != base_receipt:
+            raise ValueError("receipt pair must start from the base "
+                             "receipt")
+        if ready_first != base_ready:
+            raise ValueError("ready pair must start from the base ready "
+                             "flag")
+
+        if target is None:
+            if (records or receipt_second is not None
+                    or ready_second is not None):
+                raise ValueError("replaying the actions does not "
+                                 "reproduce the null target")
+        else:
+            ordered = [records[batch] for batch in sorted(records)]
+            replayed = [ordered, _range_gaps(ordered, batch_min, batch_max),
+                        receipt_second, ready_second]
+            if replayed != target:
+                raise ValueError("replaying the actions does not "
+                                 "reproduce the target")
+
+        if base != target:
+            any_changed = True
+        results.append([product, batch_min, batch_max, len(actions),
+                        target])
+
+    if changed != any_changed:
+        raise ValueError("plan 'changed' must be true exactly when some "
+                         "operation's base and target differ")
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-decimal integer spellings and any other
+    # non-canonical spelling.
+    if json.dumps(document, ensure_ascii=False, separators=(",", ":"),
+                  allow_nan=False) != plan:
+        raise ValueError("plan is not the canonical plan_delivery_updates "
+                         "encoding")
+
+    return json.dumps({"results": results, "changed": changed},
+                      ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False)
+
+
 def update_delivery_snapshot(snapshot: str, changes: str,
                              receipts: str) -> str:
     """Apply new delivery changes and receipts to a delivery snapshot.
