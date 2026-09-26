@@ -11650,3 +11650,92 @@ def plan_delivery_checkout(log: str, source: str, target: str) -> str:
         parts.append("]")
     parts.append('],"snapshot":' + decoded[target_pos][5] + "}")
     return "".join(parts)
+
+
+def apply_delivery_checkout(log: str, current: str, plan: str) -> str:
+    """Apply a planned checkout to the current delivery snapshot.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log`; the whole chain is recomputed and validated
+    (identifiers, parent linkage, snapshot linkage and every stored
+    ``result`` against :func:`commit_delivery_updates`). ``current`` must
+    be a ``str`` byte-for-byte matching the canonical output of
+    :func:`build_delivery_snapshot`, and ``plan`` a ``str`` byte-for-byte
+    matching the canonical output of :func:`plan_delivery_checkout`; the
+    plan is recomputed from its ``source`` and ``target`` against the
+    validated log and must match byte-for-byte.
+
+    When ``current`` equals the ``target`` commit's ``result.snapshot``
+    the checkout is a no-op and the status is ``"unchanged"``. Otherwise,
+    when ``current`` equals the ``source`` commit's ``result.snapshot``,
+    all of the plan's steps are applied atomically and the status is
+    ``"applied"``. Any other ``current`` is stale or conflicting and
+    raises :class:`ValueError`.
+
+    Returns the canonical compact JSON document
+    ``{"source":...,"target":...,"direction":...,"status":...,
+    "snapshot":...}`` with exactly these five top-level keys in that
+    order. ``source``, ``target`` and ``direction`` echo the verified
+    plan, ``status`` is ``"unchanged"`` or ``"applied"`` and ``snapshot``
+    embeds the ``target`` commit's canonical snapshot. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline; the
+    inputs are never modified and repeated calls return a byte-identical
+    document.
+
+    :raises TypeError: ``log``, ``current`` or ``plan`` is not a ``str``.
+    :raises ValueError: a document is not its canonical encoding, an
+        identifier names no commit, the log chain or a recomputed result
+        does not match, the plan does not match the recomputed checkout
+        plan, or ``current`` matches neither the source nor the target
+        commit snapshot.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(current, str):
+        raise TypeError("current must be a str")
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    decoded = _decode_commit_log(log)
+    _decode_delivery_snapshot(current)
+    try:
+        node = _parse_json_node(plan, _skip_json_ws(plan, 0))
+    except ValueError as exc:
+        raise ValueError(f"plan is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(plan, node[2]) != len(plan):
+        raise ValueError("plan has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != ["source", "target",
+                                                  "direction", "steps",
+                                                  "snapshot"]:
+        raise ValueError('plan must be a JSON object with the keys '
+                         '"source", "target", "direction", "steps" and '
+                         '"snapshot"')
+    source_node = top["source"]
+    target_node = top["target"]
+    if not isinstance(source_node[0], str) \
+            or not isinstance(target_node[0], str):
+        raise ValueError('plan "source" and "target" must be strings')
+    source = source_node[0]
+    target = target_node[0]
+    if plan_delivery_checkout(log, source, target) != plan:
+        raise ValueError("plan does not match the recomputed checkout plan")
+    snapshot_by_id = {}
+    for row in decoded:
+        snapshot_by_id[row[0]] = row[5]
+    target_snapshot = snapshot_by_id[target]
+    if current == target_snapshot:
+        status = "unchanged"
+    elif current == snapshot_by_id[source]:
+        status = "applied"
+    else:
+        raise ValueError("current matches neither the source nor the "
+                         "target commit snapshot")
+    direction_node = top["direction"]
+    snapshot_node = top["snapshot"]
+    return ("{" + _json_string("source") + ":" + _json_string(source)
+            + "," + _json_string("target") + ":" + _json_string(target)
+            + ',"direction":' + plan[direction_node[1]:direction_node[2]]
+            + ',"status":' + _json_string(status)
+            + ',"snapshot":' + plan[snapshot_node[1]:snapshot_node[2]]
+            + "}")
