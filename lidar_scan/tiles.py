@@ -12,6 +12,9 @@ _PRECISION = 50
 _QUANTUM = Decimal("0.000001")
 _MICRO = Decimal(10) ** 6
 _NUMERIC_TYPES = (int, float)
+_IDENTIFIER_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
 
 
 def _as_decimal(value) -> Decimal:
@@ -7857,3 +7860,213 @@ def gate_report(report: str, limits: tuple) -> str:
             overall_passed = overall_passed and window_passed
 
     return _format_gate_report(windows, passed_flags, overall_passed)
+
+
+def _decode_rendered_gate_report(text: str) -> tuple:
+    """Parse and validate a canonical :func:`gate_report` output document.
+
+    Returns ``(windows, window_flags, overall_passed)`` where ``windows`` is a
+    list of ``[level, ix_min, iy_min, ix_max, iy_max, summary]`` records
+    (``summary`` is ``None`` or ``[emin, emax, rmse, amean, n]`` with the
+    metrics as Decimals), ``window_flags`` is a tuple of the per-window
+    booleans in window order and ``overall_passed`` is the top-level flag.
+
+    :raises ValueError: the JSON syntax or shape is bad, a value violates the
+        gate-report contract, the text is not the canonical encoding, or the
+        top-level ``passed`` disagrees with the per-window flags.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("report is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"windows",
+                                                            "passed"}:
+        raise ValueError("report top-level value must be an object with only "
+                         "'windows' and 'passed'")
+    if not isinstance(document["passed"], bool):
+        raise ValueError("report 'passed' must be a boolean")
+    raw_windows = document["windows"]
+    if not isinstance(raw_windows, list):
+        raise ValueError("report 'windows' must be an array")
+
+    windows = []
+    window_flags = []
+    for raw_window in raw_windows:
+        if not isinstance(raw_window, list) or len(raw_window) != 7:
+            raise ValueError("each gate-report window must be an array of "
+                             "seven values")
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), raw_window[:5]):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"report {name} must be a non-bool integer")
+        level, ix_min, iy_min, ix_max, iy_max = raw_window[:5]
+        if level < 0:
+            raise ValueError("report level must be non-negative")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("report window bounds must satisfy ix_min <= "
+                             "ix_max and iy_min <= iy_max")
+
+        raw_summary = raw_window[5]
+        summary = None
+        if raw_summary is not None:
+            if not isinstance(raw_summary, list) or len(raw_summary) != 5:
+                raise ValueError("each report summary must be null or an "
+                                 "array of five values")
+            for name, value in zip(("emin", "emax", "rmse", "amean"),
+                                   raw_summary[:4]):
+                if isinstance(value, bool) or not isinstance(value,
+                                                             (int, Decimal)):
+                    raise ValueError(f"report {name} must be a number")
+            metrics = [Decimal(value) for value in raw_summary[:4]]
+            for name, value in zip(("emin", "emax", "rmse", "amean"),
+                                   metrics):
+                if not value.is_finite():
+                    raise ValueError(f"report {name} must be finite")
+            match_count = raw_summary[4]
+            if isinstance(match_count, bool) or not isinstance(match_count,
+                                                               int):
+                raise ValueError("report n must be a non-bool integer")
+            if match_count < 1:
+                raise ValueError("report n must be a positive integer")
+            if metrics[2] < 0 or metrics[3] < 0:
+                raise ValueError("report rmse and amean must be "
+                                 "non-negative")
+            summary = [*metrics, match_count]
+
+        window_passed = raw_window[6]
+        if not isinstance(window_passed, bool):
+            raise ValueError("each report window flag must be a boolean")
+        # gate_report marks an empty (null-summary) window as failing, so a
+        # passing flag on a null summary is not an output it can produce.
+        if summary is None and window_passed:
+            raise ValueError("a null-summary window cannot be marked passed")
+
+        windows.append([level, ix_min, iy_min, ix_max, iy_max, summary])
+        window_flags.append(window_passed)
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal metric formatting, negative zero as
+    # anything but ``0.000000``, leading zeros, exponents and any other
+    # non-canonical spelling.
+    canonical = _format_gate_report(windows, window_flags,
+                                    document["passed"])
+    if canonical != text:
+        raise ValueError("report is not the canonical gate-report encoding")
+
+    overall_passed = True
+    for window_passed in window_flags:
+        overall_passed = overall_passed and window_passed
+    if document["passed"] != overall_passed:
+        raise ValueError("report top-level 'passed' must equal the logical "
+                         "AND of the per-window flags")
+
+    return windows, tuple(window_flags), overall_passed
+
+
+
+def build_delivery_manifest(items) -> str:
+    """Build a canonical delivery manifest from gated products.
+
+    ``items`` must be a tuple of 4-tuples
+    ``(batch, product, version, gate)`` where ``batch`` is a non-bool
+    non-negative integer, ``product`` and ``version`` are non-empty strings
+    containing only ASCII letters, digits and ``.``/``_``/``-``, and ``gate``
+    is a canonical :func:`gate_report` output string: a compact JSON document
+    with exactly the keys ``windows`` and ``passed`` in that order, one
+    seven-value window per entry, whose top-level ``passed`` equals the
+    logical AND of the per-window flags (an empty window list yielding
+    ``true``).
+
+    Returns a canonical compact JSON string with exactly the keys
+    ``entries`` and ``releasable`` in that order. ``entries`` is sorted by
+    ``(batch, product)`` ascending; each entry is
+    ``[batch, product, version, passed, failures]`` where ``passed`` is the
+    gate's top-level flag and ``failures`` lists the first six failing window
+    field sets (in gate window order) as
+    ``[level, ix_min, iy_min, ix_max, iy_max]``, or ``[]`` when no window
+    fails. ``releasable`` is the logical AND of every entry's ``passed`` and
+    is ``true`` for an empty ``items`` tuple. Integers are decimal,
+    ``ensure_ascii`` is false, ``NaN``/``Infinity`` never appear and the
+    output has no whitespace or trailing newline. The inputs are never
+    modified; reordering ``items`` yields byte-identical output.
+
+    :raises TypeError: ``items`` is not a tuple, an item is not a 4-tuple,
+        or an item field has the wrong type.
+    :raises ValueError: a batch is negative, an identifier is empty or
+        contains illegal characters, a ``(batch, product)`` pair is
+        duplicated, or a gate is not a canonical gate report with a
+        consistent ``passed`` flag.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+
+    normalized = []
+    for item in items:
+        if not isinstance(item, tuple) or len(item) != 4:
+            raise TypeError("each item must be a 4-tuple "
+                            "(batch, product, version, gate)")
+        batch, product, version, gate = item
+        if isinstance(batch, bool) or not isinstance(batch, int):
+            raise TypeError("batch must be a non-bool integer")
+        if batch < 0:
+            raise ValueError("batch must be non-negative")
+        for name, value in (("product", product), ("version", version)):
+            if not isinstance(value, str):
+                raise TypeError(f"{name} must be a str")
+            if not value or any(
+                    ch not in _IDENTIFIER_CHARS for ch in value):
+                raise ValueError(
+                    f"{name} must be non-empty and contain only ASCII "
+                    "letters, digits and '.', '_' or '-'"
+                )
+        if not isinstance(gate, str):
+            raise TypeError("gate must be a str")
+
+        windows, window_flags, passed = _decode_rendered_gate_report(gate)
+        failures = []
+        for record, window_passed in zip(windows, window_flags):
+            if not window_passed:
+                failures.append(record[:5])
+                if len(failures) == 6:
+                    break
+        normalized.append((batch, product, version, passed, failures))
+
+    seen = set()
+    for batch, product, _version, _passed, _failures in normalized:
+        key = (batch, product)
+        if key in seen:
+            raise ValueError("duplicate (batch, product) entry")
+        seen.add(key)
+
+    normalized.sort(key=lambda entry: (entry[0], entry[1]))
+
+    parts = ['{"entries":[']
+    releasable = True
+    for index, (batch, product, version, passed,
+                failures) in enumerate(normalized):
+        if index:
+            parts.append(",")
+        parts.append("[")
+        parts.append(str(batch))
+        parts.append(",")
+        parts.append(json.dumps(product, ensure_ascii=False))
+        parts.append(",")
+        parts.append(json.dumps(version, ensure_ascii=False))
+        parts.append(",true," if passed else ",false,")
+        parts.append("[")
+        for window_index, window in enumerate(failures):
+            if window_index:
+                parts.append(",")
+            level, ix_min, iy_min, ix_max, iy_max = window
+            parts.append("[" + ",".join((str(level), str(ix_min),
+                                         str(iy_min), str(ix_max),
+                                         str(iy_max))) + "]")
+        parts.append("]]")
+        releasable = releasable and passed
+    parts.append('],"releasable":')
+    parts.append("true}" if releasable else "false}")
+    return "".join(parts)
