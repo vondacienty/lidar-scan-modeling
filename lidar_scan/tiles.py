@@ -14529,3 +14529,140 @@ def summarize_recovery_index(index: str, start: int, stop: int) -> tuple:
     complete = stop == start or all(entry["complete"]
                                     for entry in entries[start:stop])
     return (start, stop, selected, before, after, resume, complete)
+
+
+def plan_recovery_index_migration(before, after) -> str:
+    """Plan a migration between two :func:`merge_recovery_indexes` indexes.
+
+    ``before`` (B) and ``after`` (A) must each be a ``str`` byte-for-byte
+    matching the canonical output of :func:`merge_recovery_indexes`; each
+    index's entries chain and its derived ``audit``, ``snapshot``,
+    ``resume`` and ``complete`` fields are recomputed from the embedded
+    entries and must agree.
+
+    The longest prefix of identical entries (embedding the same plan and
+    history byte for byte) is shared. When both indexes then hold another
+    entry and those next entries follow the same plan, the boundary is
+    extended into that entry: the longest common prefix is taken of the
+    plan units its history has confirmed, together with the corresponding
+    audit rows. Let ``b`` be the boundary snapshot reached that way: the
+    ``after`` of the last common unit when units were shared, otherwise
+    the last common entry's history ``end`` when whole entries were
+    shared, otherwise the first entry's history ``start`` of whichever
+    side is non-empty (which must be identical on both sides).
+
+    ``rollback`` is B's audit after ``b``, in reverse order as
+    ``[id, status]`` arrays, and ``pending`` is A's audit after ``b`` in
+    its original order. A shared batch id on the two sides forks the
+    migration and is rejected.
+
+    Returns the canonical compact JSON document with exactly the six
+    top-level keys ``common``, ``rollback``, ``pending``, ``snapshot``,
+    ``resume`` and ``complete`` in that order. ``common`` is
+    ``[e, u, b]``: ``e`` is the number of wholly shared entries and ``u``
+    the number of shared units inside the following entry (``b`` is
+    ``null`` only when both indexes are empty). ``snapshot`` is A's
+    terminal snapshot object or ``null``. ``resume`` is A's embedded
+    :func:`execute_checkout_recovery` resume state object when A's last
+    entry is in progress and ``null`` otherwise. ``complete`` is A's
+    overall flag. An empty index on either side is valid. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline; the
+    inputs are never modified and repeated calls return a byte-identical
+    document.
+
+    :raises TypeError: ``before`` or ``after`` is not a ``str``.
+    :raises ValueError: an index is malformed or not its canonical
+        encoding (including a broken entry chain or a repeated batch
+        id), the non-empty sides start at different history snapshots
+        with no shared plan, or the post-boundary audit rows share a
+        batch id (a fork).
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    entries_b, _audit_b, _snapshot_b, _resume_b, _complete_b = \
+        _decode_merged_recovery_index(before)
+    entries_a, _audit_a, snapshot, resume_state, complete = \
+        _decode_merged_recovery_index(after)
+
+    shared_entries = 0
+    limit = min(len(entries_b), len(entries_a))
+    while (shared_entries < limit
+           and entries_b[shared_entries]["plan"]
+           == entries_a[shared_entries]["plan"]
+           and entries_b[shared_entries]["history"]
+           == entries_a[shared_entries]["history"]):
+        shared_entries += 1
+
+    shared_units = 0
+    boundary = None
+    if shared_entries < len(entries_b) \
+            and shared_entries < len(entries_a) \
+            and entries_b[shared_entries]["plan"] \
+            == entries_a[shared_entries]["plan"]:
+        next_b = entries_b[shared_entries]
+        next_a = entries_a[shared_entries]
+        units = next_a["units"]
+        confirmed_b = next_b["runs"][-1][0] if next_b["runs"] else 0
+        confirmed_a = next_a["runs"][-1][0] if next_a["runs"] else 0
+        unit_limit = min(confirmed_b, confirmed_a, len(units))
+        for unit_index in range(unit_limit):
+            position = sum(len(unit[1]) for unit in units[:unit_index])
+            segment = units[unit_index][1]
+            if next_b["audit"][position:position + len(segment)] \
+                    != segment or next_a["audit"][
+                        position:position + len(segment)] != segment:
+                break
+            shared_units += 1
+        if shared_units:
+            boundary = units[shared_units - 1][0][4]
+        else:
+            boundary = entries_b[shared_entries - 1]["end"] \
+                if shared_entries else next_a["start"]
+    elif shared_entries:
+        boundary = entries_b[shared_entries - 1]["end"]
+    elif entries_b or entries_a:
+        boundary = (entries_b or entries_a)[0]["start"]
+        if entries_b and entries_a \
+                and entries_b[0]["start"] != entries_a[0]["start"]:
+            raise ValueError("the indexes must start at the same snapshot")
+
+    def _audit_after(entries, reverse_order):
+        rows = []
+        for position, entry in enumerate(entries):
+            if position < shared_entries:
+                continue
+            if position == shared_entries and shared_units:
+                confirmed = sum(len(unit[1]) for unit in
+                                entry["units"][:shared_units])
+                rows.extend(entry["audit"][confirmed:])
+            else:
+                rows.extend(entry["audit"])
+        if reverse_order:
+            rows.reverse()
+        return rows
+
+    rollback_rows = _audit_after(entries_b, True)
+    pending_rows = _audit_after(entries_a, False)
+
+    fork = {batch_id for batch_id, _status in rollback_rows} \
+        & {batch_id for batch_id, _status in pending_rows}
+    if fork:
+        raise ValueError(f"duplicate batch id {sorted(fork)[0]!r} across the "
+                         "migration boundary; the indexes fork")
+
+    common_text = "[" + str(shared_entries) + "," + str(shared_units) + \
+        "," + ("null" if boundary is None else boundary) + "]"
+    rollback_text = "[" + ",".join(
+        "[" + _json_string(batch_id) + "," + _json_string(status) + "]"
+        for batch_id, status in rollback_rows) + "]"
+    pending_text = "[" + ",".join(
+        "[" + _json_string(batch_id) + "," + _json_string(status) + "]"
+        for batch_id, status in pending_rows) + "]"
+    parts = ['{"common":', common_text, ',"rollback":', rollback_text,
+             ',"pending":', pending_text, ',"snapshot":',
+             "null" if snapshot is None else snapshot, ',"resume":',
+             "null" if resume_state is None else resume_state,
+             ',"complete":', "true" if complete else "false", "}"]
+    return "".join(parts)
