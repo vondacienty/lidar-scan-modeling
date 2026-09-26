@@ -12033,3 +12033,143 @@ def replay_checkout(log: str, text: str) -> str:
     parts.append(text[snapshot_node[1]:snapshot_node[2]])
     parts.append("}")
     return "".join(parts)
+
+
+def _parse_checkout_ledger_spans(text: str):
+    """Parse a :func:`checkout_log` document into raw canonical text spans.
+
+    Returns ``(rows, snapshot_span)`` where each row is a three-item tuple
+    ``(batch_id, before_span, status)`` with ``before_span`` the ledger's
+    raw canonical encoding of the batch's ``before`` snapshot and
+    ``status`` its verified ``result.status``; ``snapshot_span`` is the raw
+    JSON text of the ledger's ``snapshot`` (``"null"`` for an empty
+    ledger).
+
+    :raises ValueError: the document is malformed or a field has the wrong
+        JSON type.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"text is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("text has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != ["batches", "snapshot"]:
+        raise ValueError('text must be a JSON object with the keys '
+                         '"batches" and "snapshot"')
+    batches = top["batches"][0]
+    if not isinstance(batches, list):
+        raise ValueError('"batches" must be an array')
+    rows = []
+    for row_node in batches:
+        row = row_node[0]
+        if not isinstance(row, list) or len(row) != 4:
+            raise ValueError("each batch must be a four-item array "
+                             "[id, before, plans, result]")
+        batch_id = row[0][0]
+        if not isinstance(batch_id, str):
+            raise ValueError("batch id must be a str")
+        if not isinstance(row[1][0], dict):
+            raise ValueError("before must be a JSON object")
+        result = row[3][0]
+        if not isinstance(result, dict):
+            raise ValueError("result must be a JSON object")
+        status = result["status"][0]
+        if status not in ("applied", "unchanged"):
+            raise ValueError("result status must be applied or unchanged")
+        rows.append((batch_id, text[row[1][1]:row[1][2]], status))
+    snapshot_node = top["snapshot"]
+    return rows, text[snapshot_node[1]:snapshot_node[2]]
+
+
+def merge_checkout_logs(log: str, ledgers: tuple) -> str:
+    """Merge canonical :func:`checkout_log` ledgers into one range audit.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log` and ``ledgers`` a ``tuple`` whose items are
+    each a ``str`` byte-for-byte matching the canonical output of
+    :func:`checkout_log`. Every ledger is re-verified with
+    :func:`replay_checkout`; an empty ledger produces no range and does not
+    change the boundary expected from the previous non-empty ledger.
+
+    Non-empty ledgers must chain globally: every batch id must be unique
+    across all ledgers, and the first batch's ``before`` of every later
+    non-empty ledger must byte-for-byte equal the previous non-empty
+    ledger's ``snapshot``.
+
+    Returns the canonical compact JSON document with exactly the three
+    top-level keys ``ranges``, ``audit`` and ``snapshot`` in that order.
+    ``ranges`` preserves the non-empty ledger input order, each row being
+    ``[first_id, last_id, batch_count, before, after]`` where
+    ``batch_count`` is the positive number of batches in that ledger,
+    ``before`` embeds the first batch's ``before`` snapshot and ``after``
+    embeds that ledger's ``snapshot``. ``audit`` lists every batch in
+    global batch order as ``[id, status]`` with ``status`` the verified
+    result's ``"applied"`` or ``"unchanged"``. ``snapshot`` is ``null``
+    when no ledger is non-empty and otherwise embeds the last non-empty
+    ledger's ``snapshot``. The output uses ``ensure_ascii=False``, no
+    whitespace and no trailing newline; the inputs are never modified and
+    repeated calls return a byte-identical document.
+
+    :raises TypeError: ``log`` or a ledger is not a ``str``, or
+        ``ledgers`` is not a ``tuple``.
+    :raises ValueError: a document is malformed or not its canonical
+        encoding, :func:`replay_checkout` re-verification fails, a batch
+        id repeats across the ledgers, or a later non-empty ledger does
+        not start at the previous non-empty ledger's snapshot.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(ledgers, tuple):
+        raise TypeError("ledgers must be a tuple")
+    for ledger in ledgers:
+        if not isinstance(ledger, str):
+            raise TypeError("each ledger must be a str")
+
+    ranges = []
+    audit = []
+    seen_batch_ids = set()
+    boundary_snapshot = None
+    final_snapshot = None
+    for text in ledgers:
+        replay_checkout(log, text)
+        rows, snapshot_span = _parse_checkout_ledger_spans(text)
+        if not rows:
+            continue
+        first_before = rows[0][1]
+        if boundary_snapshot is not None \
+                and first_before != boundary_snapshot:
+            raise ValueError("the first batch's before of each later "
+                             "non-empty ledger must byte-for-byte equal the "
+                             "previous non-empty ledger's snapshot")
+        for batch_id, _before_span, status in rows:
+            if batch_id in seen_batch_ids:
+                raise ValueError(f"duplicate batch id {batch_id!r} across "
+                                 "the checkout ledgers")
+            seen_batch_ids.add(batch_id)
+            audit.append((batch_id, status))
+        ranges.append((rows[0][0], rows[-1][0], len(rows), first_before,
+                       snapshot_span))
+        boundary_snapshot = snapshot_span
+        final_snapshot = snapshot_span
+
+    parts = ['{"ranges":[']
+    for index, (first_id, last_id, batch_count, before,
+                after) in enumerate(ranges):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(first_id) + ","
+                     + _json_string(last_id) + ","
+                     + str(batch_count) + "," + before + "," + after + "]")
+    parts.append('],"audit":[')
+    for index, (batch_id, status) in enumerate(audit):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(batch_id) + ","
+                     + _json_string(status) + "]")
+    parts.append('],"snapshot":')
+    parts.append("null" if final_snapshot is None else final_snapshot)
+    parts.append("}")
+    return "".join(parts)
