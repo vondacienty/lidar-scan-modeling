@@ -11868,3 +11868,168 @@ def apply_delivery_checkouts(log: str, current: str, plans: tuple) -> str:
                      + str(step_count) + "]")
     parts.append('],"snapshot":' + target_snapshot + "}")
     return "".join(parts)
+
+
+def checkout_log(log: str, records: tuple) -> str:
+    """Build a checkout ledger chaining :func:`apply_delivery_checkouts`.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log`; the whole chain is recomputed and validated.
+    ``records`` must be a ``tuple`` whose items are strictly three-item
+    tuples ``(id, before, plans)``. ``id`` must be a unique ``str``
+    matching ``[A-Za-z0-9._-]+``; ``before`` must be a ``str``
+    byte-for-byte matching the canonical output of
+    :func:`build_delivery_snapshot`; ``plans`` must be a non-empty
+    ``tuple`` whose items are each a ``str`` byte-for-byte matching the
+    canonical output of :func:`plan_delivery_checkout`, exactly as
+    required by :func:`apply_delivery_checkouts`.
+
+    Each record's ``result`` is generated with
+    ``apply_delivery_checkouts(log, before, plans)`` and every later
+    record's ``before`` must byte-for-byte equal the previous record's
+    ``result.snapshot``.
+
+    Returns the canonical compact JSON document with exactly the two
+    top-level keys ``batches`` and ``snapshot`` in that order.
+    ``batches`` preserves the record order, each row being
+    ``[id, before, [plan...], result]`` with ``before``, every plan and
+    ``result`` embedded as JSON objects; ``snapshot`` is ``null`` for an
+    empty ledger and otherwise the last record's ``result.snapshot``.
+    The output uses ``ensure_ascii=False``, no whitespace and no trailing
+    newline, and repeated calls return a byte-identical document.
+
+    :raises TypeError: ``log`` is not a ``str``, ``records`` is not a
+        ``tuple``, a record is not a three-item ``tuple``, or a field has
+        the wrong type.
+    :raises ValueError: the log is not its canonical encoding, an ``id``
+        is invalid or duplicated, the snapshot linkage is broken, or a
+        ``before`` or plan document is not its canonical encoding.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(records, tuple):
+        raise TypeError("records must be a tuple")
+    _decode_commit_log(log)
+    rows = []
+    seen = set()
+    previous_snapshot = None
+    for record in records:
+        if not isinstance(record, tuple) or len(record) != 3:
+            raise TypeError("each record must be a three-item tuple "
+                            "(id, before, plans)")
+        batch_id, before, plans = record
+        if not isinstance(batch_id, str):
+            raise TypeError("batch id must be a str")
+        if not isinstance(before, str):
+            raise TypeError("before must be a str")
+        if not isinstance(plans, tuple):
+            raise TypeError("plans must be a tuple")
+        for plan in plans:
+            if not isinstance(plan, str):
+                raise TypeError("each plan must be a str")
+        if _COMMIT_ID_RE.fullmatch(batch_id) is None:
+            raise ValueError(f"invalid batch id {batch_id!r}")
+        if batch_id in seen:
+            raise ValueError(f"duplicate batch id {batch_id!r}")
+        seen.add(batch_id)
+        if previous_snapshot is not None and before != previous_snapshot:
+            raise ValueError(f"record {batch_id!r} before must equal the "
+                             "previous record's result snapshot")
+        result = apply_delivery_checkouts(log, before, plans)
+        rows.append((batch_id, before, plans, result))
+        previous_snapshot = _result_snapshot_text(result)
+    parts = ['{"batches":[']
+    for index, (batch_id, before, plans, result) in enumerate(rows):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(batch_id) + "," + before + ",[")
+        parts.append(",".join(plans))
+        parts.append("]," + result + "]")
+    parts.append('],"snapshot":')
+    parts.append("null" if previous_snapshot is None else previous_snapshot)
+    parts.append("}")
+    return "".join(parts)
+
+
+def replay_checkout(log: str, text: str) -> str:
+    """Re-verify a :func:`checkout_log` ledger and audit its batches.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log` and ``text`` a ``str`` byte-for-byte matching
+    the canonical output of :func:`checkout_log`. The whole document is
+    re-validated: the encoding must be canonical, the log chain is
+    recomputed, every record's ``result`` is recomputed with
+    :func:`apply_delivery_checkouts` and required to match, and every
+    later record's ``before`` must equal the previous record's
+    ``result.snapshot``.
+
+    Returns the canonical compact JSON document with exactly the two
+    top-level keys ``audit`` and ``snapshot`` in that order. ``audit``
+    preserves the batch order, each row being ``[id, status]`` with
+    ``status`` the record's verified ``result.status``; ``snapshot`` is
+    the ledger's ``snapshot`` (``null`` for an empty ledger). The output
+    uses ``ensure_ascii=False``, no whitespace and no trailing newline,
+    and repeated calls return a byte-identical document.
+
+    :raises TypeError: ``log`` or ``text`` is not a ``str``.
+    :raises ValueError: either document is malformed or not its canonical
+        encoding, the log chain or a recomputed result does not match, or
+        the snapshot linkage is broken.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"text is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("text has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != ["batches", "snapshot"]:
+        raise ValueError('text must be a JSON object with the keys '
+                         '"batches" and "snapshot"')
+    batches = top["batches"][0]
+    if not isinstance(batches, list):
+        raise ValueError('"batches" must be an array')
+    records = []
+    result_nodes = []
+    for row_node in batches:
+        row = row_node[0]
+        if not isinstance(row, list) or len(row) != 4:
+            raise ValueError("each batch must be a four-item array "
+                             "[id, before, plans, result]")
+        batch_id = row[0][0]
+        if not isinstance(batch_id, str):
+            raise ValueError("batch id must be a str")
+        if not isinstance(row[1][0], dict):
+            raise ValueError("before must be a JSON object")
+        plan_nodes = row[2][0]
+        if not isinstance(plan_nodes, list):
+            raise ValueError("plans must be an array")
+        plans = []
+        for plan_node in plan_nodes:
+            if not isinstance(plan_node[0], dict):
+                raise ValueError("each plan must be a JSON object")
+            plans.append(text[plan_node[1]:plan_node[2]])
+        if not isinstance(row[3][0], dict):
+            raise ValueError("result must be a JSON object")
+        records.append((batch_id, text[row[1][1]:row[1][2]], tuple(plans)))
+        result_nodes.append(row[3])
+    if checkout_log(log, tuple(records)) != text:
+        raise ValueError("text does not match the recomputed checkout log")
+    parts = ['{"audit":[']
+    for index, (record, result_node) in enumerate(zip(records,
+                                                      result_nodes)):
+        if index:
+            parts.append(",")
+        status = result_node[0]["status"][0]
+        parts.append("[" + _json_string(record[0]) + ","
+                     + _json_string(status) + "]")
+    parts.append('],"snapshot":')
+    snapshot_node = top["snapshot"]
+    parts.append(text[snapshot_node[1]:snapshot_node[2]])
+    parts.append("}")
+    return "".join(parts)
