@@ -9964,6 +9964,92 @@ def query_delivery_snapshot(snapshot: str, product: str) -> tuple | None:
     return None
 
 
+def query_delivery_range(snapshot: str, product: str, batch_min: int,
+                         batch_max: int) -> tuple | None:
+    """Return one product's delivery state restricted to a batch range.
+
+    ``snapshot`` must be a ``str`` byte-for-byte matching the canonical
+    output of :func:`build_delivery_snapshot` (its ``previous`` links,
+    ``gaps`` intervals and top-level ``ready`` flag are verified against
+    the product chains they derive from), ``product`` a ``str`` and
+    ``batch_min``/``batch_max`` non-bool ``int`` bounds with
+    ``0 <= batch_min <= batch_max``.
+
+    Returns ``None`` when the snapshot has no product with that name.
+    Otherwise returns the four-tuple ``(versions, gaps, receipt, ready)``:
+
+    - ``versions`` is the product's ``(batch, previous, version, passed)``
+      rows whose ``batch`` lies in the closed interval
+      ``[batch_min, batch_max]``, kept in ascending ``batch`` order;
+    - ``gaps`` compresses the batch numbers of the interval that carry no
+      version into maximal closed ``(first, last)`` intervals (``()`` when
+      none are missing, and ``((batch_min, batch_max),)`` when the
+      interval holds no version at all);
+    - ``receipt`` is ``None`` when the product carries no receipt and
+      otherwise the five-tuple ``(action, current, target, history,
+      final)`` with ``history`` the receipt's ``(status, reason)`` pairs
+      in their original order;
+    - ``ready`` is recomputed from the product's complete chain — true
+      exactly when the chain has no gaps, its final version passes and
+      its receipt is a ``publish`` receipt whose ``final`` status is
+      ``succeeded`` — and is unaffected by the requested range.
+
+    The input is never modified.
+
+    :raises TypeError: ``snapshot`` or ``product`` is not a ``str``, or a
+        batch bound is not a non-bool ``int``.
+    :raises ValueError: ``snapshot`` is not the canonical delivery
+        snapshot encoding, a batch bound is negative, or
+        ``batch_min > batch_max``.
+    """
+    if not isinstance(snapshot, str):
+        raise TypeError("snapshot must be a str")
+    if not isinstance(product, str):
+        raise TypeError("product must be a str")
+    if isinstance(batch_min, bool) or not isinstance(batch_min, int):
+        raise TypeError("batch_min must be a non-bool int")
+    if isinstance(batch_max, bool) or not isinstance(batch_max, int):
+        raise TypeError("batch_max must be a non-bool int")
+    if batch_min < 0 or batch_max < 0:
+        raise ValueError("batch bounds must be non-negative")
+    if batch_min > batch_max:
+        raise ValueError("batch_min must not exceed batch_max")
+
+    products, _snapshot_ready = _decode_delivery_snapshot(snapshot)
+    for name, versions, gaps, receipt in products:
+        if name != product:
+            continue
+        ranged_versions = tuple(
+            (batch, previous, version, passed)
+            for batch, previous, version, passed in versions
+            if batch_min <= batch <= batch_max
+        )
+        ranged_gaps = []
+        expected = batch_min
+        for batch, _previous, _version, _passed in ranged_versions:
+            if batch > expected:
+                ranged_gaps.append((expected, batch - 1))
+            expected = batch + 1
+        if expected <= batch_max:
+            ranged_gaps.append((expected, batch_max))
+        ranged_receipt = None
+        if receipt is not None:
+            action, current, target, _affected, history, final, \
+                _failures = receipt
+            ranged_receipt = (
+                action, current, target,
+                tuple((status, reason) for status, reason in history),
+                final,
+            )
+        product_ready = bool(
+            not gaps and receipt is not None and versions[-1][3]
+            and receipt[0] == "publish" and receipt[5] == "succeeded"
+        )
+        return (ranged_versions, tuple(ranged_gaps), ranged_receipt,
+                product_ready)
+    return None
+
+
 def update_delivery_snapshot(snapshot: str, changes: str,
                              receipts: str) -> str:
     """Apply new delivery changes and receipts to a delivery snapshot.
