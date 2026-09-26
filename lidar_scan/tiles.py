@@ -7976,6 +7976,23 @@ def _json_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _format_delivery_manifest(entries: list) -> str:
+    """Serialize sorted normalized manifest entries to the JSON document."""
+    parts = ['{"entries":[']
+    for index, (batch, product, version, passed,
+                failures) in enumerate(entries):
+        if index:
+            parts.append(",")
+        parts.append("[" + str(batch) + "," + _json_string(product) + ","
+                     + _json_string(version) + ",")
+        parts.append("true," if passed else "false,")
+        parts.append(_format_report_windows_array(failures))
+        parts.append("]")
+    parts.append('],"releasable":')
+    parts.append("true}" if all(entry[3] for entry in entries) else "false}")
+    return "".join(parts)
+
+
 def build_delivery_manifest(items: tuple) -> str:
     """Build a delivery manifest from gated product reports.
 
@@ -8055,17 +8072,245 @@ def build_delivery_manifest(items: tuple) -> str:
         normalized.append((batch, product, version, passed, failures))
 
     normalized.sort(key=lambda entry: (entry[0], entry[1]))
+    return _format_delivery_manifest(normalized)
 
-    parts = ['{"entries":[']
-    for index, (batch, product, version, passed,
-                failures) in enumerate(normalized):
+
+def _decode_manifest_failure_window(raw_window) -> list:
+    """Validate one six-value manifest failure window and normalize it.
+
+    Returns ``[level, ix_min, iy_min, ix_max, iy_max, summary]`` where
+    ``summary`` is ``None`` or ``[emin, emax, rmse, amean, n]``.
+
+    :raises ValueError: the window shape or any field violates the report
+        window contract.
+    """
+    if not isinstance(raw_window, list) or len(raw_window) != 6:
+        raise ValueError("each manifest failure window must be an array of "
+                         "six values")
+    for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                            "iy_max"), raw_window[:5]):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"manifest failure {name} must be a non-bool "
+                             "integer")
+    level, ix_min, iy_min, ix_max, iy_max = raw_window[:5]
+    if level < 0:
+        raise ValueError("manifest failure level must be non-negative")
+    if ix_min > ix_max or iy_min > iy_max:
+        raise ValueError("manifest failure window bounds must satisfy "
+                         "ix_min <= ix_max and iy_min <= iy_max")
+
+    raw_summary = raw_window[5]
+    summary = None
+    if raw_summary is not None:
+        if not isinstance(raw_summary, list) or len(raw_summary) != 5:
+            raise ValueError("each manifest failure summary must be null "
+                             "or an array of five values")
+        metrics_raw = list(raw_summary[:4])
+        match_count = raw_summary[4]
+        for name, value in zip(("emin", "emax", "rmse", "amean"),
+                               metrics_raw):
+            if isinstance(value, bool) or not isinstance(value,
+                                                         (int, Decimal)):
+                raise ValueError(f"manifest failure {name} must be a "
+                                 "number")
+        metrics = [Decimal(value) for value in metrics_raw]
+        for name, value in zip(("emin", "emax", "rmse", "amean"),
+                               metrics):
+            if not value.is_finite():
+                raise ValueError(f"manifest failure {name} must be finite")
+        if isinstance(match_count, bool) or not isinstance(match_count,
+                                                           int):
+            raise ValueError("manifest failure n must be a non-bool "
+                             "integer")
+        if match_count < 1:
+            raise ValueError("manifest failure n must be a positive "
+                             "integer")
+        if metrics[2] < 0 or metrics[3] < 0:
+            raise ValueError("manifest failure rmse and amean must be "
+                             "non-negative")
+        summary = [*metrics, match_count]
+
+    return [level, ix_min, iy_min, ix_max, iy_max, summary]
+
+
+def _decode_delivery_manifest(text: str) -> list:
+    """Parse and validate a canonical :func:`build_delivery_manifest` document.
+
+    Returns a list of ``[batch, product, version, passed, failures]``
+    entries in document order, where ``failures`` is a list of six-value
+    ``[level, ix_min, iy_min, ix_max, iy_max, R]`` windows.
+
+    :raises ValueError: the JSON syntax or shape is bad, a value violates
+        the delivery manifest contract, the entries are not sorted by
+        ``(batch, product)``, the top-level ``releasable`` does not equal
+        the logical AND of the entry flags, or the text is not the
+        canonical manifest encoding.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("manifest is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"entries",
+                                                           "releasable"}:
+        raise ValueError("manifest top-level value must be an object with "
+                         "only 'entries' and 'releasable'")
+    raw_entries = document["entries"]
+    if not isinstance(raw_entries, list):
+        raise ValueError("manifest 'entries' must be an array")
+    releasable = document["releasable"]
+    if not isinstance(releasable, bool):
+        raise ValueError("manifest 'releasable' must be a boolean")
+
+    entries = []
+    seen = set()
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, list) or len(raw_entry) != 5:
+            raise ValueError("each manifest entry must be an array of "
+                             "five values")
+        batch, product, version, passed, raw_failures = raw_entry
+        if isinstance(batch, bool) or not isinstance(batch, int):
+            raise ValueError("manifest entry batch must be a non-bool "
+                             "integer")
+        if batch < 0:
+            raise ValueError("manifest entry batch must be non-negative")
+        if not isinstance(product, str):
+            raise ValueError("manifest entry product must be a str")
+        if not product or not set(product) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "manifest entry product must be non-empty and contain "
+                "only ASCII alphanumeric characters and ._-"
+            )
+        if not isinstance(version, str):
+            raise ValueError("manifest entry version must be a str")
+        if not version or not set(version) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "manifest entry version must be non-empty and contain "
+                "only ASCII alphanumeric characters and ._-"
+            )
+        if not isinstance(passed, bool):
+            raise ValueError("manifest entry passed must be a boolean")
+        if not isinstance(raw_failures, list) or len(raw_failures) > 6:
+            raise ValueError("manifest entry failures must be an array of "
+                             "at most six windows")
+        failures = [_decode_manifest_failure_window(raw_window)
+                    for raw_window in raw_failures]
+
+        key = (batch, product)
+        if key in seen:
+            raise ValueError(f"duplicate manifest entry (batch, product): "
+                             f"{key!r}")
+        seen.add(key)
+        entries.append([batch, product, version, passed, failures])
+
+    expected_releasable = all(entry[3] for entry in entries)
+    if releasable != expected_releasable:
+        raise ValueError("manifest 'releasable' must equal the logical "
+                         "AND of the entry passed flags")
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, unsorted entries, non-six-decimal metric formatting,
+    # negative zero as anything but ``0.000000``, leading zeros, exponents
+    # and any other non-canonical spelling.
+    canonical = _format_delivery_manifest(
+        sorted(entries, key=lambda entry: (entry[0], entry[1])))
+    if canonical != text:
+        raise ValueError("manifest is not the canonical delivery manifest "
+                         "encoding")
+    return entries
+
+
+def merge_delivery_manifests(manifests: tuple) -> str:
+    """Merge delivery manifests into a per-product change log.
+
+    ``manifests`` is a tuple of canonical :func:`build_delivery_manifest`
+    documents. Each is validated by re-encoding: the parsed structure,
+    entry sorting, numeric formats and the top-level ``releasable`` flag
+    must reproduce the input byte for byte.
+
+    Entries sharing a ``(batch, product)`` key across manifests are
+    de-duplicated when identical and conflict otherwise. Within one
+    product, batches are ordered by ``batch`` and a ``version`` may not be
+    reused across batches.
+
+    Returns a canonical compact JSON document with exactly the two keys
+    ``changes`` and ``releasable`` in that order. ``changes`` is sorted by
+    ``(batch, product)`` and each item is the array ``[batch, product,
+    previous, version, passed, failures]`` where ``previous`` is the
+    version of the same product's previous batch (``null`` for the first
+    batch) and ``failures`` keeps the manifest's window order as
+    six-value ``[level, ix_min, iy_min, ix_max, iy_max, R]`` arrays
+    (``R`` is ``null`` or ``[emin, emax, rmse, amean, n]``).
+    ``releasable`` is the logical AND of each product's last-batch
+    ``passed`` flag and is ``true`` when there are no entries. Integers
+    are decimal, the four metrics use exactly six decimal places
+    (negative zero written as ``0.000000``), ``NaN``/``Infinity`` never
+    appear and the output has no whitespace or trailing newline. The
+    input is never modified and reordering ``manifests`` yields a
+    byte-identical document.
+
+    :raises TypeError: ``manifests`` is not a tuple or a member is not a
+        ``str``.
+    :raises ValueError: a member is not a canonical delivery manifest,
+        two entries share ``(batch, product)`` but differ, or a product
+        reuses a version across batches.
+    """
+    if not isinstance(manifests, tuple):
+        raise TypeError("manifests must be a tuple")
+
+    merged = {}
+    for manifest in manifests:
+        if not isinstance(manifest, str):
+            raise TypeError("each manifest must be a str")
+        for entry in _decode_delivery_manifest(manifest):
+            key = (entry[0], entry[1])
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = entry
+            elif existing != entry:
+                raise ValueError(f"conflicting manifest entries for "
+                                 f"(batch, product): {key!r}")
+
+    versions_by_product = {}
+    for batch, product, version, passed, failures in merged.values():
+        product_versions = versions_by_product.setdefault(product, set())
+        if version in product_versions:
+            raise ValueError(f"version {version!r} is reused for product "
+                             f"{product!r}")
+        product_versions.add(version)
+
+    previous_by_key = {}
+    last_passed_by_product = {}
+    batches_by_product = {}
+    for batch, product, version, passed, failures in merged.values():
+        batches_by_product.setdefault(product, []).append(
+            (batch, version, passed))
+    for product, product_batches in batches_by_product.items():
+        product_batches.sort()
+        previous = None
+        for batch, version, passed in product_batches:
+            previous_by_key[(batch, product)] = previous
+            previous = version
+        last_passed_by_product[product] = product_batches[-1][2]
+
+    parts = ['{"changes":[']
+    for index, (batch, product, version, passed, failures) in enumerate(
+            sorted(merged.values(), key=lambda entry: (entry[0],
+                                                       entry[1]))):
         if index:
             parts.append(",")
-        parts.append("[" + str(batch) + "," + _json_string(product) + ","
-                     + _json_string(version) + ",")
+        parts.append("[" + str(batch) + "," + _json_string(product) + ",")
+        previous = previous_by_key[(batch, product)]
+        parts.append("null" if previous is None
+                     else _json_string(previous))
+        parts.append("," + _json_string(version) + ",")
         parts.append("true," if passed else "false,")
         parts.append(_format_report_windows_array(failures))
         parts.append("]")
     parts.append('],"releasable":')
-    parts.append("true}" if all(entry[3] for entry in normalized) else "false}")
+    parts.append("true}" if all(last_passed_by_product.values())
+                 else "false}")
     return "".join(parts)
