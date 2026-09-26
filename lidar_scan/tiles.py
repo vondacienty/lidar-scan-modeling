@@ -14473,3 +14473,67 @@ def query_recovery_index(index: str, kind: str, value: str) -> tuple:
     entry_index = hits[0]
     return (entry_index, entries[entry_index]["audit"], snapshot,
             resume_state, complete)
+
+
+def summarize_recovery_index(index, start, stop) -> tuple:
+    """Summarize a half-open entry range of a
+    :func:`merge_recovery_indexes` index.
+
+    ``index`` must be a ``str`` byte-for-byte matching the canonical
+    output of :func:`merge_recovery_indexes`; its embedded entries are
+    re-validated (each entry's history is checked against its plan and
+    entries must chain) and the derived ``audit``, ``snapshot``,
+    ``resume`` and ``complete`` fields are recomputed and must agree.
+    ``start`` and ``stop`` must be non-boolean integers describing the
+    zero-based half-open range ``[start, stop)`` and must satisfy
+    ``0 <= start <= stop <= entry_count``.
+
+    Returns ``(start, stop, audit, before, after, resume, complete)``.
+    ``audit`` collects, in index order, the ``(entry_index, batch_id,
+    status)`` rows of the selected entries. The boundary snapshot at ``k``
+    is the ``start`` snapshot of entry ``k`` when ``k`` is smaller than
+    the entry count, and the index terminal snapshot otherwise;
+    ``before`` and ``after`` are the boundary snapshots at ``start`` and
+    ``stop``, each a canonical snapshot ``str`` or ``None``. ``resume``
+    is the canonical :func:`execute_checkout_recovery` resume state of
+    the range's last history when the range is non-empty and that last
+    entry is unfinished, and ``None`` otherwise. ``complete`` is true
+    only for an empty range or when every selected entry is complete.
+    For an empty range, ``audit`` is ``()`` and ``before`` equals
+    ``after``. The input is never modified and repeated calls return
+    equal tuples.
+
+    :raises TypeError: ``index`` is not a ``str`` or ``start``/``stop``
+        is not a non-boolean integer.
+    :raises ValueError: ``index`` is malformed or not its canonical
+        encoding (including a repeated audit batch id), or the range is
+        out of bounds or inverted.
+    """
+    if not isinstance(index, str):
+        raise TypeError("index must be a str")
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise TypeError("start must be a non-boolean integer")
+    if isinstance(stop, bool) or not isinstance(stop, int):
+        raise TypeError("stop must be a non-boolean integer")
+
+    entries, audit, snapshot, _resume_state, _complete = \
+        _decode_merged_recovery_index(index)
+    entry_count = len(entries)
+    if not 0 <= start <= stop <= entry_count:
+        raise ValueError("range must satisfy 0 <= start <= stop <= "
+                         f"{entry_count}")
+
+    selected_audit = tuple(row for row in audit
+                           if start <= row[0] < stop)
+    before = entries[start]["start"] if start < entry_count else snapshot
+    after = entries[stop]["start"] if stop < entry_count else snapshot
+
+    if start < stop and not entries[stop - 1]["complete"]:
+        resume = entries[stop - 1]["resume"]
+    else:
+        resume = None
+    complete = start == stop or all(
+        entries[position]["complete"]
+        for position in range(start, stop))
+
+    return (start, stop, selected_audit, before, after, resume, complete)
