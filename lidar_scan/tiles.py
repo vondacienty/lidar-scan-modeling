@@ -9964,6 +9964,42 @@ def query_delivery_snapshot(snapshot: str, product: str) -> tuple | None:
     return None
 
 
+def _delivery_range_result(versions, gaps, receipt, batch_min, batch_max):
+    """Compute :func:`query_delivery_range`'s result for a decoded product.
+
+    ``versions``/``gaps``/``receipt`` are the product's decoded snapshot
+    fields and ``batch_min``/``batch_max`` the already-validated bounds.
+    """
+    ranged_versions = tuple(
+        (batch, previous, version, passed)
+        for batch, previous, version, passed in versions
+        if batch_min <= batch <= batch_max
+    )
+    ranged_gaps = []
+    expected = batch_min
+    for batch, _previous, _version, _passed in ranged_versions:
+        if batch > expected:
+            ranged_gaps.append((expected, batch - 1))
+        expected = batch + 1
+    if expected <= batch_max:
+        ranged_gaps.append((expected, batch_max))
+    ranged_receipt = None
+    if receipt is not None:
+        action, current, target, _affected, history, final, \
+            _failures = receipt
+        ranged_receipt = (
+            action, current, target,
+            tuple((status, reason) for status, reason in history),
+            final,
+        )
+    product_ready = bool(
+        not gaps and receipt is not None and versions[-1][3]
+        and receipt[0] == "publish" and receipt[5] == "succeeded"
+    )
+    return (ranged_versions, tuple(ranged_gaps), ranged_receipt,
+            product_ready)
+
+
 def query_delivery_range(snapshot: str, product: str, batch_min: int,
                          batch_max: int) -> tuple | None:
     """Return one product's delivery state restricted to a batch range.
@@ -10019,35 +10055,116 @@ def query_delivery_range(snapshot: str, product: str, batch_min: int,
     for name, versions, gaps, receipt in products:
         if name != product:
             continue
-        ranged_versions = tuple(
-            (batch, previous, version, passed)
-            for batch, previous, version, passed in versions
-            if batch_min <= batch <= batch_max
-        )
-        ranged_gaps = []
-        expected = batch_min
-        for batch, _previous, _version, _passed in ranged_versions:
-            if batch > expected:
-                ranged_gaps.append((expected, batch - 1))
-            expected = batch + 1
-        if expected <= batch_max:
-            ranged_gaps.append((expected, batch_max))
-        ranged_receipt = None
-        if receipt is not None:
-            action, current, target, _affected, history, final, \
-                _failures = receipt
-            ranged_receipt = (
-                action, current, target,
-                tuple((status, reason) for status, reason in history),
-                final,
-            )
-        product_ready = bool(
-            not gaps and receipt is not None and versions[-1][3]
-            and receipt[0] == "publish" and receipt[5] == "succeeded"
-        )
-        return (ranged_versions, tuple(ranged_gaps), ranged_receipt,
-                product_ready)
+        return _delivery_range_result(versions, gaps, receipt,
+                                      batch_min, batch_max)
     return None
+
+
+def _format_range_result(value) -> str:
+    """Serialize a range-query result recursively as compact JSON arrays."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return _json_string(value)
+    return "[" + ",".join(_format_range_result(item) for item in value) + "]"
+
+
+def audit_delivery_ranges(snapshot: str, ranges: tuple) -> str:
+    """Audit a delivery snapshot across a batch of ranged queries.
+
+    ``snapshot`` must be a ``str`` byte-for-byte matching the canonical
+    output of :func:`build_delivery_snapshot`, validated exactly as for
+    :func:`query_delivery_range`. ``ranges`` must be a ``tuple`` whose
+    items are strictly three-element tuples ``(product, batch_min,
+    batch_max)`` with ``product`` a ``str`` and ``batch_min``/``batch_max``
+    non-bool ``int`` bounds satisfying ``0 <= batch_min <= batch_max`` —
+    the same field and boundary contract as :func:`query_delivery_range`.
+    No two items may share the same ``(product, batch_min, batch_max)``
+    key.
+
+    Returns a canonical compact JSON document with exactly the two keys
+    ``ranges`` and ``ready`` in that order. ``ranges`` is sorted
+    lexicographically by ``(product, batch_min, batch_max)`` and each item
+    is the array ``[product, batch_min, batch_max, result]`` where
+    ``result`` is the return value of :func:`query_delivery_range` called
+    with the same arguments, recursively converted to JSON arrays (``None``
+    becoming ``null`` when the snapshot has no such product); the
+    ``versions``, ``gaps``, ``receipt`` and per-product ``ready`` semantics
+    are therefore unchanged. The top-level ``ready`` is true exactly when
+    every item's ``result`` is non-null and its own ``ready`` flag is true
+    (an empty ``ranges`` being ``true``). Integers are decimal, booleans
+    are lowercase, ``null`` is canonical, ``NaN``/``Infinity`` never appear
+    and the output has no whitespace or trailing newline. The inputs are
+    never modified and reordering ``ranges`` returns a byte-identical
+    document.
+
+    :raises TypeError: ``snapshot`` is not a ``str``, ``ranges`` is not a
+        ``tuple``, an item is not a three-element ``tuple``, or an item's
+        ``product`` is not a ``str`` or a batch bound is not a non-bool
+        ``int``.
+    :raises ValueError: ``snapshot`` is not the canonical delivery
+        snapshot encoding, a batch bound is negative,
+        ``batch_min > batch_max``, or two items share the same
+        ``(product, batch_min, batch_max)`` key.
+    """
+    if not isinstance(snapshot, str):
+        raise TypeError("snapshot must be a str")
+    if not isinstance(ranges, tuple):
+        raise TypeError("ranges must be a tuple")
+    normalized = []
+    for item in ranges:
+        if not isinstance(item, tuple) or len(item) != 3:
+            raise TypeError("each range must be a (product, batch_min, "
+                            "batch_max) tuple")
+        product, batch_min, batch_max = item
+        if not isinstance(product, str):
+            raise TypeError("range product must be a str")
+        if isinstance(batch_min, bool) or not isinstance(batch_min, int):
+            raise TypeError("range batch_min must be a non-bool int")
+        if isinstance(batch_max, bool) or not isinstance(batch_max, int):
+            raise TypeError("range batch_max must be a non-bool int")
+        normalized.append((product, batch_min, batch_max))
+
+    products, _snapshot_ready = _decode_delivery_snapshot(snapshot)
+
+    seen_keys = set()
+    for key in normalized:
+        _product, batch_min, batch_max = key
+        if batch_min < 0 or batch_max < 0:
+            raise ValueError("batch bounds must be non-negative")
+        if batch_min > batch_max:
+            raise ValueError("batch_min must not exceed batch_max")
+        if key in seen_keys:
+            raise ValueError(f"duplicate range key {key!r}")
+        seen_keys.add(key)
+
+    by_name = {name: (versions, gaps, receipt)
+               for name, versions, gaps, receipt in products}
+
+    parts = ['{"ranges":[']
+    ready = True
+    for index, (product, batch_min, batch_max) in enumerate(
+            sorted(normalized)):
+        if index:
+            parts.append(",")
+        entry = by_name.get(product)
+        if entry is None:
+            result = None
+        else:
+            versions, gaps, receipt = entry
+            result = _delivery_range_result(versions, gaps, receipt,
+                                            batch_min, batch_max)
+        parts.append("[" + _json_string(product) + "," + str(batch_min)
+                     + "," + str(batch_max) + ","
+                     + _format_range_result(result) + "]")
+        ready = ready and result is not None and result[3]
+    parts.append('],"ready":')
+    parts.append("true}" if ready else "false}")
+    return "".join(parts)
 
 
 def update_delivery_snapshot(snapshot: str, changes: str,
