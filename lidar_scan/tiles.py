@@ -10557,6 +10557,9 @@ def _decode_plan_range_side(value, batch_min, batch_max, side):
         if versions and record[0] <= versions[-1][0]:
             raise ValueError(f"the {side} range versions must be sorted "
                              "uniquely by batch")
+        if versions and record[1] != versions[-1][2]:
+            raise ValueError(f"the {side} range previous must be the "
+                             "version of the preceding record")
         if record[2] in seen_versions:
             raise ValueError(f"the {side} range reuses version "
                              f"{record[2]!r}")
@@ -10710,6 +10713,7 @@ def replay_delivery_updates(plan: str) -> str:
 
     results = []
     any_base_differs = False
+    previous_key = None
     for raw_operation in raw_operations:
         if (not isinstance(raw_operation, list)
                 or len(raw_operation) != 8):
@@ -10731,6 +10735,12 @@ def replay_delivery_updates(plan: str) -> str:
             raise ValueError("operation batch bounds must be non-negative")
         if batch_min > batch_max:
             raise ValueError("operation batch_min must not exceed batch_max")
+        operation_key = (product, batch_min, batch_max)
+        if (previous_key is not None
+                and operation_key <= previous_key):
+            raise ValueError("operations must be sorted uniquely by "
+                             "(product, batch_min, batch_max)")
+        previous_key = operation_key
 
         base = _decode_plan_range_side(raw_base, batch_min, batch_max,
                                           "base")
@@ -10816,6 +10826,93 @@ def replay_delivery_updates(plan: str) -> str:
                          "encoding")
 
     document_out = {"results": results, "changed": changed}
+    return json.dumps(document_out, ensure_ascii=False,
+                     separators=(",", ":"), allow_nan=False)
+
+
+def apply_delivery_updates(snapshot: str, plan: str) -> str:
+    """Check and apply a delivery update plan against a delivery snapshot.
+
+    ``snapshot`` must be a ``str`` byte-for-byte matching the canonical
+    output of :func:`build_delivery_snapshot` and ``plan`` a ``str`` that
+    passes :func:`replay_delivery_updates`. Each plan operation is checked
+    against the snapshot as a pre-flight: the snapshot's current range
+    result (the :func:`query_delivery_range` value for the operation's
+    product and bounds) is compared with the operation's base and target:
+
+    - equal to ``target``: status ``unchanged``;
+    - otherwise equal to ``base``: status ``applied``;
+    - otherwise: status ``conflict``.
+
+    Every operation is checked before anything is applied. When at least
+    one operation conflicts, nothing is applied: the conflicting rows
+    carry reason ``mismatch`` and every other row carries status
+    ``aborted`` with reason ``conflict``; every row's ``state`` is the
+    current range result and ``applied`` is false. Otherwise every row's
+    reason is the empty string, its ``state`` is the operation target and
+    ``applied`` is true.
+
+    Returns the canonical compact JSON document
+    ``{"results":[...],"applied":...}`` with exactly these two top-level
+    keys in this order; ``results`` holds one
+    ``[product, batch_min, batch_max, status, reason, state]`` array per
+    plan operation, kept in the operations' order, with each range result
+    recursively rendered as JSON arrays (``null`` for an absent product).
+    An empty plan is ``{"results":[],"applied":true}``. The output uses
+    decimal integers, lowercase booleans and canonical ``null``, with no
+    whitespace, no ``NaN``/``Infinity`` and no trailing newline. The
+    inputs are never modified.
+
+    :raises TypeError: ``snapshot`` or ``plan`` is not a ``str``.
+    :raises ValueError: ``snapshot`` is not the canonical delivery
+        snapshot encoding or ``plan`` fails :func:`replay_delivery_updates`.
+    """
+    if not isinstance(snapshot, str):
+        raise TypeError("snapshot must be a str")
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+
+    replay_delivery_updates(plan)
+    products, _snapshot_ready = _decode_delivery_snapshot(snapshot)
+    document = json.loads(plan, parse_constant=_reject_constant)
+
+    rows = []
+    conflicts = False
+    for operation in document["operations"]:
+        product, batch_min, batch_max, raw_base, _raw_actions, \
+            _raw_receipt_pair, _raw_ready_pair, raw_target = operation
+        current = _delivery_range_result(
+            products, product, batch_min, batch_max)
+        current_json = _ranges_result_to_json(current)
+        if current_json == raw_target:
+            status = "unchanged"
+        elif current_json == raw_base:
+            status = "applied"
+        else:
+            status = "conflict"
+            conflicts = True
+        rows.append((product, batch_min, batch_max, status, current_json,
+                     raw_target))
+
+    if conflicts:
+        results = [
+            [product, batch_min, batch_max,
+             "conflict" if status == "conflict" else "aborted",
+             "mismatch" if status == "conflict" else "conflict",
+             current_json]
+            for product, batch_min, batch_max, status, current_json,
+                _raw_target in rows
+        ]
+        applied = False
+    else:
+        results = [
+            [product, batch_min, batch_max, status, "", raw_target]
+            for product, batch_min, batch_max, status, _current_json,
+                raw_target in rows
+        ]
+        applied = True
+
+    document_out = {"results": results, "applied": applied}
     return json.dumps(document_out, ensure_ascii=False,
                      separators=(",", ":"), allow_nan=False)
 

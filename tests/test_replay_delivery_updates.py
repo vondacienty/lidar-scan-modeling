@@ -395,3 +395,30 @@ def test_changed_flag_must_match():
     with pytest.raises(ValueError):
         replay_delivery_updates(_tampered(
             equal_plan, lambda doc: doc.__setitem__("changed", True)))
+
+
+def test_operations_must_be_strictly_sorted():
+    before = _ready_p(((0, "1"),))
+    after = _ready_p(((0, "1"), (1, "2")))
+    plan_text = plan_delivery_updates(
+        before, after, (("q", 0, 0), ("p", 0, 0)))
+    document = json.loads(plan_text)
+    document["operations"].reverse()
+    with pytest.raises(ValueError):
+        replay_delivery_updates(json.dumps(
+            document, separators=(",", ":")))
+
+
+def test_side_versions_must_chain_previous():
+    before = _ready_p(((0, "1"), (1, "2")))
+    after = _ready_p(((0, "1"), (1, "2"), (2, "3")))
+    plan_text = plan_delivery_updates(before, after, (("p", 0, 2),))
+
+    with pytest.raises(ValueError):
+        replay_delivery_updates(_tampered(
+            plan_text,
+            lambda doc: doc["operations"][0][7][0][1].__setitem__(1, "x")))
+    with pytest.raises(ValueError):
+        replay_delivery_updates(_tampered(
+            plan_text,
+            lambda doc: doc["operations"][0][3][0][1].__setitem__(1, "x")))
