@@ -13070,3 +13070,270 @@ def build_recovery_receipt(plan: str, states: tuple) -> str:
     parts.append("true" if complete else "false")
     parts.append("}")
     return "".join(parts)
+
+
+def _decode_recovery_receipt(text: str, direction: str, start_snapshot):
+    """Parse and validate a canonical :func:`build_recovery_receipt` receipt.
+
+    ``direction`` is the plan's active recovery arm (``"pending"``,
+    ``"missing"`` or ``"none"``) and ``start_snapshot`` is ``None`` or the
+    raw snapshot document the receipt's ``start`` must equal.
+
+    Returns ``(segments, end_snapshot, complete)`` with ``segments`` a list
+    of ``(origin, target, batches)`` triples (``batches`` a tuple of
+    ``(id, status)`` rows in document order), ``end_snapshot`` ``None`` or
+    the raw snapshot document, and ``complete`` the receipt's boolean.
+
+    :raises ValueError: the JSON or shape is bad, a value violates the
+        receipt contract, the direction or start does not match the plan,
+        or the text is not its canonical encoding.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"receipt is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("receipt has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "direction", "start", "end", "segments", "complete"]:
+        raise ValueError("receipt must be a JSON object with exactly the keys "
+                         '"direction", "start", "end", "segments" and '
+                         '"complete"')
+    receipt_direction = top["direction"][0]
+    if receipt_direction not in ("pending", "missing", "none"):
+        raise ValueError('receipt "direction" must be "pending", "missing" or '
+                         '"none"')
+    if receipt_direction != direction:
+        raise ValueError('receipt "direction" does not match the plan')
+
+    def _raw_snapshot(key):
+        snapshot_node = top[key]
+        if snapshot_node[0] is None:
+            return None
+        if isinstance(snapshot_node[0], dict):
+            raw = text[snapshot_node[1]:snapshot_node[2]]
+            _decode_delivery_snapshot(raw)
+            return raw
+        raise ValueError(f'receipt "{key}" must be null or a JSON object')
+
+    receipt_start = _raw_snapshot("start")
+    if receipt_start != start_snapshot:
+        raise ValueError('receipt "start" does not match the plan')
+    receipt_end = _raw_snapshot("end")
+
+    receipt_nodes = top["segments"][0]
+    if not isinstance(receipt_nodes, list):
+        raise ValueError('receipt "segments" must be an array')
+    segments = []
+    seen_ids = set()
+    for segment_node in receipt_nodes:
+        children = segment_node[0]
+        if not isinstance(children, list) or len(children) != 3:
+            raise ValueError("each receipt segment must be a three-item array "
+                             "[from, to, batches]")
+        origin = children[0][0]
+        target = children[1][0]
+        if isinstance(origin, bool) or not isinstance(origin, int) \
+                or origin < 0:
+            raise ValueError("receipt segment origin must be a non-negative "
+                             "integer")
+        if isinstance(target, bool) or not isinstance(target, int) \
+                or target < 0:
+            raise ValueError("receipt segment target must be a non-negative "
+                             "integer")
+        if origin >= target:
+            raise ValueError("receipt segment must confirm at least one unit")
+        if segments and origin != segments[-1][1]:
+            raise ValueError("receipt segments must chain without a gap")
+        batch_nodes = children[2][0]
+        if not isinstance(batch_nodes, list):
+            raise ValueError("receipt segment batches must be an array")
+        batches = []
+        for row_node in batch_nodes:
+            row = row_node[0]
+            if not isinstance(row, list) or len(row) != 2:
+                raise ValueError("each receipt batch row must be a two-item "
+                                 "array [id, status]")
+            batch_id = row[0][0]
+            status = row[1][0]
+            if not isinstance(batch_id, str) or not isinstance(status, str):
+                raise ValueError("receipt batch id and status must be str")
+            if _COMMIT_ID_RE.fullmatch(batch_id) is None:
+                raise ValueError(f"invalid batch id {batch_id!r}")
+            if status not in ("applied", "unchanged"):
+                raise ValueError(f"invalid audit status {status!r}")
+            if batch_id in seen_ids:
+                raise ValueError(f"duplicate batch id {batch_id!r}")
+            seen_ids.add(batch_id)
+            batches.append((batch_id, status))
+        segments.append((origin, target, tuple(batches)))
+
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('receipt "complete" must be a boolean')
+
+    parts = ['{"direction":', _json_string(receipt_direction), ',"start":',
+             "null" if receipt_start is None else receipt_start, ',"end":',
+             "null" if receipt_end is None else receipt_end, ',"segments":[']
+    segment_text = []
+    for origin, target, batches in segments:
+        segment_text.append("[" + str(origin) + "," + str(target) + ",["
+                            + ",".join(_checkout_audit_row_text(row)
+                                       for row in batches) + "]]")
+    parts.append(",".join(segment_text))
+    parts.append('],"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    if "".join(parts) != text:
+        raise ValueError("receipt is not its canonical encoding")
+    return segments, receipt_end, complete
+
+
+def merge_recovery_receipts(plan: str, receipts: tuple) -> str:
+    """Merge canonical recovery receipts of one
+    :func:`plan_checkout_recovery` plan into a single receipt.
+
+    ``plan`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`plan_checkout_recovery`. ``receipts`` must be a ``tuple``
+    whose items are each a ``str`` byte-for-byte matching the canonical
+    output of :func:`build_recovery_receipt` for that same plan.
+
+    Every receipt's ``direction`` and ``start`` must match the plan. The
+    receipts are read in tuple order: each receipt's confirmed unit count
+    (the ``to`` of its last segment, zero when it has no segments) must
+    strictly increase over the previous receipt, its segments must chain
+    without gaps from the previous receipt's target, and the previous
+    receipt's whole segment sequence must be a prefix of this receipt's
+    segments (identical batch rows included), so the earlier receipts are
+    a complete prefix of the later ones. Each newly covered segment's
+    batches must equal the plan units' audit rows for that range, no
+    batch id may repeat across the merge, the first newly covered unit's
+    ``before`` must equal the previous receipt's ``end``, each receipt's
+    ``end`` must equal its last newly covered unit's ``after`` (or
+    ``start`` when it covers nothing), and its ``complete`` flag must
+    agree with the confirmed prefix. An empty ``receipts`` tuple is
+    valid.
+
+    Returns the canonical compact JSON document with exactly the five
+    top-level keys ``direction``, ``start``, ``end``, ``receipts`` and
+    ``complete`` in that order. ``direction`` is the plan's active arm
+    (``"pending"``, ``"missing"`` or ``"none"`` when the plan has no
+    units). ``start`` is the first unit's ``before`` snapshot and
+    otherwise the plan's ``snapshot`` (possibly ``null``). ``end`` is the
+    last receipt's ``end`` embedded byte for byte, or ``start`` when
+    ``receipts`` is empty. ``receipts`` embeds the input receipts in
+    tuple order as their original canonical objects without re-encoding
+    their snapshots. ``complete`` is the last receipt's ``complete``
+    value, and is true only when the plan has no units when ``receipts``
+    is empty. The output uses ``ensure_ascii=False``, no whitespace and no
+    trailing newline; the inputs are never modified and repeated calls
+    return a byte-identical document.
+
+    :raises TypeError: ``plan`` or a receipt is not a ``str``, or
+        ``receipts`` is not a ``tuple``.
+    :raises ValueError: the plan is not the canonical plan encoding or is
+        forked (both arms non-empty), a receipt is malformed or not its
+        canonical encoding, a receipt's ``direction`` or ``start`` does
+        not match the plan, the confirmed counts do not strictly
+        increase, the segments gap or fail the prefix relationship, the
+        batch rows disagree with the plan, a batch id repeats, or an
+        ``end`` or ``complete`` value does not match the confirmed
+        prefix.
+    """
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a tuple")
+
+    common, missing, pending, plan_snapshot = \
+        _decode_checkout_recovery_plan(plan)
+    if missing and pending:
+        raise ValueError("the plan forks: both missing and pending units "
+                         "remain")
+    if pending:
+        direction = "pending"
+        units = pending
+    elif missing:
+        direction = "missing"
+        units = missing
+    else:
+        direction = "none"
+        units = []
+
+    if units:
+        start_snapshot = units[0][0][3]
+    else:
+        start_snapshot = plan_snapshot
+
+    decoded = []
+    for receipt in receipts:
+        if not isinstance(receipt, str):
+            raise TypeError("each receipt must be a str")
+        decoded.append(_decode_recovery_receipt(
+            receipt, direction, start_snapshot))
+
+    confirmed = 0
+    previous_end = start_snapshot
+    previous_segments = []
+    seen_ids = set()
+    for index, (segments, end_snapshot, receipt_complete) in enumerate(
+            decoded):
+        target = segments[-1][1] if segments else 0
+        if len(segments) < len(previous_segments) \
+                or segments[:len(previous_segments)] != previous_segments:
+            raise ValueError("each receipt's segments must extend the "
+                             "previous receipt's segments")
+        if index > 0 and target <= confirmed:
+            raise ValueError("receipt confirmed counts must strictly "
+                             "increase")
+        if target > len(units):
+            raise ValueError("a receipt confirms more units than the plan "
+                             "holds")
+        first_new = len(previous_segments)
+        if segments:
+            if segments[first_new][0] != confirmed:
+                raise ValueError("the receipt segments do not continue the "
+                                 "confirmed prefix")
+            if units[confirmed][0][3] != previous_end:
+                raise ValueError("the receipt does not continue at the "
+                                 "previous receipt's end")
+        for origin, segment_target, batches in segments[first_new:]:
+            expected = []
+            for unit in units[origin:segment_target]:
+                expected.extend(unit[1])
+            if tuple(expected) != batches:
+                raise ValueError("a receipt segment's batches do not match "
+                                 "the plan's confirmed prefix")
+            for batch_id, _status in batches:
+                if batch_id in seen_ids:
+                    raise ValueError(f"duplicate batch id {batch_id!r}")
+                seen_ids.add(batch_id)
+        if target:
+            expected_end = units[target - 1][0][4]
+        else:
+            expected_end = start_snapshot
+        if end_snapshot != expected_end:
+            raise ValueError('receipt "end" does not match the confirmed '
+                             "prefix")
+        if receipt_complete != (target == len(units)):
+            raise ValueError('receipt "complete" does not match the '
+                             "confirmed prefix")
+        confirmed = target
+        previous_end = end_snapshot
+        previous_segments = segments
+
+    if receipts:
+        end_snapshot = decoded[-1][1]
+        complete = decoded[-1][2]
+    else:
+        end_snapshot = start_snapshot
+        complete = not units
+
+    parts = ['{"direction":', _json_string(direction), ',"start":',
+             "null" if start_snapshot is None else start_snapshot, ',"end":',
+             "null" if end_snapshot is None else end_snapshot, ',"receipts":[',
+             ",".join(receipts), '],"complete":',
+             "true" if complete else "false", "}"]
+    return "".join(parts)
