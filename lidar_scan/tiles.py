@@ -10143,6 +10143,128 @@ def audit_delivery_ranges(snapshot: str, ranges: tuple) -> str:
                       separators=(",", ":"), allow_nan=False)
 
 
+def diff_delivery_snapshots(before: str, after: str, ranges: tuple) -> str:
+    """Diff two delivery snapshots over a batch of range queries.
+
+    ``before`` and ``after`` must each be a ``str`` byte-for-byte matching
+    the canonical output of :func:`build_delivery_snapshot`, exactly as
+    required by :func:`query_delivery_range`. ``ranges`` must be a
+    ``tuple`` whose items are strictly three-tuples ``(product,
+    batch_min, batch_max)`` with ``product`` a ``str`` and
+    ``batch_min``/``batch_max`` non-bool ``int`` bounds satisfying
+    ``0 <= batch_min <= batch_max``; no ``(product, batch_min,
+    batch_max)`` key may repeat.
+
+    Returns the canonical compact JSON document
+    ``{"ranges":[...],"changed":...}`` with exactly these two top-level
+    keys in this order. ``ranges`` holds one ``[product, batch_min,
+    batch_max, before_result, after_result, added, removed, modified]``
+    array per requested range, sorted lexicographically by the three key
+    fields, where ``before_result``/``after_result`` are the return
+    values of :func:`query_delivery_range` called on ``before``/``after``
+    with the same arguments, recursively converted to JSON arrays
+    (``None`` becomes ``null``, so an unknown product yields a ``null``
+    result). A ``null`` result counts as holding no versions:
+    ``added`` lists the four-item version arrays of ``after`` whose
+    ``batch`` no ``before`` version carries, ``removed`` lists those of
+    ``before`` whose ``batch`` no ``after`` version carries, both in
+    ascending ``batch`` order, and ``modified`` lists one ``[batch,
+    before_version, after_version]`` array per ``batch`` carried by both
+    sides whose version records differ. The top-level ``changed`` is
+    true exactly when some range's ``before_result`` differs from its
+    ``after_result``.
+
+    The output uses ``ensure_ascii=False``, decimal integers, lowercase
+    booleans and canonical ``null``, with no whitespace, no
+    ``NaN``/``Infinity`` and no trailing newline. The inputs are never
+    modified and reordering ``ranges`` leaves the output byte-identical.
+
+    :raises TypeError: ``before``, ``after`` or ``ranges`` has the wrong
+        type, a range item is not a three-tuple, or a field has the
+        wrong type.
+    :raises ValueError: either snapshot is not the canonical delivery
+        snapshot encoding, a batch bound is negative,
+        ``batch_min > batch_max``, or a range key repeats.
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if not isinstance(ranges, tuple):
+        raise TypeError("ranges must be a tuple")
+    for item in ranges:
+        if not isinstance(item, tuple) or len(item) != 3:
+            raise TypeError("each range must be a (product, batch_min, "
+                            "batch_max) tuple")
+        product, batch_min, batch_max = item
+        if not isinstance(product, str):
+            raise TypeError("product must be a str")
+        if isinstance(batch_min, bool) or not isinstance(batch_min, int):
+            raise TypeError("batch_min must be a non-bool int")
+        if isinstance(batch_max, bool) or not isinstance(batch_max, int):
+            raise TypeError("batch_max must be a non-bool int")
+
+    _decode_delivery_snapshot(before)
+    _decode_delivery_snapshot(after)
+
+    seen = set()
+    for product, batch_min, batch_max in ranges:
+        if batch_min < 0 or batch_max < 0:
+            raise ValueError("batch bounds must be non-negative")
+        if batch_min > batch_max:
+            raise ValueError("batch_min must not exceed batch_max")
+        key = (product, batch_min, batch_max)
+        if key in seen:
+            raise ValueError(f"duplicate range key {key!r}")
+        seen.add(key)
+
+    rows = []
+    changed = False
+    for product, batch_min, batch_max in ranges:
+        before_result = query_delivery_range(before, product, batch_min,
+                                             batch_max)
+        after_result = query_delivery_range(after, product, batch_min,
+                                            batch_max)
+        before_versions = before_result[0] if before_result is not None \
+            else ()
+        after_versions = after_result[0] if after_result is not None \
+            else ()
+        before_by_batch = {version[0]: version
+                           for version in before_versions}
+        after_by_batch = {version[0]: version
+                          for version in after_versions}
+        added = [list(version) for version in after_versions
+                 if version[0] not in before_by_batch]
+        removed = [list(version) for version in before_versions
+                   if version[0] not in after_by_batch]
+        modified = [
+            [batch, list(before_by_batch[batch]),
+             list(after_by_batch[batch])]
+            for batch, _previous, _version, _passed in before_versions
+            if batch in after_by_batch
+            and before_by_batch[batch] != after_by_batch[batch]
+        ]
+        if before_result != after_result:
+            changed = True
+        rows.append((product, batch_min, batch_max, before_result,
+                     after_result, added, removed, modified))
+    rows.sort(key=lambda row: (row[0], row[1], row[2]))
+
+    document = {
+        "ranges": [
+            [product, batch_min, batch_max,
+             _ranges_result_to_json(before_result),
+             _ranges_result_to_json(after_result),
+             added, removed, modified]
+            for product, batch_min, batch_max, before_result,
+            after_result, added, removed, modified in rows
+        ],
+        "changed": changed,
+    }
+    return json.dumps(document, ensure_ascii=False,
+                      separators=(",", ":"), allow_nan=False)
+
+
 def update_delivery_snapshot(snapshot: str, changes: str,
                              receipts: str) -> str:
     """Apply new delivery changes and receipts to a delivery snapshot.
