@@ -12561,3 +12561,394 @@ def plan_checkout_recovery(log: str, checkpoint, ledgers: tuple) -> str:
     parts.append("null" if snapshot is None else snapshot)
     parts.append("}")
     return "".join(parts)
+
+
+def _decode_checkout_recovery_plan(text: str) -> tuple:
+    """Parse and validate a canonical :func:`plan_checkout_recovery` plan.
+
+    Returns ``(common, missing, pending, snapshot)`` with ``missing`` and
+    ``pending`` lists of ``(range_row, audit_segment)`` units, ``range_row``
+    a ``(first_id, last_id, batch_count, before, after)`` tuple
+    (``before``/``after`` kept as raw snapshot documents) and
+    ``audit_segment`` a tuple of ``(id, status)`` rows.
+
+    :raises ValueError: the document is malformed or not its canonical
+        encoding, a row is invalid, or the units do not chain.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"plan is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("plan has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) \
+            or list(top) != ["common", "missing", "pending", "snapshot"]:
+        raise ValueError('plan must be a JSON object with exactly the keys '
+                         '"common", "missing", "pending" and "snapshot"')
+    common = top["common"][0]
+    if isinstance(common, bool) or not isinstance(common, int) or common < 0:
+        raise ValueError('"common" must be a non-negative integer')
+
+    def decode_units(key: str) -> list:
+        unit_nodes = top[key][0]
+        if not isinstance(unit_nodes, list):
+            raise ValueError(f'"{key}" must be an array')
+        units = []
+        for unit_node in unit_nodes:
+            pair = unit_node[0]
+            if not isinstance(pair, list) or len(pair) != 2:
+                raise ValueError(f'each "{key}" unit must be a two-item '
+                                 "array [range, audit]")
+            range_row = pair[0][0]
+            audit_nodes = pair[1][0]
+            if not isinstance(range_row, list) or len(range_row) != 5:
+                raise ValueError("each range must be a five-item array "
+                                 "[first_id, last_id, batch_count, before, "
+                                 "after]")
+            first_id = range_row[0][0]
+            last_id = range_row[1][0]
+            batch_count = range_row[2][0]
+            if not isinstance(first_id, str) or not isinstance(last_id, str):
+                raise ValueError("range first and last ids must be str")
+            if isinstance(batch_count, bool) \
+                    or not isinstance(batch_count, int) or batch_count < 1:
+                raise ValueError("range batch count must be a positive "
+                                 "integer")
+            if not isinstance(range_row[3][0], dict) \
+                    or not isinstance(range_row[4][0], dict):
+                raise ValueError("range before and after must be JSON "
+                                 "objects")
+            before = text[range_row[3][1]:range_row[3][2]]
+            after = text[range_row[4][1]:range_row[4][2]]
+            _decode_delivery_snapshot(before)
+            _decode_delivery_snapshot(after)
+            if not isinstance(audit_nodes, list):
+                raise ValueError("each unit audit must be an array")
+            segment = []
+            for audit_node in audit_nodes:
+                audit_row = audit_node[0]
+                if not isinstance(audit_row, list) or len(audit_row) != 2:
+                    raise ValueError("each audit row must be a two-item "
+                                     "array [id, status]")
+                batch_id = audit_row[0][0]
+                status = audit_row[1][0]
+                if not isinstance(batch_id, str) \
+                        or not isinstance(status, str):
+                    raise ValueError("audit id and status must be str")
+                if _COMMIT_ID_RE.fullmatch(batch_id) is None:
+                    raise ValueError(f"invalid audit id {batch_id!r}")
+                if status not in ("applied", "unchanged"):
+                    raise ValueError(f"invalid audit status {status!r}")
+                segment.append((batch_id, status))
+            if len(segment) != batch_count:
+                raise ValueError("a unit's audit must hold exactly "
+                                 "batch_count rows")
+            if segment[0][0] != first_id or segment[-1][0] != last_id:
+                raise ValueError("a unit's audit must run from first_id to "
+                                 "last_id")
+            units.append(((first_id, last_id, batch_count, before, after),
+                          tuple(segment)))
+        return units
+
+    missing = decode_units("missing")
+    pending = decode_units("pending")
+    if missing and pending:
+        raise ValueError("plan must not hold both missing and pending "
+                         "units")
+
+    def chain(units: list) -> None:
+        previous_after = None
+        for range_row, segment in units:
+            first_id, _last_id, batch_count, before, after = range_row
+            if previous_after is not None and before != previous_after:
+                raise ValueError("a range's before does not equal the "
+                                 "previous range's after")
+            if batch_count != len(segment):
+                raise ValueError("the ranges do not segment the audit rows")
+            previous_after = after
+
+    chain(missing)
+    chain(pending)
+
+    snapshot_node = top["snapshot"]
+    if snapshot_node[0] is None:
+        if common or pending or missing:
+            raise ValueError("snapshot must equal the last unit's after")
+        snapshot = None
+    elif isinstance(snapshot_node[0], dict):
+        snapshot = text[snapshot_node[1]:snapshot_node[2]]
+        _decode_delivery_snapshot(snapshot)
+        terminal = pending if pending else missing
+        if terminal:
+            if snapshot != terminal[-1][0][4]:
+                raise ValueError("snapshot must equal the last unit's after")
+        elif not common:
+            raise ValueError("snapshot must be null when the plan holds no "
+                             "units at all")
+    else:
+        raise ValueError('"snapshot" must be null or a JSON object')
+
+    rebuilt = ['{"common":', str(common), ',"missing":[',
+               _format_checkout_recovery_units(missing), '],"pending":[',
+               _format_checkout_recovery_units(pending), '],"snapshot":',
+               "null" if snapshot is None else snapshot, "}"]
+    if "".join(rebuilt) != text:
+        raise ValueError("plan is not its canonical encoding")
+    return common, missing, pending, snapshot
+
+
+def _decode_checkout_recovery_state(text: str) -> tuple:
+    """Parse and validate a canonical :func:`execute_checkout_recovery`
+    state.
+
+    Returns ``(common, direction, confirmed, records, snapshot, complete)``
+    with ``records`` a list of ``(range_row, audit_segment)`` units.
+
+    :raises ValueError: the document is malformed or not its canonical
+        encoding, a value violates the contract, or the records do not
+        chain.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"state is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("state has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "common", "direction", "confirmed", "records", "snapshot",
+            "complete"]:
+        raise ValueError("state must be a JSON object with exactly the "
+                         'keys "common", "direction", "confirmed", '
+                         '"records", "snapshot" and "complete"')
+    common = top["common"][0]
+    if isinstance(common, bool) or not isinstance(common, int) or common < 0:
+        raise ValueError('"common" must be a non-negative integer')
+    direction = top["direction"][0]
+    if direction not in ("pending", "missing", "none"):
+        raise ValueError('"direction" must be "pending", "missing" or '
+                         '"none"')
+    confirmed = top["confirmed"][0]
+    if isinstance(confirmed, bool) or not isinstance(confirmed, int) \
+            or confirmed < 0:
+        raise ValueError('"confirmed" must be a non-negative integer')
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('"complete" must be a boolean')
+
+    record_nodes = top["records"][0]
+    if not isinstance(record_nodes, list):
+        raise ValueError('"records" must be an array')
+    records = []
+    previous_after = None
+    for record_node in record_nodes:
+        row = record_node[0]
+        if not isinstance(row, list) or len(row) != 6:
+            raise ValueError("each record must be a six-item array "
+                             "[first, last, count, before, after, audit]")
+        first_id = row[0][0]
+        last_id = row[1][0]
+        count = row[2][0]
+        if not isinstance(first_id, str) or not isinstance(last_id, str):
+            raise ValueError("record first and last ids must be str")
+        if isinstance(count, bool) or not isinstance(count, int) \
+                or count < 1:
+            raise ValueError("record count must be a positive integer")
+        if not isinstance(row[3][0], dict) or not isinstance(row[4][0],
+                                                             dict):
+            raise ValueError("record before and after must be JSON "
+                             "objects")
+        before = text[row[3][1]:row[3][2]]
+        after = text[row[4][1]:row[4][2]]
+        _decode_delivery_snapshot(before)
+        _decode_delivery_snapshot(after)
+        if previous_after is not None and before != previous_after:
+            raise ValueError("a record's before does not equal the previous "
+                             "record's after")
+        audit_nodes = row[5][0]
+        if not isinstance(audit_nodes, list):
+            raise ValueError("record audit must be an array")
+        segment = []
+        for audit_node in audit_nodes:
+            audit_row = audit_node[0]
+            if not isinstance(audit_row, list) or len(audit_row) != 2:
+                raise ValueError("each audit row must be a two-item array "
+                                 "[id, status]")
+            batch_id = audit_row[0][0]
+            status = audit_row[1][0]
+            if not isinstance(batch_id, str) or not isinstance(status, str):
+                raise ValueError("audit id and status must be str")
+            if _COMMIT_ID_RE.fullmatch(batch_id) is None:
+                raise ValueError(f"invalid audit id {batch_id!r}")
+            if status not in ("applied", "unchanged"):
+                raise ValueError(f"invalid audit status {status!r}")
+            segment.append((batch_id, status))
+        if len(segment) != count or segment[0][0] != first_id \
+                or segment[-1][0] != last_id:
+            raise ValueError("a record's audit must run from first to last "
+                             "and hold exactly count rows")
+        records.append(((first_id, last_id, count, before, after),
+                        tuple(segment)))
+        previous_after = after
+
+    snapshot_node = top["snapshot"]
+    if snapshot_node[0] is None:
+        snapshot = None
+    elif isinstance(snapshot_node[0], dict):
+        snapshot = text[snapshot_node[1]:snapshot_node[2]]
+        _decode_delivery_snapshot(snapshot)
+    else:
+        raise ValueError('"snapshot" must be null or a JSON object')
+
+    if len(records) != confirmed:
+        raise ValueError('"confirmed" must equal the number of records')
+    if records:
+        if snapshot != records[-1][0][4]:
+            raise ValueError('"snapshot" must equal the last record\'s '
+                             "after")
+        if direction == "none":
+            raise ValueError('"direction" must not be "none" with records')
+    else:
+        if complete != (direction == "none"):
+            raise ValueError('"complete" is inconsistent with direction and '
+                             "records")
+
+    rebuilt_parts = ['{"common":', str(common), ',"direction":',
+                     _json_string(direction), ',"confirmed":',
+                     str(confirmed), ',"records":[',
+                     _format_checkout_recovery_records(records),
+                     '],"snapshot":',
+                     "null" if snapshot is None else snapshot,
+                     ',"complete":', "true" if complete else "false", "}"]
+    if "".join(rebuilt_parts) != text:
+        raise ValueError("state is not its canonical encoding")
+    return common, direction, confirmed, records, snapshot, complete
+
+
+def _format_checkout_recovery_records(records: list) -> str:
+    """Format recovery state records as flat six-item arrays."""
+    rows = []
+    for range_row, segment in records:
+        first_id, last_id, batch_count, before, after = range_row
+        rows.append("[" + _json_string(first_id) + ","
+                    + _json_string(last_id) + "," + str(batch_count) + ","
+                    + before + "," + after + ",["
+                    + ",".join(_checkout_audit_row_text(row)
+                               for row in segment) + "]]")
+    return ",".join(rows)
+
+
+def _format_checkout_recovery_state(common: int, direction: str,
+                                    records: list, snapshot,
+                                    complete: bool) -> str:
+    """Format a checkout recovery state document."""
+    parts = ['{"common":', str(common), ',"direction":',
+             _json_string(direction), ',"confirmed":', str(len(records)),
+             ',"records":[', _format_checkout_recovery_records(records),
+             '],"snapshot":',
+             "null" if snapshot is None else snapshot, ',"complete":',
+             "true" if complete else "false", "}"]
+    return "".join(parts)
+
+
+def execute_checkout_recovery(plan: str, state=None,
+                              max_units=None) -> str:
+    """Confirm recovery units of a :func:`plan_checkout_recovery` plan.
+
+    ``plan`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`plan_checkout_recovery`. ``state`` must be either ``None``
+    (no unit confirmed yet) or a ``str`` byte-for-byte matching a previous
+    output of this function; the previous state must be a confirmed prefix
+    of the plan, i.e. its ``common``, ``direction`` and every record must
+    match the plan from the start. ``max_units`` must be either ``None``
+    (confirm every remaining unit) or a non-bool non-negative ``int``
+    bounding the number of newly confirmed units.
+
+    The plan confirms units in order along its non-empty side: ``pending``
+    when that side is non-empty, otherwise ``missing``; when both sides
+    are empty the direction is ``none``. At most ``max_units`` new units
+    are appended to the state's confirmed prefix, so a call that fails
+    validation produces no partial progress.
+
+    Returns the canonical compact JSON document with exactly the six
+    top-level keys ``common``, ``direction``, ``confirmed``, ``records``,
+    ``snapshot`` and ``complete`` in that order. ``common`` and
+    ``direction`` echo the plan; ``confirmed`` is the cumulative number
+    of confirmed units; ``records`` is the confirmed prefix, each record
+    being ``[first, last, count, before, after, [[id, status], ...]]``;
+    ``snapshot`` is the last record's ``after``, or, with no confirmation,
+    the first unit's ``before`` when the plan still holds work and
+    ``plan.snapshot`` when nothing remains; ``complete`` is true only when
+    every unit of the plan is confirmed and that last ``after`` equals
+    ``plan.snapshot``. Re-entering a completed state confirms no further
+    unit and returns a byte-identical document. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline.
+
+    :raises TypeError: ``plan`` is not a ``str``, ``state`` is neither
+        ``None`` nor a ``str``, or ``max_units`` is neither ``None`` nor
+        an ``int``.
+    :raises ValueError: the plan or state is not its canonical encoding,
+        the state is not a confirmed prefix of the plan, or ``max_units``
+        is negative.
+    """
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if state is not None and not isinstance(state, str):
+        raise TypeError("state must be None or a str")
+    if isinstance(max_units, bool) or (
+            max_units is not None and not isinstance(max_units, int)):
+        raise TypeError("max_units must be None or a non-bool int")
+    if max_units is not None and max_units < 0:
+        raise ValueError("max_units must be non-negative")
+
+    common, missing, pending, plan_snapshot = \
+        _decode_checkout_recovery_plan(plan)
+    units = pending if pending else missing
+    direction = "pending" if pending else ("missing" if missing else "none")
+
+    if state is None:
+        records = []
+    else:
+        state_common, state_direction, _state_confirmed, records, \
+            state_snapshot, state_complete = \
+            _decode_checkout_recovery_state(state)
+        if state_common != common:
+            raise ValueError("state common does not match the plan")
+        if state_direction != direction:
+            raise ValueError("state direction does not match the plan")
+        if len(records) > len(units):
+            raise ValueError("state is not a confirmed prefix of the plan")
+        for index, record in enumerate(records):
+            if record != units[index]:
+                raise ValueError("state is not a confirmed prefix of the "
+                                 "plan")
+        if records:
+            expected_snapshot = records[-1][0][4]
+        elif units:
+            expected_snapshot = units[0][0][3]
+        else:
+            expected_snapshot = plan_snapshot
+        expected_complete = len(records) == len(units) \
+            and expected_snapshot == plan_snapshot
+        if state_snapshot != expected_snapshot \
+                or state_complete != expected_complete:
+            raise ValueError("state is not a confirmed prefix of the plan")
+        records = list(records)
+
+    start = len(records)
+    remaining = len(units) - start
+    budget = remaining if max_units is None else min(max_units, remaining)
+    records.extend(units[start:start + budget])
+
+    if records:
+        snapshot = records[-1][0][4]
+    elif units:
+        snapshot = units[0][0][3]
+    else:
+        snapshot = plan_snapshot
+    complete = len(records) == len(units) and snapshot == plan_snapshot
+    return _format_checkout_recovery_state(common, direction, records,
+                                           snapshot, complete)
