@@ -12138,3 +12138,257 @@ def merge_checkout_logs(log: str, ledgers: tuple) -> str:
     parts.append("null" if snapshot is None else snapshot)
     parts.append("}")
     return "".join(parts)
+
+
+def _decode_checkout_checkpoint(checkpoint: str) -> tuple:
+    """Parse and validate a checkout checkpoint document.
+
+    ``checkpoint`` must be ``None`` or a ``str`` byte-for-byte matching
+    the canonical output of :func:`merge_checkout_logs` or of
+    :func:`update_checkout_checkpoint`. Returns ``(ranges, audit,
+    snapshot)`` where ``ranges`` is a list of ``(raw, first_id, last_id,
+    batch_count, before, after)`` tuples, ``audit`` a list of ``(raw,
+    id, status)`` tuples (every ``raw`` being the row's canonical source
+    text) and ``snapshot`` ``None`` or the raw snapshot document.
+
+    The document must be compact canonical JSON with the top-level keys
+    ``ranges``, ``audit`` and ``snapshot`` in that order, optionally
+    followed by ``added_ranges`` and ``added_audit``; the added rows,
+    when present, must be suffixes of the cumulative arrays. Every range
+    must segment the audit array (its ``batch_count`` consecutive audit
+    rows starting with ``first_id`` and ending with ``last_id``), the
+    ranges must chain (each ``before`` equals the previous ``after``)
+    and ``snapshot`` must equal the last range's ``after`` (``null``
+    when there are no ranges). Batch ids must be unique.
+
+    :raises ValueError: the document is malformed, not canonical, or
+        its ranges, audit segmentation or trailing snapshot contradict
+        each other.
+    """
+    if checkpoint is None:
+        return [], [], None
+    try:
+        node = _parse_json_node(checkpoint, _skip_json_ws(checkpoint, 0))
+    except ValueError as exc:
+        raise ValueError(f"checkpoint is not a valid JSON document "
+                         f"({exc})") from exc
+    if _skip_json_ws(checkpoint, node[2]) != len(checkpoint):
+        raise ValueError("checkpoint has trailing data after the JSON "
+                         "document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) not in (
+            ["ranges", "audit", "snapshot"],
+            ["ranges", "audit", "snapshot", "added_ranges",
+             "added_audit"]):
+        raise ValueError("checkpoint must be a JSON object with the keys "
+                         '"ranges", "audit" and "snapshot", optionally '
+                         'followed by "added_ranges" and "added_audit"')
+    ranges_value = top["ranges"][0]
+    if not isinstance(ranges_value, list):
+        raise ValueError('"ranges" must be an array')
+    ranges = []
+    for row_node in ranges_value:
+        row = row_node[0]
+        if not isinstance(row, list) or len(row) != 5:
+            raise ValueError("each range must be a five-item array "
+                             "[first_id, last_id, batch_count, before, "
+                             "after]")
+        first_id, last_id, batch_count = row[0][0], row[1][0], row[2][0]
+        if not isinstance(first_id, str) or not isinstance(last_id, str):
+            raise ValueError("range ids must be strings")
+        if _COMMIT_ID_RE.fullmatch(first_id) is None \
+                or _COMMIT_ID_RE.fullmatch(last_id) is None:
+            raise ValueError("range ids must be valid batch ids")
+        if isinstance(batch_count, bool) or not isinstance(batch_count,
+                                                           int) \
+                or batch_count < 1:
+            raise ValueError("range batch count must be a positive "
+                             "integer")
+        if not isinstance(row[3][0], dict) \
+                or not isinstance(row[4][0], dict):
+            raise ValueError("range before and after must be JSON "
+                             "objects")
+        before = checkpoint[row[3][1]:row[3][2]]
+        after = checkpoint[row[4][1]:row[4][2]]
+        _decode_delivery_snapshot(before)
+        _decode_delivery_snapshot(after)
+        raw = checkpoint[row_node[1]:row_node[2]]
+        if raw != ("[" + _json_string(first_id) + ","
+                   + _json_string(last_id) + "," + str(batch_count) + ","
+                   + before + "," + after + "]"):
+            raise ValueError("checkpoint is not its canonical encoding")
+        ranges.append((raw, first_id, last_id, batch_count, before,
+                       after))
+    audit_value = top["audit"][0]
+    if not isinstance(audit_value, list):
+        raise ValueError('"audit" must be an array')
+    audit = []
+    seen = set()
+    for row_node in audit_value:
+        row = row_node[0]
+        if not isinstance(row, list) or len(row) != 2:
+            raise ValueError("each audit row must be a two-item array "
+                             "[id, status]")
+        batch_id, status = row[0][0], row[1][0]
+        if not isinstance(batch_id, str) or not isinstance(status, str):
+            raise ValueError("audit id and status must be strings")
+        if _COMMIT_ID_RE.fullmatch(batch_id) is None:
+            raise ValueError(f"invalid batch id {batch_id!r}")
+        if status not in ("applied", "unchanged"):
+            raise ValueError(f"invalid audit status {status!r}")
+        if batch_id in seen:
+            raise ValueError(f"duplicate batch id {batch_id!r}")
+        seen.add(batch_id)
+        raw = checkpoint[row_node[1]:row_node[2]]
+        if raw != ("[" + _json_string(batch_id) + ","
+                   + _json_string(status) + "]"):
+            raise ValueError("checkpoint is not its canonical encoding")
+        audit.append((raw, batch_id, status))
+    snapshot_node = top["snapshot"]
+    if snapshot_node[0] is None:
+        snapshot = None
+    elif isinstance(snapshot_node[0], dict):
+        snapshot = checkpoint[snapshot_node[1]:snapshot_node[2]]
+        _decode_delivery_snapshot(snapshot)
+    else:
+        raise ValueError('"snapshot" must be null or a JSON object')
+    position = 0
+    previous_after = None
+    for _raw, first_id, last_id, batch_count, before, after in ranges:
+        segment = audit[position:position + batch_count]
+        if len(segment) != batch_count:
+            raise ValueError("checkpoint ranges and audit segmentation "
+                             "contradict each other")
+        if segment[0][1] != first_id or segment[-1][1] != last_id:
+            raise ValueError("checkpoint ranges and audit segmentation "
+                             "contradict each other")
+        if previous_after is not None and before != previous_after:
+            raise ValueError("checkpoint ranges do not chain")
+        previous_after = after
+        position += batch_count
+    if position != len(audit):
+        raise ValueError("checkpoint ranges and audit segmentation "
+                         "contradict each other")
+    if ranges:
+        if snapshot is None or snapshot != ranges[-1][5]:
+            raise ValueError("checkpoint snapshot contradicts the last "
+                             "range")
+    elif snapshot is not None:
+        raise ValueError("checkpoint snapshot contradicts the empty "
+                         "ranges")
+    parts = ['{"ranges":[']
+    for index, (raw, _first, _last, _count, _before, _after) \
+            in enumerate(ranges):
+        if index:
+            parts.append(",")
+        parts.append(raw)
+    parts.append('],"audit":[')
+    for index, (raw, _batch_id, _status) in enumerate(audit):
+        if index:
+            parts.append(",")
+        parts.append(raw)
+    parts.append('],"snapshot":')
+    parts.append("null" if snapshot is None else snapshot)
+    if len(top) == 5:
+        added = []
+        for key, cumulative in (("added_ranges", ranges),
+                                ("added_audit", audit)):
+            added_value = top[key][0]
+            if not isinstance(added_value, list):
+                raise ValueError(f'"{key}" must be an array')
+            rows = [checkpoint[item[1]:item[2]] for item in added_value]
+            if len(rows) > len(cumulative) \
+                    or [item[0] for item in
+                        cumulative[len(cumulative) - len(rows):]] != rows:
+                raise ValueError(f'"{key}" must be a suffix of the '
+                                 "cumulative array")
+            added.append(rows)
+        parts.append(',"added_ranges":[')
+        parts.append(",".join(added[0]))
+        parts.append('],"added_audit":[')
+        parts.append(",".join(added[1]))
+        parts.append("]")
+    parts.append("}")
+    if "".join(parts) != checkpoint:
+        raise ValueError("checkpoint is not its canonical encoding")
+    return ranges, audit, snapshot
+
+
+def update_checkout_checkpoint(log: str, checkpoint, ledgers: tuple) -> str:
+    """Extend a checkout checkpoint with a batch of checkout ledgers.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log`; the whole chain is recomputed and validated.
+    ``checkpoint`` must be ``None``, a ``str`` byte-for-byte matching the
+    canonical output of :func:`merge_checkout_logs`, or a ``str``
+    byte-for-byte matching a previous output of this function; ``None``
+    starts the cumulative state from ``[],[],null``. A previous output of
+    this function has its ``added_ranges``/``added_audit`` rows verified
+    as suffixes of the cumulative arrays before they are accepted.
+    ``ledgers`` must be a ``tuple`` whose items are each a ``str``
+    byte-for-byte matching the canonical output of :func:`checkout_log`;
+    every ledger is re-verified with :func:`replay_checkout` against
+    ``log`` before it contributes.
+
+    Empty ledgers contribute nothing; the non-empty ledgers append their
+    ranges and audit rows in order. The first non-empty ledger's first
+    ``before`` must byte-for-byte equal the checkpoint's ``snapshot``
+    when the checkpoint carries one. Batch ids must be unique across the
+    checkpoint and the new ledgers.
+
+    Returns the canonical compact JSON document with exactly the five
+    top-level keys ``ranges``, ``audit``, ``snapshot``, ``added_ranges``
+    and ``added_audit`` in that order. The first three follow the
+    :func:`merge_checkout_logs` structure and hold the cumulative
+    result; the last two hold only this call's newly added ranges and
+    ``[id, status]`` rows and are suffixes of the cumulative arrays.
+    When nothing is added the last two are both ``[]`` and the
+    cumulative values are unchanged. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline; the
+    inputs are never modified and repeated calls return a byte-identical
+    document.
+
+    :raises TypeError: ``log`` is not a ``str``, ``checkpoint`` is
+        neither ``None`` nor a ``str``, ``ledgers`` is not a ``tuple``,
+        or a ledger is not a ``str``.
+    :raises ValueError: a document is not its canonical encoding, the
+        checkpoint's ranges, audit segmentation or trailing snapshot
+        contradict each other, a previous output's added rows are not
+        suffixes of the cumulative arrays, a batch id is duplicated, the
+        first new non-empty ledger's ``before`` does not equal the
+        checkpoint's snapshot, or a ledger fails
+        :func:`replay_checkout` re-verification.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if checkpoint is not None and not isinstance(checkpoint, str):
+        raise TypeError("checkpoint must be None or a str")
+    if not isinstance(ledgers, tuple):
+        raise TypeError("ledgers must be a tuple")
+    for ledger in ledgers:
+        if not isinstance(ledger, str):
+            raise TypeError("each ledger must be a str")
+    old_ranges, old_audit, old_snapshot = \
+        _decode_checkout_checkpoint(checkpoint)
+    new_ranges, new_audit, new_snapshot = \
+        _decode_checkout_checkpoint(merge_checkout_logs(log, ledgers))
+    old_ids = {batch_id for _raw, batch_id, _status in old_audit}
+    for _raw, batch_id, _status in new_audit:
+        if batch_id in old_ids:
+            raise ValueError(f"duplicate batch id {batch_id!r}")
+    if new_ranges and old_snapshot is not None \
+            and new_ranges[0][4] != old_snapshot:
+        raise ValueError("the first new non-empty ledger must begin "
+                         "from the checkpoint snapshot")
+    ranges = [raw for raw, *_rest in old_ranges]
+    ranges.extend(raw for raw, *_rest in new_ranges)
+    audit = [raw for raw, *_rest in old_audit]
+    audit.extend(raw for raw, *_rest in new_audit)
+    snapshot = new_snapshot if new_ranges else old_snapshot
+    return ('{"ranges":[' + ",".join(ranges)
+            + '],"audit":[' + ",".join(audit)
+            + '],"snapshot":' + ("null" if snapshot is None else snapshot)
+            + ',"added_ranges":['
+            + ",".join(raw for raw, *_rest in new_ranges)
+            + '],"added_audit":['
+            + ",".join(raw for raw, *_rest in new_audit) + "]}")
