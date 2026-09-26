@@ -9932,6 +9932,50 @@ def _snapshot_to_tuples(value):
     return value
 
 
+def _delivery_range_result(products: list, product: str, batch_min: int,
+                           batch_max: int) -> tuple | None:
+    """Compute :func:`query_delivery_range` from pre-decoded products.
+
+    ``products`` must be the decoded product list of a canonical delivery
+    snapshot as returned by :func:`_decode_delivery_snapshot`; the bounds
+    must already satisfy ``0 <= batch_min <= batch_max``. Returns exactly
+    what :func:`query_delivery_range` would return for the same snapshot
+    and arguments, without re-parsing any text.
+    """
+    for name, versions, gaps, receipt in products:
+        if name != product:
+            continue
+        ranged_versions = tuple(
+            (batch, previous, version, passed)
+            for batch, previous, version, passed in versions
+            if batch_min <= batch <= batch_max
+        )
+        ranged_gaps = []
+        expected = batch_min
+        for batch, _previous, _version, _passed in ranged_versions:
+            if batch > expected:
+                ranged_gaps.append((expected, batch - 1))
+            expected = batch + 1
+        if expected <= batch_max:
+            ranged_gaps.append((expected, batch_max))
+        ranged_receipt = None
+        if receipt is not None:
+            action, current, target, _affected, history, final, \
+                _failures = receipt
+            ranged_receipt = (
+                action, current, target,
+                tuple((status, reason) for status, reason in history),
+                final,
+            )
+        product_ready = bool(
+            not gaps and receipt is not None and versions[-1][3]
+            and receipt[0] == "publish" and receipt[5] == "succeeded"
+        )
+        return (ranged_versions, tuple(ranged_gaps), ranged_receipt,
+                product_ready)
+    return None
+
+
 def query_delivery_snapshot(snapshot: str, product: str) -> tuple | None:
     """Return one product item from a delivery snapshot as nested tuples.
 
@@ -10016,38 +10060,7 @@ def query_delivery_range(snapshot: str, product: str, batch_min: int,
         raise ValueError("batch_min must not exceed batch_max")
 
     products, _snapshot_ready = _decode_delivery_snapshot(snapshot)
-    for name, versions, gaps, receipt in products:
-        if name != product:
-            continue
-        ranged_versions = tuple(
-            (batch, previous, version, passed)
-            for batch, previous, version, passed in versions
-            if batch_min <= batch <= batch_max
-        )
-        ranged_gaps = []
-        expected = batch_min
-        for batch, _previous, _version, _passed in ranged_versions:
-            if batch > expected:
-                ranged_gaps.append((expected, batch - 1))
-            expected = batch + 1
-        if expected <= batch_max:
-            ranged_gaps.append((expected, batch_max))
-        ranged_receipt = None
-        if receipt is not None:
-            action, current, target, _affected, history, final, \
-                _failures = receipt
-            ranged_receipt = (
-                action, current, target,
-                tuple((status, reason) for status, reason in history),
-                final,
-            )
-        product_ready = bool(
-            not gaps and receipt is not None and versions[-1][3]
-            and receipt[0] == "publish" and receipt[5] == "succeeded"
-        )
-        return (ranged_versions, tuple(ranged_gaps), ranged_receipt,
-                product_ready)
-    return None
+    return _delivery_range_result(products, product, batch_min, batch_max)
 
 
 def _ranges_result_to_json(value):
@@ -10264,6 +10277,140 @@ def diff_delivery_snapshots(before: str, after: str, ranges: tuple) -> str:
         ])
 
     document = {"ranges": rows, "changed": changed}
+    return json.dumps(document, ensure_ascii=False,
+                      separators=(",", ":"), allow_nan=False)
+
+
+def plan_delivery_updates(before: str, after: str, ranges: tuple) -> str:
+    """Plan the actions that turn one delivery snapshot into another.
+
+    ``before`` and ``after`` must each be a ``str`` byte-for-byte matching
+    the canonical output of :func:`build_delivery_snapshot`, exactly as
+    required by :func:`query_delivery_range`; each snapshot is parsed
+    exactly once. ``ranges`` must be a ``tuple`` whose items are strictly
+    three-tuples ``(product, batch_min, batch_max)`` with ``product`` a
+    ``str`` and ``batch_min``/``batch_max`` non-bool ``int`` bounds
+    satisfying ``0 <= batch_min <= batch_max``; no
+    ``(product, batch_min, batch_max)`` key may repeat.
+
+    For each requested range, ``B`` and ``A`` are the return values of
+    :func:`query_delivery_range` called against ``before`` and ``after``
+    respectively (``None`` when the product is absent).
+
+    Returns the canonical compact JSON document
+    ``{"operations":[...],"changed":...}`` with exactly these two
+    top-level keys in this order. ``operations`` holds one
+    ``[product, batch_min, batch_max, base, actions, receipt, ready,
+    target]`` array per requested range, sorted lexicographically by the
+    three key fields:
+
+    - ``base`` and ``target`` are the ``B`` and ``A`` query results
+      recursively converted to JSON arrays (``None`` becomes ``null``);
+    - ``actions`` lists, in ascending batch order, one ``["add",
+      A-record]`` per batch present only in ``A``, one ``["remove",
+      B-record]`` per batch present only in ``B`` and one ``["replace",
+      B-record, A-record]`` per batch present on both sides whose version
+      records differ, where each record is the four-value
+      ``[batch, previous, version, passed]`` array;
+    - ``receipt`` is ``[B-receipt, A-receipt]`` and ``ready`` is
+      ``[B-ready, A-ready]``, each side being ``null`` when that side's
+      query result is ``null`` (a ``null`` receipt on a present product
+      stays ``null``).
+
+    Replaying ``actions`` onto ``base``'s versions, recomputing the
+    gaps of the requested interval from the resulting batches and taking
+    the ``A`` sides of the ``receipt`` and ``ready`` migrations yields
+    exactly ``target``. The top-level ``changed`` flag is true exactly
+    when at least one range's ``base`` and ``target`` values differ (an
+    empty ``ranges`` being ``false``).
+
+    The output uses ``ensure_ascii=False``, decimal integers, lowercase
+    booleans and canonical ``null``, with no whitespace, no
+    ``NaN``/``Infinity`` and no trailing newline. The inputs are never
+    modified and reordering ``ranges`` leaves the output byte-identical.
+
+    :raises TypeError: ``before``/``after`` or ``ranges`` has the wrong
+        type, a range item is not a three-tuple, or a field has the
+        wrong type.
+    :raises ValueError: a snapshot is not the canonical delivery
+        snapshot encoding, a batch bound is negative,
+        ``batch_min > batch_max``, or a range key repeats.
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if not isinstance(ranges, tuple):
+        raise TypeError("ranges must be a tuple")
+    for item in ranges:
+        if not isinstance(item, tuple) or len(item) != 3:
+            raise TypeError("each range must be a (product, batch_min, "
+                            "batch_max) tuple")
+        product, batch_min, batch_max = item
+        if not isinstance(product, str):
+            raise TypeError("product must be a str")
+        if isinstance(batch_min, bool) or not isinstance(batch_min, int):
+            raise TypeError("batch_min must be a non-bool int")
+        if isinstance(batch_max, bool) or not isinstance(batch_max, int):
+            raise TypeError("batch_max must be a non-bool int")
+
+    before_products, _before_ready = _decode_delivery_snapshot(before)
+    after_products, _after_ready = _decode_delivery_snapshot(after)
+
+    seen = set()
+    for product, batch_min, batch_max in ranges:
+        if batch_min < 0 or batch_max < 0:
+            raise ValueError("batch bounds must be non-negative")
+        if batch_min > batch_max:
+            raise ValueError("batch_min must not exceed batch_max")
+        key = (product, batch_min, batch_max)
+        if key in seen:
+            raise ValueError(f"duplicate range key {key!r}")
+        seen.add(key)
+
+    operations = []
+    changed = False
+    for product, batch_min, batch_max in sorted(
+            ranges, key=lambda item: (item[0], item[1], item[2])):
+        base = _delivery_range_result(before_products, product, batch_min,
+                                      batch_max)
+        target = _delivery_range_result(after_products, product, batch_min,
+                                        batch_max)
+        if base != target:
+            changed = True
+
+        base_versions = (
+            {} if base is None else {record[0]: record
+                                     for record in base[0]}
+        )
+        target_versions = (
+            {} if target is None else {record[0]: record
+                                       for record in target[0]}
+        )
+        actions = []
+        for batch in sorted(set(base_versions) | set(target_versions)):
+            base_record = base_versions.get(batch)
+            target_record = target_versions.get(batch)
+            if base_record is None:
+                actions.append(["add", list(target_record)])
+            elif target_record is None:
+                actions.append(["remove", list(base_record)])
+            elif base_record != target_record:
+                actions.append(["replace", list(base_record),
+                                list(target_record)])
+
+        operations.append([
+            product, batch_min, batch_max,
+            _ranges_result_to_json(base),
+            actions,
+            [None if base is None else _ranges_result_to_json(base[2]),
+             None if target is None else _ranges_result_to_json(target[2])],
+            [None if base is None else base[3],
+             None if target is None else target[3]],
+            _ranges_result_to_json(target),
+        ])
+
+    document = {"operations": operations, "changed": changed}
     return json.dumps(document, ensure_ascii=False,
                       separators=(",", ":"), allow_nan=False)
 
