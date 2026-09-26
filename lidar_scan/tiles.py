@@ -10945,6 +10945,154 @@ def apply_delivery_updates(snapshot: str, plan: str) -> str:
                       separators=(",", ":"), allow_nan=False)
 
 
+def commit_delivery_updates(snapshot: str, target: str, plan: str) -> str:
+    """Commit a replayed delivery update plan, adopting a target snapshot.
+
+    ``snapshot`` and ``target`` must each be a ``str`` byte-for-byte
+    matching the canonical output of :func:`build_delivery_snapshot` and
+    ``plan`` a ``str`` that passes :func:`replay_delivery_updates` (the
+    canonical :func:`plan_delivery_updates` encoding with operations in
+    strictly ascending ``(product, batch_min, batch_max)`` order and
+    valid ``previous`` chains on both sides). Additionally, the plan's
+    ranges for the same product must not overlap, the ``target``
+    snapshot's range result for every operation's
+    ``(product, batch_min, batch_max)`` key must equal the plan's target,
+    and every product and version record not covered by a plan range must
+    be identical in ``snapshot`` and ``target`` (an empty plan therefore
+    requires the two snapshots to be identical).
+
+    Every operation is then checked against ``snapshot`` (preflight): the
+    snapshot's current range result for the operation's key is compared
+    with the plan's target and base. When it equals the target the
+    operation is ``unchanged``, otherwise when it equals the base it is
+    ``applied``, and otherwise it is a ``conflict``.
+
+    When at least one operation conflicts, nothing is committed: each
+    conflicting result row carries ``status`` ``"conflict"`` and
+    ``reason`` ``"mismatch"``, every other row carries ``status``
+    ``"aborted"`` and ``reason`` ``"conflict"``, every row's ``state`` is
+    the snapshot's current range result, the final snapshot is
+    ``snapshot`` itself and the top-level ``committed`` flag is
+    ``false``. When no operation conflicts, every row carries an empty
+    ``reason``, a ``state`` equal to the plan's target and ``status``
+    ``"unchanged"`` or ``"applied"`` as above, the ``target`` snapshot is
+    atomically adopted as the final snapshot and ``committed`` is
+    ``true``.
+
+    Returns the canonical compact JSON document
+    ``{"snapshot":...,"results":[...],"committed":...}`` with exactly
+    these three top-level keys in this order; ``snapshot`` is the final
+    snapshot object, ``results`` preserves the plan's operation order and
+    each row is ``[product, batch_min, batch_max, status, reason,
+    state]``, with ``state`` the range result recursively converted to
+    JSON arrays (``null`` for an absent product). An empty plan yields
+    ``{"snapshot":<target>,"results":[],"committed":true}``. The output
+    keeps the snapshot's number formats (the four failure metrics use
+    exactly six decimal places with negative zero written as
+    ``0.000000``), decimal integers, lowercase booleans and canonical
+    ``null``, with no whitespace, no ``NaN``/``Infinity`` and no trailing
+    newline. The inputs are never modified and repeated calls return a
+    byte-identical document.
+
+    :raises TypeError: ``snapshot``, ``target`` or ``plan`` is not a
+        ``str``.
+    :raises ValueError: ``snapshot`` or ``target`` is not the canonical
+        delivery snapshot encoding, ``plan`` fails
+        :func:`replay_delivery_updates`, the plan's ranges for one
+        product overlap, ``target``'s range result differs from the
+        plan's target, or an item not covered by the plan differs
+        between ``snapshot`` and ``target``.
+    """
+    if not isinstance(snapshot, str):
+        raise TypeError("snapshot must be a str")
+    if not isinstance(target, str):
+        raise TypeError("target must be a str")
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+
+    snapshot_products, _snapshot_ready = _decode_delivery_snapshot(snapshot)
+    target_products, _target_ready = _decode_delivery_snapshot(target)
+    _document, operations = _parse_delivery_plan(plan)
+
+    covered_by_product = {}
+    for product, batch_min, batch_max, _action_count, _base, _target, \
+            _raw_target in operations:
+        intervals = covered_by_product.setdefault(product, [])
+        if intervals and batch_min <= intervals[-1][1]:
+            raise ValueError("plan ranges for the same product must not "
+                             "overlap")
+        intervals.append((batch_min, batch_max))
+
+    for (product, batch_min, batch_max, _action_count, _base, _target,
+         raw_target) in operations:
+        target_json = _ranges_result_to_json(_delivery_range_result(
+            target_products, product, batch_min, batch_max))
+        if target_json != raw_target:
+            raise ValueError(
+                f"target snapshot range {(product, batch_min, batch_max)!r} "
+                f"must equal the plan's target")
+
+    snapshot_by_product = {item[0]: item for item in snapshot_products}
+    target_by_product = {item[0]: item for item in target_products}
+    for product in sorted(set(snapshot_by_product) | set(target_by_product)):
+        intervals = covered_by_product.get(product)
+        snapshot_item = snapshot_by_product.get(product)
+        target_item = target_by_product.get(product)
+        if not intervals:
+            if snapshot_item != target_item:
+                raise ValueError(
+                    f"product {product!r} is not covered by the plan and "
+                    f"must be identical in both snapshots")
+            continue
+        outside = [[record for record in ([] if item is None else item[1])
+                    if not any(first <= record[0] <= last
+                               for first, last in intervals)]
+                   for item in (snapshot_item, target_item)]
+        if outside[0] != outside[1]:
+            raise ValueError(
+                f"version records of product {product!r} outside the plan "
+                f"ranges must be identical in both snapshots")
+
+    checked = []
+    any_conflict = False
+    for (product, batch_min, batch_max, _action_count,
+         base, _target, raw_target) in operations:
+        current_json = _ranges_result_to_json(_delivery_range_result(
+            snapshot_products, product, batch_min, batch_max))
+        if current_json == raw_target:
+            status = "unchanged"
+        elif current_json == _ranges_result_to_json(base):
+            status = "applied"
+        else:
+            status = "conflict"
+            any_conflict = True
+        checked.append([product, batch_min, batch_max, status,
+                        current_json, raw_target])
+
+    results = []
+    for (product, batch_min, batch_max, status, current_json,
+         raw_target) in checked:
+        if any_conflict:
+            if status == "conflict":
+                reason = "mismatch"
+            else:
+                status = "aborted"
+                reason = "conflict"
+            state = current_json
+        else:
+            reason = ""
+            state = raw_target
+        results.append([product, batch_min, batch_max, status, reason,
+                        state])
+
+    final_snapshot = snapshot if any_conflict else target
+    results_text = json.dumps(results, ensure_ascii=False,
+                              separators=(",", ":"), allow_nan=False)
+    return ("{\"snapshot\":" + final_snapshot + ",\"results\":"
+            + results_text + ",\"committed\":"
+            + ("false" if any_conflict else "true") + "}")
+
+
 def update_delivery_snapshot(snapshot: str, changes: str,
                              receipts: str) -> str:
     """Apply new delivery changes and receipts to a delivery snapshot.
