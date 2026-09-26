@@ -9962,3 +9962,138 @@ def query_delivery_snapshot(snapshot: str, product: str) -> tuple | None:
         if item[0] == product:
             return _snapshot_to_tuples(item)
     return None
+
+
+def update_delivery_snapshot(snapshot: str, changes: str,
+                             receipts: str) -> str:
+    """Update a delivery snapshot with newly merged changes and receipts.
+
+    ``snapshot`` must be a ``str`` byte-for-byte matching the canonical
+    output of :func:`build_delivery_snapshot`, ``changes`` a ``str``
+    byte-for-byte matching the canonical output of
+    :func:`merge_delivery_manifests` and ``receipts`` a ``str``
+    byte-for-byte matching the canonical output of
+    :func:`merge_delivery_receipts`.
+
+    The snapshot's old versions and the new changes are unioned by
+    ``(product, batch)``: a key present on both sides must agree on its
+    ``version`` and ``passed`` flag, and a product must never reuse a
+    version across two of its batches. Each product's versions are then
+    re-sorted by ascending ``batch`` and every ``previous`` is recomputed
+    (``null`` for the first batch and the preceding version otherwise).
+
+    Every product named by the new receipts must occur in the union and
+    its receipt ``current`` must equal the product's final (greatest
+    batch) version; such a receipt, with its ``product`` field removed,
+    replaces any receipt the snapshot previously held for that product.
+    A product absent from the new receipts keeps its old receipt only
+    when that receipt's ``current`` still equals the product's final
+    version, and otherwise gets ``null``.
+
+    Returns a canonical compact snapshot document with exactly the same
+    byte-for-byte contract as :func:`build_delivery_snapshot`: products
+    sorted lexicographically by name, each product the array
+    ``[product, versions, gaps, receipt]`` with ``gaps`` recomputed as
+    the missing batch numbers from ``0`` through the greatest batch
+    compressed into maximal closed intervals, and ``ready`` true exactly
+    when every product has no gaps, a passing final change and a
+    ``publish`` receipt whose final status is ``succeeded`` (an empty
+    product set yielding ``true``). Integers are decimal, the four
+    failure metrics use exactly six decimal places (negative zero
+    written as ``0.000000``), ``NaN``/``Infinity`` never appear and the
+    output has no whitespace or trailing newline. The inputs are never
+    modified and repeated calls return a byte-identical document.
+
+    :raises TypeError: ``snapshot``, ``changes`` or ``receipts`` is not a
+        ``str``.
+    :raises ValueError: one of the documents is not its canonical
+        encoding, a ``(product, batch)`` key carries conflicting
+        version/passed values, a product reuses a version across
+        batches, a receipt names a product absent from the union, or a
+        receipt's ``current`` does not match the product's final
+        version.
+    """
+    if not isinstance(snapshot, str):
+        raise TypeError("snapshot must be a str")
+    if not isinstance(changes, str):
+        raise TypeError("changes must be a str")
+    if not isinstance(receipts, str):
+        raise TypeError("receipts must be a str")
+
+    old_products, _old_ready = _decode_delivery_snapshot(snapshot)
+    decoded_changes, _changes_releasable = _decode_delivery_changes(changes)
+    merged_receipts = _decode_merged_receipts(receipts)
+
+    # Union the snapshot's versions with the new changes by
+    # (product, batch); each entry maps batch -> [version, passed].
+    batches_by_product = {}
+    for product, versions, _gaps, _receipt in old_products:
+        batches_by_product[product] = {
+            version[0]: [version[2], version[3]] for version in versions
+        }
+    for batch, product, _previous, version, passed, _failures in (
+            decoded_changes):
+        entries = batches_by_product.setdefault(product, {})
+        value = [version, passed]
+        existing = entries.get(batch)
+        if existing is not None and existing != value:
+            raise ValueError(
+                f"conflicting (product, batch) entries: "
+                f"{(product, batch)!r}"
+            )
+        entries.setdefault(batch, value)
+
+    products = []
+    for product in sorted(batches_by_product):
+        versions = []
+        seen_versions = set()
+        for batch in sorted(batches_by_product[product]):
+            version, passed = batches_by_product[product][batch]
+            if version in seen_versions:
+                raise ValueError(f"version {version!r} is reused by product "
+                                 f"{product!r}")
+            seen_versions.add(version)
+            versions.append([batch, None, version, passed])
+        # Recompute previous from the merged batch history: null for the
+        # first batch and the preceding batch's version thereafter.
+        previous = None
+        for row in versions:
+            row[1] = previous
+            previous = row[2]
+        products.append([product, versions])
+
+    new_receipts = {row[0]: row[1:] for row in merged_receipts}
+    old_receipts = {item[0]: item[3] for item in old_products
+                    if item[3] is not None}
+
+    output_products = []
+    for product, versions in products:
+        gaps = _delivery_gaps([version[0] for version in versions])
+        final_version = versions[-1][2]
+        if product in new_receipts:
+            receipt = new_receipts.pop(product)
+            if receipt[1] != final_version:
+                raise ValueError(
+                    f"receipt current {receipt[1]!r} for product "
+                    f"{product!r} must equal its final change version "
+                    f"{final_version!r}"
+                )
+        else:
+            old_receipt = old_receipts.get(product)
+            if old_receipt is not None and old_receipt[1] == final_version:
+                receipt = old_receipt
+            else:
+                receipt = None
+        output_products.append([product, versions, gaps, receipt])
+
+    if new_receipts:
+        product = next(iter(new_receipts))
+        raise ValueError(f"unknown receipt product {product!r}")
+
+    ready = all(
+        not gaps and receipt is not None and versions[-1][3]
+        and receipt[0] == "publish" and receipt[5] == "succeeded"
+        for _product, versions, gaps, receipt in output_products
+    )
+    return _format_delivery_snapshot(output_products, ready)
+
