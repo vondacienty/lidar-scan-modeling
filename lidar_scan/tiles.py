@@ -8313,6 +8313,66 @@ def merge_delivery_manifests(manifests: tuple) -> str:
     return _format_delivery_changes(changes, releasable)
 
 
+def _decode_failure_window(raw_window) -> list:
+    """Validate one ``[level, ix_min, iy_min, ix_max, iy_max, R]`` window.
+
+    Returns ``[level, ix_min, iy_min, ix_max, iy_max, summary]`` with
+    ``summary`` ``None`` or ``[emin, emax, rmse, amean, n]`` whose metrics
+    are finite Decimals.
+
+    :raises ValueError: the window shape or values are bad.
+    """
+    if not isinstance(raw_window, list) or len(raw_window) != 6:
+        raise ValueError("each change failure must be an array of six "
+                         "values")
+    for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                            "iy_max"), raw_window[:5]):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"change failure {name} must be a "
+                             "non-bool integer")
+    level, ix_min, iy_min, ix_max, iy_max = raw_window[:5]
+    if level < 0:
+        raise ValueError("change failure level must be non-negative")
+    if ix_min > ix_max or iy_min > iy_max:
+        raise ValueError("change failure bounds must satisfy "
+                         "ix_min <= ix_max and iy_min <= iy_max")
+
+    raw_summary = raw_window[5]
+    summary = None
+    if raw_summary is not None:
+        if not isinstance(raw_summary, list) or len(raw_summary) != 5:
+            raise ValueError("each change failure R must be null or "
+                             "an array of five values")
+        metrics_raw = list(raw_summary[:4])
+        match_count = raw_summary[4]
+        for name, value in zip(("emin", "emax", "rmse", "amean"),
+                               metrics_raw):
+            if isinstance(value, bool) or not isinstance(value,
+                                                         (int,
+                                                          Decimal)):
+                raise ValueError(f"change failure {name} must be a "
+                                 "number")
+        metrics = [Decimal(value) for value in metrics_raw]
+        for name, value in zip(("emin", "emax", "rmse", "amean"),
+                               metrics):
+            if not value.is_finite():
+                raise ValueError(f"change failure {name} must be "
+                                 "finite")
+        if isinstance(match_count, bool) or not isinstance(
+                match_count, int):
+            raise ValueError("change failure n must be a non-bool "
+                             "integer")
+        if match_count < 1:
+            raise ValueError("change failure n must be a positive "
+                             "integer")
+        if metrics[2] < 0 or metrics[3] < 0:
+            raise ValueError("change failure rmse and amean must be "
+                             "non-negative")
+        summary = [*metrics, match_count]
+
+    return [level, ix_min, iy_min, ix_max, iy_max, summary]
+
+
 def _decode_delivery_changes(text: str) -> tuple:
     """Parse and validate a canonical :func:`merge_delivery_manifests` string.
 
@@ -8393,55 +8453,7 @@ def _decode_delivery_changes(text: str) -> tuple:
 
         failures = []
         for raw_window in raw_failures:
-            if not isinstance(raw_window, list) or len(raw_window) != 6:
-                raise ValueError("each change failure must be an array of "
-                                 "six values")
-            for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
-                                    "iy_max"), raw_window[:5]):
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise ValueError(f"change failure {name} must be a "
-                                     "non-bool integer")
-            level, ix_min, iy_min, ix_max, iy_max = raw_window[:5]
-            if level < 0:
-                raise ValueError("change failure level must be non-negative")
-            if ix_min > ix_max or iy_min > iy_max:
-                raise ValueError("change failure bounds must satisfy "
-                                 "ix_min <= ix_max and iy_min <= iy_max")
-
-            raw_summary = raw_window[5]
-            summary = None
-            if raw_summary is not None:
-                if not isinstance(raw_summary, list) or len(raw_summary) != 5:
-                    raise ValueError("each change failure R must be null or "
-                                     "an array of five values")
-                metrics_raw = list(raw_summary[:4])
-                match_count = raw_summary[4]
-                for name, value in zip(("emin", "emax", "rmse", "amean"),
-                                       metrics_raw):
-                    if isinstance(value, bool) or not isinstance(value,
-                                                                 (int,
-                                                                  Decimal)):
-                        raise ValueError(f"change failure {name} must be a "
-                                         "number")
-                metrics = [Decimal(value) for value in metrics_raw]
-                for name, value in zip(("emin", "emax", "rmse", "amean"),
-                                       metrics):
-                    if not value.is_finite():
-                        raise ValueError(f"change failure {name} must be "
-                                         "finite")
-                if isinstance(match_count, bool) or not isinstance(
-                        match_count, int):
-                    raise ValueError("change failure n must be a non-bool "
-                                     "integer")
-                if match_count < 1:
-                    raise ValueError("change failure n must be a positive "
-                                     "integer")
-                if metrics[2] < 0 or metrics[3] < 0:
-                    raise ValueError("change failure rmse and amean must be "
-                                     "non-negative")
-                summary = [*metrics, match_count]
-
-            failures.append([level, ix_min, iy_min, ix_max, iy_max, summary])
+            failures.append(_decode_failure_window(raw_window))
 
         if passed and failures:
             raise ValueError("a passing change must have no failures")
@@ -8492,6 +8504,33 @@ def _decode_delivery_changes(text: str) -> tuple:
     return changes, releasable
 
 
+def _format_affected_failures(affected: list, failures: list) -> str:
+    """Serialize the ``affected`` batches and expanded failure windows."""
+    parts = ["[" + ",".join(str(batch) for batch in affected) + "],["]
+    for failure_index, (batch, version, level, ix_min, iy_min, ix_max,
+                        iy_max, summary) in enumerate(failures):
+        if failure_index:
+            parts.append(",")
+        parts.append("[" + str(batch) + "," + _json_string(version) + ",")
+        parts.append(",".join((str(level), str(ix_min), str(iy_min),
+                               str(ix_max), str(iy_max))))
+        parts.append(",")
+        if summary is None:
+            parts.append("null")
+        else:
+            emin, emax, rmse, amean, match_count = summary
+            parts.append("[")
+            parts.append(",".join((_format_decimal6(emin),
+                                   _format_decimal6(emax),
+                                   _format_decimal6(rmse),
+                                   _format_decimal6(amean),
+                                   str(match_count))))
+            parts.append("]")
+        parts.append("]")
+    parts.append("]")
+    return "".join(parts)
+
+
 def _format_audit_products(products: list) -> str:
     """Serialize per-product audit rows to the compact products array body."""
     parts = ["["]
@@ -8503,28 +8542,9 @@ def _format_audit_products(products: list) -> str:
                      + _json_string(current) + ",")
         parts.append("true," if passed else "false,")
         parts.append("null" if rollback is None else _json_string(rollback))
-        parts.append(",[" + ",".join(str(batch) for batch in affected) + "],[")
-        for failure_index, (batch, version, level, ix_min, iy_min, ix_max,
-                            iy_max, summary) in enumerate(failures):
-            if failure_index:
-                parts.append(",")
-            parts.append("[" + str(batch) + "," + _json_string(version) + ",")
-            parts.append(",".join((str(level), str(ix_min), str(iy_min),
-                                   str(ix_max), str(iy_max))))
-            parts.append(",")
-            if summary is None:
-                parts.append("null")
-            else:
-                emin, emax, rmse, amean, match_count = summary
-                parts.append("[")
-                parts.append(",".join((_format_decimal6(emin),
-                                       _format_decimal6(emax),
-                                       _format_decimal6(rmse),
-                                       _format_decimal6(amean),
-                                       str(match_count))))
-                parts.append("]")
-            parts.append("]")
-        parts.append("]]")
+        parts.append(",")
+        parts.append(_format_affected_failures(affected, failures))
+        parts.append("]")
     parts.append("]")
     return "".join(parts)
 
@@ -8622,3 +8642,236 @@ def audit_delivery_changes(changes: str) -> str:
                          failures_out])
 
     return _format_audit_delivery(products, releasable)
+
+
+def _decode_audit_failure(raw_failure) -> list:
+    """Validate one ``[batch, version, level, ..., R]`` audit failure row.
+
+    Returns the eight-value list with the window fields validated by
+    :func:`_decode_failure_window`.
+
+    :raises ValueError: the row shape or values are bad.
+    """
+    if not isinstance(raw_failure, list) or len(raw_failure) != 8:
+        raise ValueError("each product failure must be an array of eight "
+                         "values")
+    batch, version = raw_failure[:2]
+    if isinstance(batch, bool) or not isinstance(batch, int):
+        raise ValueError("product failure batch must be a non-bool integer")
+    if batch < 0:
+        raise ValueError("product failure batch must be non-negative")
+    if not isinstance(version, str):
+        raise ValueError("product failure version must be a str")
+    if not version or not set(version) <= _DELIVERY_IDENT_CHARS:
+        raise ValueError(
+            "product failure version must be non-empty and contain only "
+            "ASCII alphanumeric characters and ._-"
+        )
+    return [batch, version] + _decode_failure_window(raw_failure[2:])
+
+
+def _decode_audit_delivery(text: str) -> tuple:
+    """Parse and validate a canonical :func:`audit_delivery_changes` string.
+
+    Returns ``(products, releasable)`` where ``products`` is a list of
+    ``[product, current, passed, rollback, affected, failures]`` rows in
+    document order, with ``affected`` a list of batch integers and
+    ``failures`` a list of ``[batch, version, level, ix_min, iy_min,
+    ix_max, iy_max, R]`` rows.
+
+    Beyond JSON, shape and canonical-format checks, the audit contract is
+    revalidated: products are sorted uniquely by product name; a passing
+    row carries a null rollback and empty affected and failures; a failing
+    row carries at least one affected batch and one failure, affected
+    batches ascend strictly, failure rows are ordered by batch and their
+    batches are exactly the affected ones; and the top-level ``releasable``
+    is the logical AND of the product passed flags (an empty product set
+    being ``true``).
+
+    :raises ValueError: the JSON syntax or shape is bad, a value violates
+        the audit contract, the text is not the canonical audit encoding,
+        or the top-level ``releasable`` flag is inconsistent.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("audit is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"products",
+                                                           "releasable"}:
+        raise ValueError("audit top-level value must be an object with "
+                         "only 'products' and 'releasable'")
+    raw_products = document["products"]
+    if not isinstance(raw_products, list):
+        raise ValueError("'products' must be an array")
+    releasable = document["releasable"]
+    if not isinstance(releasable, bool):
+        raise ValueError("'releasable' must be a boolean")
+
+    products = []
+    for raw_product in raw_products:
+        if not isinstance(raw_product, list) or len(raw_product) != 6:
+            raise ValueError("each product must be an array of six values")
+        product, current, passed, rollback, raw_affected, raw_failures = (
+            raw_product)
+        if not isinstance(product, str):
+            raise ValueError("product name must be a str")
+        if not product or not set(product) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "product name must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+        if not isinstance(current, str):
+            raise ValueError("product current must be a str")
+        if not current or not set(current) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "product current must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+        if not isinstance(passed, bool):
+            raise ValueError("product passed flag must be a boolean")
+        if rollback is not None and not isinstance(rollback, str):
+            raise ValueError("product rollback must be null or a str")
+        if rollback is not None and (
+                not rollback or not set(rollback) <= _DELIVERY_IDENT_CHARS):
+            raise ValueError(
+                "product rollback must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+        if not isinstance(raw_affected, list):
+            raise ValueError("product affected must be an array")
+        affected = []
+        for batch in raw_affected:
+            if isinstance(batch, bool) or not isinstance(batch, int):
+                raise ValueError("product affected batches must be non-bool "
+                                 "integers")
+            if batch < 0:
+                raise ValueError("product affected batches must be "
+                                 "non-negative")
+            affected.append(batch)
+        if any(affected[index] >= affected[index + 1]
+               for index in range(len(affected) - 1)):
+            raise ValueError("product affected batches must be strictly "
+                             "ascending")
+        if not isinstance(raw_failures, list):
+            raise ValueError("product failures must be an array")
+        failures = [_decode_audit_failure(raw_failure)
+                    for raw_failure in raw_failures]
+
+        if passed:
+            if rollback is not None or affected or failures:
+                raise ValueError("a passing product must have a null "
+                                 "rollback and empty affected and failures")
+        else:
+            if not affected or not failures:
+                raise ValueError("a failing product must list an affected "
+                                 "batch and a failure")
+            failure_batches = [failure[0] for failure in failures]
+            if any(failure_batches[index] > failure_batches[index + 1]
+                   for index in range(len(failure_batches) - 1)):
+                raise ValueError("product failures must be ordered by "
+                                 "batch")
+            if sorted(set(failure_batches)) != affected:
+                raise ValueError("product failure batches must be exactly "
+                                 "the affected batches")
+
+        products.append([product, current, passed, rollback, affected,
+                         failures])
+
+    names = [row[0] for row in products]
+    if any(names[index] >= names[index + 1]
+           for index in range(len(names) - 1)):
+        raise ValueError("products must be sorted uniquely by product name")
+
+    if releasable != all(row[2] for row in products):
+        raise ValueError("'releasable' must equal the logical AND of the "
+                         "product passed flags")
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal metric formatting, negative zero as
+    # anything but ``0.000000``, leading zeros, exponents and any other
+    # non-canonical spelling.
+    if _format_audit_delivery(products, releasable) != text:
+        raise ValueError("audit is not the canonical audit delivery "
+                         "encoding")
+    return products, releasable
+
+
+def _format_plan_operations(operations: list) -> str:
+    """Serialize delivery-plan operations to the compact operations body."""
+    parts = ["["]
+    for index, (product, action, current, target, affected,
+                failures) in enumerate(operations):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(product) + ","
+                     + _json_string(action) + ","
+                     + _json_string(current) + ",")
+        parts.append("null" if target is None else _json_string(target))
+        parts.append(",")
+        parts.append(_format_affected_failures(affected, failures))
+        parts.append("]")
+    parts.append("]")
+    return "".join(parts)
+
+
+def _format_delivery_plan(operations: list, releasable: bool) -> str:
+    """Serialize delivery operations to the two-key plan document."""
+    return ('{"operations":' + _format_plan_operations(operations)
+            + ',"releasable":' + ("true}" if releasable else "false}"))
+
+
+def build_delivery_plan(audit: str) -> str:
+    """Build a delivery plan from an audited delivery document.
+
+    ``audit`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`audit_delivery_changes`: the compact document whose sole
+    top-level keys are ``products`` and ``releasable`` in that order, with
+    product rows ``[product, current, passed, rollback, affected,
+    failures]`` sorted uniquely by product name, a passing row carrying a
+    null rollback and empty affected and failures, a failing row's failure
+    batches covering exactly its affected batches in batch order, and
+    ``releasable`` equal to the logical AND of the product passed flags.
+
+    Returns a canonical compact JSON document with exactly the two keys
+    ``operations`` and ``releasable`` in that order. Operations follow the
+    audit's product order and each operation is ``[product, action,
+    current, target, affected, failures]``. A passing product yields a
+    ``publish`` operation whose ``target`` is its ``current`` version and
+    whose ``affected`` and ``failures`` are empty. A failing product with
+    a non-null rollback version yields a ``rollback`` operation targeting
+    that version; a failing product without one yields a ``block``
+    operation with a null ``target``. Failing operations keep the audit
+    row's ``affected`` and ``failures`` verbatim. The top-level
+    ``releasable`` echoes the audit document's flag. Integers are decimal,
+    the four metrics use exactly six decimal places (negative zero written
+    as ``0.000000``), ``NaN``/``Infinity`` never appear and the output has
+    no whitespace or trailing newline.
+
+    :raises TypeError: ``audit`` is not a ``str``.
+    :raises ValueError: the document's JSON syntax, structure, values,
+        product order, row field association, ``releasable`` flag or
+        numeric formatting are bad, or it is not the canonical audit
+        encoding.
+    """
+    if not isinstance(audit, str):
+        raise TypeError("audit must be a str")
+
+    products, releasable = _decode_audit_delivery(audit)
+
+    operations = []
+    for product, current, passed, rollback, affected, failures in products:
+        if passed:
+            operations.append([product, "publish", current, current, [],
+                               []])
+        elif rollback is not None:
+            operations.append([product, "rollback", current, rollback,
+                               affected, failures])
+        else:
+            operations.append([product, "block", current, None, affected,
+                               failures])
+
+    return _format_delivery_plan(operations, releasable)
