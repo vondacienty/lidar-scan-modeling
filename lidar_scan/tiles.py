@@ -11700,23 +11700,9 @@ def apply_delivery_checkout(log: str, current: str, plan: str) -> str:
     if not isinstance(plan, str):
         raise TypeError("plan must be a str")
 
-    try:
-        plan_node = _parse_json_node(plan, _skip_json_ws(plan, 0))
-    except ValueError as exc:
-        raise ValueError(f"plan is not a valid JSON document ({exc})") \
-            from exc
-    if _skip_json_ws(plan, plan_node[2]) != len(plan):
-        raise ValueError("plan has trailing data after the JSON document")
-    plan_top = plan_node[0]
-    if not isinstance(plan_top, dict) or list(plan_top) != [
-            "source", "target", "direction", "steps", "snapshot"]:
-        raise ValueError("plan must be a JSON object with exactly the "
-                         'keys "source", "target", "direction", "steps" '
-                         'and "snapshot"')
+    plan_top = _parse_checkout_plan(plan)
     source = plan_top["source"][0]
     target = plan_top["target"][0]
-    if not isinstance(source, str) or not isinstance(target, str):
-        raise ValueError("plan source and target must be strings")
 
     decoded = _decode_commit_log(log)
     recomputed = _build_checkout_plan(decoded, source, target)
@@ -11742,3 +11728,143 @@ def apply_delivery_checkout(log: str, current: str, plan: str) -> str:
             + _json_string(target) + ',"direction":'
             + _json_string(direction) + ',"status":'
             + _json_string(status) + ',"snapshot":' + target_snapshot + "}")
+
+
+def _parse_checkout_plan(plan: str):
+    """Parse a checkout plan document into its top-level node mapping.
+
+    Returns the mapping of the plan's top-level keys to their JSON nodes.
+    Raises ``ValueError`` on malformed JSON, trailing data or a top-level
+    shape other than exactly ``source``, ``target``, ``direction``,
+    ``steps`` and ``snapshot`` with string ``source``/``target``.
+    """
+    try:
+        plan_node = _parse_json_node(plan, _skip_json_ws(plan, 0))
+    except ValueError as exc:
+        raise ValueError(f"plan is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(plan, plan_node[2]) != len(plan):
+        raise ValueError("plan has trailing data after the JSON document")
+    plan_top = plan_node[0]
+    if not isinstance(plan_top, dict) or list(plan_top) != [
+            "source", "target", "direction", "steps", "snapshot"]:
+        raise ValueError("plan must be a JSON object with exactly the "
+                         'keys "source", "target", "direction", "steps" '
+                         'and "snapshot"')
+    if not isinstance(plan_top["source"][0], str) \
+            or not isinstance(plan_top["target"][0], str):
+        raise ValueError("plan source and target must be strings")
+    return plan_top
+
+
+def apply_delivery_checkouts(log: str, current: str, plans: tuple) -> str:
+    """Validate and atomically apply a batch of planned delivery checkouts.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log`, ``current`` a ``str`` byte-for-byte matching
+    the canonical output of :func:`build_delivery_snapshot`, and ``plans``
+    a non-empty ``tuple`` whose items are each a ``str`` byte-for-byte
+    matching the canonical output of :func:`plan_delivery_checkout`. The
+    whole log chain is recomputed and validated, then every plan is
+    recomputed from its ``source`` and ``target`` commits and required to
+    match byte-for-byte.
+
+    The plans must chain: each plan's ``target`` must equal the next
+    plan's ``source``, and no commit id may appear in the ``steps`` of
+    more than one plan (nor twice within one plan).
+
+    When every precheck passes the batch is applied atomically: when
+    ``current`` equals the last plan's ``target`` snapshot nothing is
+    applied and ``status`` is ``"unchanged"``; when ``current`` equals the
+    first plan's ``source`` snapshot every planned step is applied and
+    ``status`` is ``"applied"``. Any other snapshot is stale or
+    conflicting with the batch and raises :class:`ValueError`.
+
+    Returns the canonical compact JSON document
+    ``{"source":...,"target":...,"status":...,"plans":[...],
+    "snapshot":...}`` with exactly these five top-level keys in that
+    order. ``source`` and ``target`` are the first plan's ``source`` and
+    the last plan's ``target``; ``plans`` lists, in input order, one
+    ``[source, target, direction, step_count]`` row per plan with
+    ``step_count`` the length of that plan's ``steps``; the final
+    ``snapshot`` embeds the last plan's ``target`` canonical snapshot.
+    The output uses ``ensure_ascii=False``, no whitespace and no trailing
+    newline; the inputs are never modified and repeated calls return a
+    byte-identical document.
+
+    :raises TypeError: ``log`` or ``current`` is not a ``str``, ``plans``
+        is not a ``tuple``, or a plan is not a ``str``.
+    :raises ValueError: ``plans`` is empty, a document is not its
+        canonical encoding, the log chain or a recomputed result does not
+        match, a recomputed plan does not byte-for-byte equal the given
+        plan, adjacent plans do not chain, a commit id repeats across the
+        planned steps, or ``current`` is neither the first source nor the
+        last target snapshot of the batch.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(current, str):
+        raise TypeError("current must be a str")
+    if not isinstance(plans, tuple):
+        raise TypeError("plans must be a tuple")
+    for plan in plans:
+        if not isinstance(plan, str):
+            raise TypeError("each plan must be a str")
+    if not plans:
+        raise ValueError("plans must not be empty")
+
+    decoded = _decode_commit_log(log)
+    index_by_id = {row[0]: position for position, row in enumerate(decoded)}
+
+    summaries = []
+    seen_step_ids = set()
+    previous_target = None
+    for plan in plans:
+        plan_top = _parse_checkout_plan(plan)
+        source = plan_top["source"][0]
+        target = plan_top["target"][0]
+        recomputed = _build_checkout_plan(decoded, source, target)
+        if recomputed != plan:
+            raise ValueError("plan does not match the checkout plan "
+                             "recomputed from the log")
+        if previous_target is not None and source != previous_target:
+            raise ValueError("each plan's source must equal the previous "
+                             "plan's target")
+        previous_target = target
+        steps = plan_top["steps"][0]
+        for step in steps:
+            step_id = step[0][0][0]
+            if step_id in seen_step_ids:
+                raise ValueError(f"commit id {step_id!r} appears in the "
+                                 "steps of more than one plan")
+            seen_step_ids.add(step_id)
+        summaries.append((source, target, plan_top["direction"][0],
+                          len(steps)))
+
+    _decode_delivery_snapshot(current)
+
+    first_source = summaries[0][0]
+    last_target = summaries[-1][1]
+    target_snapshot = decoded[index_by_id[last_target]][5]
+    source_snapshot = decoded[index_by_id[first_source]][5]
+    if current == target_snapshot:
+        status = "unchanged"
+    elif current == source_snapshot:
+        status = "applied"
+    else:
+        raise ValueError("current snapshot is neither the first source "
+                         "nor the last target snapshot of the batch")
+
+    parts = ['{"source":' + _json_string(first_source),
+             ',"target":' + _json_string(last_target),
+             ',"status":' + _json_string(status), ',"plans":[']
+    for index, (source, target, direction, step_count) \
+            in enumerate(summaries):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(source) + ","
+                     + _json_string(target) + ","
+                     + _json_string(direction) + ","
+                     + str(step_count) + "]")
+    parts.append('],"snapshot":' + target_snapshot + "}")
+    return "".join(parts)
