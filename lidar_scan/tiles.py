@@ -8311,3 +8311,301 @@ def merge_delivery_manifests(manifests: tuple) -> str:
 
     releasable = all(final_passed.values())
     return _format_delivery_changes(changes, releasable)
+
+
+def _decode_delivery_changes(text: str) -> list:
+    """Parse and validate a canonical :func:`merge_delivery_manifests` string.
+
+    Returns a pair ``(changes, releasable)`` where ``changes`` is a list of
+    ``[batch, product, previous, version, passed, failures]`` where
+    ``previous`` is ``None`` or a version string and ``failures`` is a list of
+    ``[level, ix_min, iy_min, ix_max, iy_max, R]`` (``R`` is ``None`` or
+    ``[emin, emax, rmse, amean, n]``), in changes order, and ``releasable``
+    is the document's echoed top-level flag.
+
+    :raises ValueError: the JSON syntax or shape is bad, a value violates the
+        changes contract, the changes are not sorted uniquely by
+        ``(batch, product)``, a product reuses a version or misstates
+        ``previous``, the text is not the canonical changes encoding, or the
+        top-level ``releasable`` does not equal the logical AND of each
+        product's final flag (an empty change set being ``true``).
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("changes document is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"changes",
+                                                           "releasable"}:
+        raise ValueError("changes top-level value must be an object with "
+                         "only 'changes' and 'releasable'")
+    raw_changes = document["changes"]
+    if not isinstance(raw_changes, list):
+        raise ValueError("document 'changes' must be an array")
+    releasable = document["releasable"]
+    if not isinstance(releasable, bool):
+        raise ValueError("document 'releasable' must be a boolean")
+
+    changes = []
+    for raw_change in raw_changes:
+        if not isinstance(raw_change, list) or len(raw_change) != 6:
+            raise ValueError("each change must be an array of six values")
+        batch, product, previous, version, passed, raw_failures = raw_change
+        if isinstance(batch, bool) or not isinstance(batch, int):
+            raise ValueError("change batch must be a non-bool integer")
+        if batch < 0:
+            raise ValueError("change batch must be non-negative")
+        if not isinstance(product, str):
+            raise ValueError("change product must be a str")
+        if not product or not set(product) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "change product must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+        if previous is not None:
+            if not isinstance(previous, str) or not previous or (
+                    not set(previous) <= _DELIVERY_IDENT_CHARS):
+                raise ValueError(
+                    "change previous must be null or a non-empty version "
+                    "string containing only ASCII alphanumeric characters "
+                    "and ._-"
+                )
+        if not isinstance(version, str):
+            raise ValueError("change version must be a str")
+        if not version or not set(version) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "change version must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+        if not isinstance(passed, bool):
+            raise ValueError("change passed flag must be a boolean")
+        if not isinstance(raw_failures, list) or len(raw_failures) > 6:
+            raise ValueError("change failures must be an array of at most "
+                             "six windows")
+
+        failures = []
+        for raw_window in raw_failures:
+            if not isinstance(raw_window, list) or len(raw_window) != 6:
+                raise ValueError("each change failure must be an array of "
+                                 "six values")
+            for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                    "iy_max"), raw_window[:5]):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(f"change failure {name} must be a "
+                                     "non-bool integer")
+            level, ix_min, iy_min, ix_max, iy_max = raw_window[:5]
+            if level < 0:
+                raise ValueError("change failure level must be non-negative")
+            if ix_min > ix_max or iy_min > iy_max:
+                raise ValueError("change failure bounds must satisfy "
+                                 "ix_min <= ix_max and iy_min <= iy_max")
+
+            raw_summary = raw_window[5]
+            summary = None
+            if raw_summary is not None:
+                if not isinstance(raw_summary, list) or len(raw_summary) != 5:
+                    raise ValueError("each change failure R must be null or "
+                                     "an array of five values")
+                metrics_raw = list(raw_summary[:4])
+                match_count = raw_summary[4]
+                for name, value in zip(("emin", "emax", "rmse", "amean"),
+                                       metrics_raw):
+                    if isinstance(value, bool) or not isinstance(value,
+                                                                 (int,
+                                                                  Decimal)):
+                        raise ValueError(f"change failure {name} must be a "
+                                         "number")
+                metrics = [Decimal(value) for value in metrics_raw]
+                for name, value in zip(("emin", "emax", "rmse", "amean"),
+                                       metrics):
+                    if not value.is_finite():
+                        raise ValueError(f"change failure {name} must be "
+                                         "finite")
+                if isinstance(match_count, bool) or not isinstance(
+                        match_count, int):
+                    raise ValueError("change failure n must be a non-bool "
+                                     "integer")
+                if match_count < 1:
+                    raise ValueError("change failure n must be a positive "
+                                     "integer")
+                if metrics[2] < 0 or metrics[3] < 0:
+                    raise ValueError("change failure rmse and amean must be "
+                                     "non-negative")
+                summary = [*metrics, match_count]
+
+            failures.append([level, ix_min, iy_min, ix_max, iy_max, summary])
+
+        if passed and failures:
+            raise ValueError("a passing change must have no failures")
+        if not passed and not failures:
+            raise ValueError("a failing change must list a failure")
+
+        changes.append([batch, product, previous, version, passed, failures])
+
+    # Changes must appear strictly ascending by (batch, product); a
+    # byte-for-byte re-encode alone would tolerate reordering.
+    keys = [(change[0], change[1]) for change in changes]
+    if any(keys[index] >= keys[index + 1]
+           for index in range(len(keys) - 1)):
+        raise ValueError("changes must be sorted uniquely by (batch, "
+                         "product)")
+
+    # A product's version must never repeat and previous must name the
+    # version of its preceding batch (null for its first batch).
+    versions_by_product = {}
+    previous_by_product = {}
+    final_passed = {}
+    for change in changes:
+        batch, product, previous, version, passed = change[:5]
+        if version in versions_by_product.setdefault(product, set()):
+            raise ValueError(f"version {version!r} is reused by product "
+                             f"{product!r}")
+        versions_by_product[product].add(version)
+        if previous != previous_by_product.get(product):
+            raise ValueError("change previous must be the version of the "
+                             "product's preceding batch")
+        previous_by_product[product] = version
+        # Changes are (batch, product)-sorted, so the last write per product
+        # is its greatest batch and hence its final passed flag.
+        final_passed[product] = passed
+
+    # Byte-for-byte canonical equality also checks the top-level releasable
+    # flag (the AND of the final flags) and rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal metric formatting, negative zero as
+    # anything but ``0.000000``, leading zeros, exponents and any other
+    # non-canonical spelling.
+    expected_releasable = all(final_passed.values())
+    # Byte-for-byte canonical equality also checks the top-level releasable
+    # flag (the AND of the final flags) and rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal metric formatting, negative zero as
+    # anything but ``0.000000``, leading zeros, exponents and any other
+    # non-canonical spelling.
+    if _format_delivery_changes(changes,
+                                expected_releasable) != text:
+        raise ValueError("document is not the canonical delivery-changes "
+                         "encoding")
+    return changes, releasable
+
+
+def _format_audit_products(products: list, releasable: bool) -> str:
+    """Serialize per-product audit rows to the two-key audit document."""
+    parts = ['{"products":[']
+    for index, (product, current, passed, rollback, affected,
+                rows) in enumerate(products):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(product) + ","
+                     + _json_string(current) + ",")
+        parts.append("true," if passed else "false,")
+        parts.append("null" if rollback is None else _json_string(rollback))
+        parts.append(",[")
+        for affected_index, batch in enumerate(affected):
+            if affected_index:
+                parts.append(",")
+            parts.append(str(batch))
+        parts.append("],[")
+        for row_index, (batch, version, level, ix_min, iy_min, ix_max,
+                        iy_max, summary) in enumerate(rows):
+            if row_index:
+                parts.append(",")
+            parts.append("[")
+            parts.append(",".join((str(batch), _json_string(version),
+                                   str(level), str(ix_min), str(iy_min),
+                                   str(ix_max), str(iy_max))))
+            parts.append(",")
+            if summary is None:
+                parts.append("null")
+            else:
+                emin, emax, rmse, amean, match_count = summary
+                parts.append("[")
+                parts.append(",".join((_format_decimal6(emin),
+                                       _format_decimal6(emax),
+                                       _format_decimal6(rmse),
+                                       _format_decimal6(amean),
+                                       str(match_count))))
+                parts.append("]")
+            parts.append("]")
+        parts.append("]]")
+    parts.append('],"releasable":')
+    parts.append("true}" if releasable else "false}")
+    return "".join(parts)
+
+
+def audit_delivery_changes(changes: str) -> str:
+    """Audit a canonical delivery-changes document per product.
+
+    ``changes`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`merge_delivery_manifests`: the compact document with keys
+    ``changes`` and ``releasable``, whose changes are
+    ``[batch, product, previous, version, passed, failures]`` arrays sorted
+    by ``(batch, product)`` with ``failures`` preserved in source window
+    order. It is decoded, structurally validated and re-encoded byte for byte.
+
+    Returns a canonical compact JSON document with exactly the two keys
+    ``products`` and ``releasable`` in that order. Products are sorted by
+    ``product`` and each product row is the array
+    ``[product, current, passed, rollback, affected, failures]``.
+    ``current`` and ``passed`` come from the product's last change (its
+    greatest batch). When that change passes, ``rollback`` is ``null`` and
+    ``affected`` and ``failures`` are both empty. When it fails, ``rollback``
+    is the version of the nearest preceding passing change, or ``null`` when
+    the product has never passed; ``affected`` lists the failing batches
+    after that nearest passing change (every failing batch when there is no
+    preceding pass), and ``failures`` flattens those batches' failure windows
+    by batch and source window order as
+    ``[batch, version, level, ix_min, iy_min, ix_max, iy_max, R]`` arrays,
+    with ``R`` preserved verbatim (``null`` or
+    ``[emin, emax, rmse, amean, n]``). ``releasable`` echoes the input
+    document's value. Integers are decimal, the four metrics use exactly six
+    decimal places (negative zero written as ``0.000000``),
+    ``NaN``/``Infinity`` never appear and the output has no whitespace or
+    trailing newline.
+
+    :raises TypeError: ``changes`` is not a ``str``.
+    :raises ValueError: ``changes`` is not a canonical delivery-changes
+        document.
+    """
+    if not isinstance(changes, str):
+        raise TypeError("changes must be a str")
+
+    decoded, releasable = _decode_delivery_changes(changes)
+
+    by_product = {}
+    for change in decoded:
+        batch, product, previous, version, passed, failures = change
+        by_product.setdefault(product, []).append(
+            (batch, version, passed, failures))
+
+    products = []
+    for product in sorted(by_product):
+        history = by_product[product]
+        current = history[-1][1]
+        passed = history[-1][2]
+        if passed:
+            products.append((product, current, True, None, [], []))
+            continue
+
+        # Locate the nearest preceding passing change (greatest batch below
+        # the final batch whose flag is true); -1 when the product has never
+        # passed. The final change fails, so the tail after it contains only
+        # failing changes; with no preceding pass, the tail is the whole
+        # history.
+        cutoff = len(history) - 2
+        while cutoff >= 0 and not history[cutoff][2]:
+            cutoff -= 1
+        rollback = history[cutoff][1] if cutoff >= 0 else None
+        tail = history[cutoff + 1:]
+
+        affected = [entry[0] for entry in tail]
+        rows = []
+        for failed_batch, failed_version, _, failed_windows in tail:
+            for level, ix_min, iy_min, ix_max, iy_max, summary in (
+                    failed_windows):
+                rows.append([failed_batch, failed_version, level, ix_min,
+                             iy_min, ix_max, iy_max, summary])
+        products.append((product, current, False, rollback, affected, rows))
+
+    return _format_audit_products(products, releasable)
