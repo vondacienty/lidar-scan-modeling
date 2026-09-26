@@ -12561,3 +12561,397 @@ def plan_checkout_recovery(log: str, checkpoint, ledgers: tuple) -> str:
     parts.append("null" if snapshot is None else snapshot)
     parts.append("}")
     return "".join(parts)
+
+
+def _parse_checkout_recovery_units(text: str, array_nodes: list,
+                                   label: str) -> list:
+    """Parse ``missing``/``pending`` ``[range, audit]`` pairs from a plan.
+
+    Each node is validated into a ``(range_row, audit_segment)`` unit with
+    ``range_row`` a ``(first_id, last_id, batch_count, before, after)``
+    tuple (``before``/``after`` raw canonical snapshot documents) and
+    ``audit_segment`` a tuple of ``(id, status)`` rows. Consecutive units
+    must chain through the ``before``/``after`` boundary and batch ids
+    must not repeat within the array.
+    """
+    units = []
+    previous_after = None
+    seen = set()
+    for pair_node in array_nodes:
+        pair = pair_node[0]
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValueError(f"each {label} entry must be a [range, audit] "
+                             "pair")
+        range_children = pair[0][0]
+        audit_children = pair[1][0]
+        if not isinstance(range_children, list) or len(range_children) != 5:
+            raise ValueError("each recovery range must be a five-item array "
+                             "[first_id, last_id, batch_count, before, "
+                             "after]")
+        first_id = range_children[0][0]
+        last_id = range_children[1][0]
+        batch_count = range_children[2][0]
+        if not isinstance(first_id, str) or not isinstance(last_id, str):
+            raise ValueError("recovery range first and last ids must be str")
+        if isinstance(batch_count, bool) or not isinstance(batch_count, int) \
+                or batch_count < 1:
+            raise ValueError("recovery range batch count must be a positive "
+                             "integer")
+        if not isinstance(range_children[3][0], dict) \
+                or not isinstance(range_children[4][0], dict):
+            raise ValueError("recovery range before and after must be JSON "
+                             "objects")
+        before = text[range_children[3][1]:range_children[3][2]]
+        after = text[range_children[4][1]:range_children[4][2]]
+        _decode_delivery_snapshot(before)
+        _decode_delivery_snapshot(after)
+        if previous_after is not None and before != previous_after:
+            raise ValueError("a recovery range's before does not equal the "
+                             "previous range's after")
+        if not isinstance(audit_children, list):
+            raise ValueError(f"the {label} audit value must be an array")
+        segment = []
+        for audit_row_node in audit_children:
+            row = audit_row_node[0]
+            if not isinstance(row, list) or len(row) != 2:
+                raise ValueError("each recovery audit row must be a two-item "
+                                 "array [id, status]")
+            batch_id = row[0][0]
+            status = row[1][0]
+            if not isinstance(batch_id, str) or not isinstance(status, str):
+                raise ValueError("recovery audit id and status must be str")
+            if _COMMIT_ID_RE.fullmatch(batch_id) is None:
+                raise ValueError(f"invalid batch id {batch_id!r}")
+            if status not in ("applied", "unchanged"):
+                raise ValueError(f"invalid audit status {status!r}")
+            if batch_id in seen:
+                raise ValueError(f"duplicate batch id {batch_id!r}")
+            seen.add(batch_id)
+            segment.append((batch_id, status))
+        if len(segment) != batch_count or segment[0][0] != first_id \
+                or segment[-1][0] != last_id:
+            raise ValueError(f"the {label} audit segment does not match its "
+                             "range")
+        previous_after = after
+        units.append(((first_id, last_id, batch_count, before, after),
+                      tuple(segment)))
+    return units
+
+
+def _decode_checkout_recovery_plan(text: str) -> tuple:
+    """Parse and validate a canonical :func:`plan_checkout_recovery` plan.
+
+    Returns ``(common, missing, pending, snapshot)`` with ``missing`` and
+    ``pending`` lists of ``(range_row, audit_segment)`` units and
+    ``snapshot`` ``None`` or the raw terminal snapshot document.
+
+    :raises ValueError: the document is malformed or not its canonical
+        encoding, a snapshot is not the canonical snapshot encoding, the
+        ranges contradict their audit segments or do not chain, or the
+        terminal snapshot does not match the trailing range.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"plan is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("plan has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "common", "missing", "pending", "snapshot"]:
+        raise ValueError("plan must be a JSON object with exactly the keys "
+                         '"common", "missing", "pending" and "snapshot"')
+    common = top["common"][0]
+    if isinstance(common, bool) or not isinstance(common, int) or common < 0:
+        raise ValueError("plan common must be a non-negative integer")
+    missing_nodes = top["missing"][0]
+    pending_nodes = top["pending"][0]
+    if not isinstance(missing_nodes, list) or not isinstance(pending_nodes,
+                                                             list):
+        raise ValueError('plan "missing" and "pending" must be arrays')
+    missing = _parse_checkout_recovery_units(text, missing_nodes, "missing")
+    pending = _parse_checkout_recovery_units(text, pending_nodes, "pending")
+    snapshot_node = top["snapshot"]
+    if snapshot_node[0] is None:
+        snapshot = None
+    elif isinstance(snapshot_node[0], dict):
+        snapshot = text[snapshot_node[1]:snapshot_node[2]]
+        _decode_delivery_snapshot(snapshot)
+    else:
+        raise ValueError('plan "snapshot" must be null or a JSON object')
+    trailing = pending[-1][0][4] if pending else (
+        missing[-1][0][4] if missing else None)
+    if (pending or missing) and snapshot != trailing:
+        raise ValueError('plan "snapshot" must equal the terminal range\'s '
+                         "after")
+    parts = ['{"common":', str(common), ',"missing":[']
+    parts.append(_format_checkout_recovery_units(missing))
+    parts.append('],"pending":[')
+    parts.append(_format_checkout_recovery_units(pending))
+    parts.append('],"snapshot":')
+    parts.append("null" if snapshot is None else snapshot)
+    parts.append("}")
+    if "".join(parts) != text:
+        raise ValueError("plan is not its canonical encoding")
+    return common, missing, pending, snapshot
+
+
+def _format_checkout_recovery_record(unit: tuple) -> str:
+    """Format one confirmation record ``[range..., audit]`` (six items)."""
+    (first_id, last_id, batch_count, before, after), segment = unit
+    parts = ["[", _json_string(first_id), ",", _json_string(last_id), ",",
+             str(batch_count), ",", before, ",", after, ",["]
+    parts.append(",".join(_checkout_audit_row_text(row) for row in segment))
+    parts.append("]]")
+    return "".join(parts)
+
+
+def _format_checkout_recovery_state(common: int, direction: str,
+                                    confirmed: int, records: list,
+                                    snapshot, complete: bool) -> str:
+    """Serialize an execute_checkout_recovery state document."""
+    parts = ['{"common":', str(common), ',"direction":',
+             _json_string(direction), ',"confirmed":', str(confirmed),
+             ',"records":[']
+    parts.append(",".join(_format_checkout_recovery_record(unit)
+                          for unit in records))
+    parts.append('],"snapshot":')
+    parts.append("null" if snapshot is None else snapshot)
+    parts.append(',"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
+
+
+def _decode_checkout_recovery_state(text: str, common: int, direction: str,
+                                    units: list, plan_snapshot) -> tuple:
+    """Validate a previous ``execute_checkout_recovery`` state document.
+
+    ``direction`` is the plan's active recovery arm (``"pending"``,
+    ``"missing"`` or ``"none"``) and ``units`` that arm's units. The
+    state must be canonical and a confirmation prefix of ``units``: its
+    ``records`` must equal the first ``confirmed`` units and its
+    ``direction``, ``snapshot`` and ``complete`` fields must agree with
+    the plan and that prefix. Returns ``(confirmed, records, snapshot)``
+    with ``snapshot`` ``None`` or the raw snapshot document.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"state is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("state has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "common", "direction", "confirmed", "records", "snapshot",
+            "complete"]:
+        raise ValueError("state must be a JSON object with exactly the keys "
+                         '"common", "direction", "confirmed", "records", '
+                         '"snapshot" and "complete"')
+    state_common = top["common"][0]
+    if isinstance(state_common, bool) or not isinstance(state_common, int) \
+            or state_common != common:
+        raise ValueError('state "common" must equal the plan common prefix')
+    state_direction = top["direction"][0]
+    if state_direction not in ("pending", "missing", "none"):
+        raise ValueError('state "direction" must be "pending", "missing" or '
+                         '"none"')
+    confirmed = top["confirmed"][0]
+    if isinstance(confirmed, bool) or not isinstance(confirmed, int) \
+            or confirmed < 0 or confirmed > len(units):
+        raise ValueError('state "confirmed" must be between zero and the '
+                         "number of units to confirm")
+    record_nodes = top["records"][0]
+    if not isinstance(record_nodes, list) or len(record_nodes) != confirmed:
+        raise ValueError('state "records" must hold one record per confirmed '
+                         "unit")
+    records = []
+    previous_after = None
+    for index, record_node in enumerate(record_nodes):
+        children = record_node[0]
+        if not isinstance(children, list) or len(children) != 6:
+            raise ValueError("each recovery record must be a six-item array "
+                             "[first_id, last_id, batch_count, before, after, "
+                             "audit]")
+        first_id = children[0][0]
+        last_id = children[1][0]
+        batch_count = children[2][0]
+        if not isinstance(first_id, str) or not isinstance(last_id, str):
+            raise ValueError("recovery record first and last ids must be str")
+        if isinstance(batch_count, bool) or not isinstance(batch_count, int) \
+                or batch_count < 1:
+            raise ValueError("recovery record batch count must be a positive "
+                             "integer")
+        if not isinstance(children[3][0], dict) \
+                or not isinstance(children[4][0], dict):
+            raise ValueError("recovery record before and after must be JSON "
+                             "objects")
+        before = text[children[3][1]:children[3][2]]
+        after = text[children[4][1]:children[4][2]]
+        _decode_delivery_snapshot(before)
+        _decode_delivery_snapshot(after)
+        if previous_after is not None and before != previous_after:
+            raise ValueError("a recovery record's before does not equal the "
+                             "previous record's after")
+        audit_children = children[5][0]
+        if not isinstance(audit_children, list):
+            raise ValueError("state record audit must be an array")
+        segment = []
+        seen = set()
+        for audit_row_node in audit_children:
+            row = audit_row_node[0]
+            if not isinstance(row, list) or len(row) != 2:
+                raise ValueError("each recovery audit row must be a two-item "
+                                 "array [id, status]")
+            batch_id = row[0][0]
+            status = row[1][0]
+            if not isinstance(batch_id, str) or not isinstance(status, str):
+                raise ValueError("recovery audit id and status must be str")
+            if _COMMIT_ID_RE.fullmatch(batch_id) is None:
+                raise ValueError(f"invalid batch id {batch_id!r}")
+            if status not in ("applied", "unchanged"):
+                raise ValueError(f"invalid audit status {status!r}")
+            if batch_id in seen:
+                raise ValueError(f"duplicate batch id {batch_id!r}")
+            seen.add(batch_id)
+            segment.append((batch_id, status))
+        if len(segment) != batch_count or segment[0][0] != first_id \
+                or segment[-1][0] != last_id:
+            raise ValueError("the state record audit does not match its "
+                             "range")
+        candidate = ((first_id, last_id, batch_count, before, after),
+                     tuple(segment))
+        if candidate != units[index]:
+            raise ValueError('state "records" must be a confirmation prefix '
+                             "of the plan's remaining units")
+        previous_after = after
+        records.append(candidate)
+    snapshot_node = top["snapshot"]
+    if snapshot_node[0] is None:
+        snapshot = None
+    elif isinstance(snapshot_node[0], dict):
+        snapshot = text[snapshot_node[1]:snapshot_node[2]]
+        _decode_delivery_snapshot(snapshot)
+    else:
+        raise ValueError('state "snapshot" must be null or a JSON object')
+    if confirmed:
+        expected_snapshot = records[-1][0][4]
+    elif units:
+        expected_snapshot = units[0][0][3]
+    else:
+        expected_snapshot = plan_snapshot
+    if snapshot != expected_snapshot:
+        raise ValueError('state "snapshot" does not match the confirmed '
+                         "prefix")
+    if state_direction != direction:
+        raise ValueError('state "direction" does not match the plan')
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('state "complete" must be a boolean')
+    terminal_snapshot = units[-1][0][4] if units else plan_snapshot
+    expected_complete = confirmed == len(units) \
+        and snapshot == terminal_snapshot
+    if complete != expected_complete:
+        raise ValueError('state "complete" does not match the confirmed '
+                         "prefix")
+    canonical = _format_checkout_recovery_state(
+        common, direction, confirmed, records, snapshot, complete)
+    if canonical != text:
+        raise ValueError("state is not its canonical encoding")
+    return confirmed, records, snapshot
+
+
+def execute_checkout_recovery(plan: str, state=None, max_units=None) -> str:
+    """Confirm recovery units of a :func:`plan_checkout_recovery` plan.
+
+    ``plan`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`plan_checkout_recovery`. ``state`` must be either ``None``
+    (no unit confirmed yet) or a ``str`` byte-for-byte matching a previous
+    output of this function for the same plan; its ``records`` must be a
+    confirmation prefix of the plan's remaining units. ``max_units`` must
+    be either ``None`` (confirm every remaining unit) or a non-bool
+    non-negative ``int`` bounding the number of units newly confirmed by
+    this call.
+
+    A canonical plan always leaves exactly one of ``missing`` and
+    ``pending`` empty; a plan document where both are non-empty describes
+    forked histories and is rejected. The non-empty arm is the active
+    arm: the pending rows are committed in order, or when the plan only
+    has missing rows those rows are re-applied in order. Confirmation
+    starts after the state's confirmed prefix and adds up to
+    ``max_units`` units (when given).
+
+    Returns the canonical compact JSON document with exactly the six
+    top-level keys ``common``, ``direction``, ``confirmed``, ``records``,
+    ``snapshot`` and ``complete`` in that order. ``common`` echoes the
+    plan. ``direction`` is ``"pending"`` when the plan has pending units,
+    ``"missing"`` when it only has missing units and ``"none"`` when both
+    sides are empty. ``confirmed`` is the cumulative number of active-arm
+    units confirmed. ``records`` is the confirmed prefix, each record a
+    six-item array ``[first_id, last_id, batch_count, before, after,
+    audit]`` with ``before``/``after`` embedded as snapshot objects and
+    ``audit`` the unit's ``[id, status]`` rows. ``snapshot`` is the last
+    record's ``after`` when at least one unit is confirmed, the first
+    remaining unit's ``before`` when nothing has been confirmed but work
+    remains, and the plan's ``snapshot`` when there is no remaining work.
+    ``complete`` is true exactly when every unit of the active arm is
+    confirmed and ``snapshot`` byte-for-byte equals the plan's
+    ``snapshot``. The output uses ``ensure_ascii=False``, no whitespace
+    and no trailing newline; feeding a completed state back in returns a
+    byte-identical document.
+
+    :raises TypeError: ``plan`` is not a ``str``, ``state`` is neither
+        ``None`` nor a ``str``, or ``max_units`` is neither ``None`` nor
+        a non-bool ``int``.
+    :raises ValueError: the plan or state is malformed or not its
+        canonical encoding, the plan's ``missing`` and ``pending`` are
+        both non-empty, ``max_units`` is negative, or the state is not a
+        confirmation prefix of the plan's remaining units. No partial
+        state is produced.
+    """
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if state is not None and not isinstance(state, str):
+        raise TypeError("state must be None or a str")
+    if max_units is not None:
+        if isinstance(max_units, bool) or not isinstance(max_units, int):
+            raise TypeError("max_units must be None or a non-bool int")
+        if max_units < 0:
+            raise ValueError("max_units must be non-negative")
+    common, missing, pending, plan_snapshot = \
+        _decode_checkout_recovery_plan(plan)
+    if missing and pending:
+        raise ValueError("the plan forks: both missing and pending units "
+                         "remain")
+    if pending:
+        direction = "pending"
+        units = pending
+    elif missing:
+        direction = "missing"
+        units = missing
+    else:
+        direction = "none"
+        units = []
+    if state is None:
+        confirmed = 0
+    else:
+        confirmed, _records, _state_snapshot = \
+            _decode_checkout_recovery_state(
+                state, common, direction, units, plan_snapshot)
+    if max_units is None:
+        target = len(units)
+    else:
+        target = min(len(units), confirmed + max_units)
+    records = units[:target]
+    if target:
+        snapshot = units[target - 1][0][4]
+    elif units:
+        snapshot = units[0][0][3]
+    else:
+        snapshot = plan_snapshot
+    complete = target == len(units) and snapshot == (
+        units[-1][0][4] if units else plan_snapshot)
+    return _format_checkout_recovery_state(
+        common, direction, target, records, snapshot, complete)
