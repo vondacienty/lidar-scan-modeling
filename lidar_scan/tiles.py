@@ -13572,3 +13572,474 @@ def build_recovery_history(plan: str, summaries: tuple) -> str:
     parts.append("true" if complete else "false")
     parts.append("}")
     return "".join(parts)
+
+
+def _decode_recovery_history(text: str, common: int, direction: str,
+                             start_snapshot, units: list,
+                             plan_snapshot) -> tuple:
+    """Validate a canonical :func:`build_recovery_history` document.
+
+    The history must describe the recovery plan identified by ``common``,
+    ``direction``, ``start_snapshot`` and ``units`` (with
+    ``plan_snapshot`` ``None`` or the plan's raw terminal snapshot).
+
+    Returns ``(runs, audit_rows, end_snapshot, resume_state)`` with
+    ``runs`` a tuple of ``(confirmed, end, complete)`` triples (``end``
+    ``None`` or the raw embedded snapshot), ``audit_rows`` a tuple of
+    ``(id, status)`` rows in document order, ``end_snapshot`` ``None`` or
+    the raw ``end`` document, and ``resume_state`` ``None`` when complete
+    or otherwise the raw embedded canonical
+    :func:`execute_checkout_recovery` state document.
+
+    :raises ValueError: the JSON or shape is bad, a value violates the
+        history contract, the direction or start does not match the plan,
+        the runs or audit rows do not follow the plan, a batch id
+        repeats, or the text is not its canonical encoding.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"history is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("history has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "direction", "start", "end", "runs", "audit", "resume",
+            "complete"]:
+        raise ValueError("history must be a JSON object with exactly the "
+                         'keys "direction", "start", "end", "runs", '
+                         '"audit", "resume" and "complete"')
+    history_direction = top["direction"][0]
+    if history_direction != direction:
+        raise ValueError('history "direction" does not match the plan')
+
+    def _raw_snapshot(key):
+        snapshot_node = top[key]
+        if snapshot_node[0] is None:
+            return None
+        if isinstance(snapshot_node[0], dict):
+            raw = text[snapshot_node[1]:snapshot_node[2]]
+            _decode_delivery_snapshot(raw)
+            return raw
+        raise ValueError(f'history "{key}" must be null or a JSON object')
+
+    history_start = _raw_snapshot("start")
+    if history_start != start_snapshot:
+        raise ValueError('history "start" does not match the plan')
+    history_end = _raw_snapshot("end")
+
+    run_nodes = top["runs"][0]
+    if not isinstance(run_nodes, list):
+        raise ValueError('history "runs" must be an array')
+    runs = []
+    previous_target = 0
+    target = 0
+    for run_node in run_nodes:
+        children = run_node[0]
+        if not isinstance(children, list) or len(children) != 3:
+            raise ValueError("each history run must be a three-item array "
+                             "[confirmed, end, complete]")
+        confirmed = children[0][0]
+        if isinstance(confirmed, bool) or not isinstance(confirmed, int) \
+                or confirmed < 0 or confirmed > len(units) \
+                or (runs and confirmed <= previous_target):
+            raise ValueError("history run confirmed count must strictly "
+                             "advance between zero and the number of plan "
+                             "units")
+        run_end_node = children[1]
+        if run_end_node[0] is None:
+            run_end = None
+        elif isinstance(run_end_node[0], dict):
+            run_end = text[run_end_node[1]:run_end_node[2]]
+            _decode_delivery_snapshot(run_end)
+        else:
+            raise ValueError("history run end must be null or a JSON object")
+        run_complete = children[2][0]
+        if not isinstance(run_complete, bool):
+            raise ValueError("history run complete must be a boolean")
+        if run_end != (units[confirmed - 1][0][4] if confirmed
+                       else start_snapshot):
+            raise ValueError('history run "end" does not match its confirmed '
+                             "prefix")
+        if run_complete != (confirmed == len(units)):
+            raise ValueError('history run "complete" does not match its '
+                             "confirmed prefix")
+        runs.append((confirmed, run_end, run_complete))
+        target = confirmed
+        previous_target = confirmed
+
+    audit_node = top["audit"][0]
+    if not isinstance(audit_node, list):
+        raise ValueError('history "audit" must be an array')
+    expected_audit = []
+    for unit in units[:target]:
+        expected_audit.extend(unit[1])
+    audit_rows = []
+    seen_ids = set()
+    for row_node in audit_node:
+        row = row_node[0]
+        if not isinstance(row, list) or len(row) != 2:
+            raise ValueError("each history audit row must be a two-item "
+                             "array [id, status]")
+        batch_id = row[0][0]
+        status = row[1][0]
+        if not isinstance(batch_id, str) or not isinstance(status, str):
+            raise ValueError("history audit id and status must be str")
+        if _COMMIT_ID_RE.fullmatch(batch_id) is None:
+            raise ValueError(f"invalid batch id {batch_id!r}")
+        if status not in ("applied", "unchanged"):
+            raise ValueError(f"invalid audit status {status!r}")
+        if batch_id in seen_ids:
+            raise ValueError(f"duplicate batch id {batch_id!r}")
+        seen_ids.add(batch_id)
+        audit_rows.append((batch_id, status))
+    if tuple(audit_rows) != tuple(expected_audit):
+        raise ValueError('history "audit" must list the confirmed plan '
+                         "units' batch rows in order")
+
+    resume_node = top["resume"]
+    if resume_node[0] is None:
+        resume_state = None
+    elif isinstance(resume_node[0], dict):
+        resume_state = text[resume_node[1]:resume_node[2]]
+    else:
+        raise ValueError('history "resume" must be null or a JSON object')
+    complete = target == len(units)
+    if bool(resume_state is None) != complete:
+        raise ValueError('history "resume" must be null exactly when the '
+                         "history is complete")
+    if not complete:
+        records = units[:target]
+        if target:
+            resume_snapshot = units[target - 1][0][4]
+        elif units:
+            resume_snapshot = units[0][0][3]
+        else:
+            resume_snapshot = plan_snapshot
+        _decode_checkout_recovery_state(
+            resume_state, common, direction, units, plan_snapshot)
+        expected_resume = _format_checkout_recovery_state(
+            common, direction, target, records, resume_snapshot, False)
+        if resume_state != expected_resume:
+            raise ValueError('history "resume" must be the canonical '
+                             "execute_checkout_recovery state at the "
+                             "confirmed prefix")
+    expected_end = runs[-1][1] if runs else start_snapshot
+    if history_end != expected_end:
+        raise ValueError('history "end" does not match the last run')
+    history_complete = top["complete"][0]
+    if not isinstance(history_complete, bool) \
+            or history_complete != complete:
+        raise ValueError('history "complete" does not match the confirmed '
+                         "prefix")
+
+    parts = ['{"direction":', _json_string(direction), ',"start":',
+             "null" if start_snapshot is None else start_snapshot, ',"end":',
+             "null" if history_end is None else history_end, ',"runs":[']
+    run_text = []
+    for run_confirmed, run_end, run_complete in runs:
+        run_text.append("[" + str(run_confirmed) + ","
+                        + ("null" if run_end is None else run_end) + ","
+                        + ("true" if run_complete else "false") + "]")
+    parts.append(",".join(run_text))
+    parts.append('],"audit":[')
+    parts.append(",".join(_checkout_audit_row_text(row)
+                          for row in audit_rows))
+    parts.append('],"resume":')
+    parts.append("null" if resume_state is None else resume_state)
+    parts.append(',"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    if "".join(parts) != text:
+        raise ValueError("history is not its canonical encoding")
+    return tuple(runs), tuple(audit_rows), history_end, resume_state
+
+
+def _recovery_plan_view(plan_text: str) -> tuple:
+    """Decode a recovery plan into its active-arm validation view.
+
+    Returns ``(common, direction, units, start_snapshot, plan_snapshot)``
+    with ``direction`` ``"pending"``, ``"missing"`` or ``"none"`` and
+    ``start_snapshot`` the first active unit's ``before`` snapshot,
+    otherwise the plan's terminal snapshot (possibly ``None``).
+    """
+    common, missing, pending, plan_snapshot = \
+        _decode_checkout_recovery_plan(plan_text)
+    if missing and pending:
+        raise ValueError("the plan forks: both missing and pending units "
+                         "remain")
+    if pending:
+        direction = "pending"
+        units = pending
+    elif missing:
+        direction = "missing"
+        units = missing
+    else:
+        direction = "none"
+        units = []
+    start_snapshot = units[0][0][3] if units else plan_snapshot
+    return common, direction, units, start_snapshot, plan_snapshot
+
+
+def _history_node_text(text: str, key: str) -> str:
+    """Return the raw embedded object text for one history top-level key."""
+    node = _parse_json_node(text, _skip_json_ws(text, 0))
+    value_node = node[0][key]
+    return text[value_node[1]:value_node[2]]
+
+
+def _history_audit_rows(text: str) -> tuple:
+    """Return a history document's ``(id, status)`` audit rows."""
+    node = _parse_json_node(text, _skip_json_ws(text, 0))
+    return tuple((row_node[0][0][0], row_node[0][1][0])
+                 for row_node in node[0]["audit"][0])
+
+
+def _history_run_texts(text: str) -> tuple:
+    """Return the raw element texts of a history document's ``runs``."""
+    node = _parse_json_node(text, _skip_json_ws(text, 0))
+    return tuple(text[run_node[1]:run_node[2]]
+                 for run_node in node[0]["runs"][0])
+
+
+def update_recovery_index(index, items: tuple) -> str:
+    """Fold ``(plan, history)`` recovery pairs into a recovery index.
+
+    ``index`` is either ``None`` (no entries yet) or a ``str``
+    byte-for-byte matching a previous canonical output of this function.
+    ``items`` must be a ``tuple`` whose items are each a two-item
+    ``(plan, history)`` tuple of ``str`` values; ``plan`` must be a
+    canonical :func:`plan_checkout_recovery` document and ``history`` the
+    canonical :func:`build_recovery_history` output for that same plan.
+
+    The pairs are validated in tuple order. Every pair except the final
+    one must carry a complete history; the final pair may be in progress,
+    in which case its ``end`` is the index snapshot and its ``resume``
+    state names the next unit to confirm. Consecutive pairs must chain:
+    the first active unit's ``before`` snapshot of every plan after the
+    first must byte-for-byte equal the previous history's ``end``, and
+    batch ids must be unique across every history audit in the index.
+    When the previous index ends with an incomplete entry, the first pair
+    must use that same plan and its history must keep the entry's
+    ``runs`` and ``audit`` prefix while strictly extending both,
+    replacing the entry; an already complete entry can never be replaced.
+    An empty ``items`` tuple leaves an existing index unchanged.
+
+    Returns the canonical compact JSON document with exactly the four
+    top-level keys ``entries``, ``snapshot``, ``resume`` and ``complete``
+    in that order. ``entries`` preserves pair order, each entry a
+    two-item array embedding the plan object and the history object in
+    that order. ``snapshot`` is the last history's ``end`` embedded byte
+    for byte, or ``null`` with no entries. ``resume`` is
+    ``[position, state]`` with ``position`` the zero-based index of the
+    last entry and ``state`` that history's embedded
+    :func:`execute_checkout_recovery` resume state when the last history
+    is incomplete, and otherwise ``null``. ``complete`` is true only for
+    an empty index or when the last entry is complete. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline; the
+    inputs are never modified and repeated calls return a byte-identical
+    document.
+
+    :raises TypeError: ``index`` is neither ``None`` nor a ``str``,
+        ``items`` is not a ``tuple``, an item is not a two-item tuple, or
+        a plan or history is not a ``str``.
+    :raises ValueError: the index, a plan or a history document is
+        malformed or not its canonical encoding, a history does not match
+        its plan, a non-last history is incomplete, an already complete
+        entry would be replaced, an incomplete entry is not replaced by a
+        strict extension of the same plan, consecutive pairs do not
+        chain, or a batch id repeats globally.
+    """
+    if index is not None and not isinstance(index, str):
+        raise TypeError("index must be None or a str")
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+
+    entries = []
+    if index is not None:
+        try:
+            node = _parse_json_node(index, _skip_json_ws(index, 0))
+        except ValueError as exc:
+            raise ValueError(f"index is not a valid JSON document ({exc})") \
+                from exc
+        if _skip_json_ws(index, node[2]) != len(index):
+            raise ValueError("index has trailing data after the JSON "
+                             "document")
+        top = node[0]
+        if not isinstance(top, dict) or list(top) != [
+                "entries", "snapshot", "resume", "complete"]:
+            raise ValueError("index must be a JSON object with exactly the "
+                             'keys "entries", "snapshot", "resume" and '
+                             '"complete"')
+        entry_nodes = top["entries"][0]
+        if not isinstance(entry_nodes, list):
+            raise ValueError('index "entries" must be an array')
+        stored_starts = []
+        for entry_node in entry_nodes:
+            pair = entry_node[0]
+            if not isinstance(pair, list) or len(pair) != 2 \
+                    or not isinstance(pair[0][0], dict) \
+                    or not isinstance(pair[1][0], dict):
+                raise ValueError("each index entry must be a [plan, "
+                                 "history] pair of JSON objects")
+            plan_text = index[pair[0][1]:pair[0][2]]
+            history_text = index[pair[1][1]:pair[1][2]]
+            _common, _direction, _units, start_snapshot, _plan_snapshot = \
+                _recovery_plan_view(plan_text)
+            _decode_recovery_history(
+                history_text, _common, _direction, start_snapshot, _units,
+                _plan_snapshot)
+            entries.append([plan_text, history_text])
+            stored_starts.append(
+                "null" if start_snapshot is None else start_snapshot)
+        for _stored_plan, stored_history in entries[:-1]:
+            if '"resume":null' not in stored_history:
+                raise ValueError("every index entry except the last must "
+                                 "hold a complete history")
+        for stored_position in range(1, len(entries)):
+            previous_end = _history_node_text(
+                entries[stored_position - 1][1], "end")
+            if stored_starts[stored_position] != previous_end:
+                raise ValueError("each index plan after the first must "
+                                 "start at the previous history's end")
+        snapshot_node = top["snapshot"]
+        if snapshot_node[0] is None:
+            index_snapshot = None
+        elif isinstance(snapshot_node[0], dict):
+            index_snapshot = index[snapshot_node[1]:snapshot_node[2]]
+            _decode_delivery_snapshot(index_snapshot)
+        else:
+            raise ValueError('index "snapshot" must be null or a JSON '
+                             "object")
+        expected_snapshot = _history_node_text(entries[-1][1], "end") \
+            if entries else "null"
+        if ("null" if index_snapshot is None else index_snapshot) \
+                != expected_snapshot:
+            raise ValueError('index "snapshot" does not match its last '
+                             "entry")
+        resume_node = top["resume"]
+        if resume_node[0] is None:
+            if entries and '"resume":null' not in entries[-1][1]:
+                raise ValueError('index "resume" must embed the last '
+                                 "history's resume state")
+        else:
+            if not isinstance(resume_node[0], list) or len(resume_node[0]) != 2:
+                raise ValueError('index "resume" must be null or a '
+                                 "[position, state] pair")
+            children = resume_node[0]
+            resume_position = children[0][0]
+            if isinstance(resume_position, bool) \
+                    or not isinstance(resume_position, int) \
+                    or resume_position != len(entries) - 1 \
+                    or not isinstance(children[1][0], dict):
+                raise ValueError('index "resume" position must name the '
+                                 "last entry and embed a state object")
+            state_text = index[children[1][1]:children[1][2]]
+            if not entries or state_text != _history_node_text(
+                    entries[-1][1], "resume"):
+                raise ValueError('index "resume" state must equal the last '
+                                 "history's resume")
+        complete_node = top["complete"][0]
+        if not isinstance(complete_node, bool):
+            raise ValueError('index "complete" must be a boolean')
+        expected_complete = not entries or '"resume":null' in entries[-1][1]
+        if complete_node != expected_complete:
+            raise ValueError('index "complete" does not match its last '
+                             "entry")
+        canonical_entries = ",".join(
+            "[" + plan_text + "," + history_text + "]"
+            for plan_text, history_text in entries)
+        canonical = ('{"entries":[' + canonical_entries + '],"snapshot":'
+                     + expected_snapshot + ',"resume":')
+        if resume_node[0] is None:
+            canonical += "null"
+        else:
+            canonical += index[resume_node[1]:resume_node[2]]
+        canonical += ',"complete":' + ("true" if expected_complete else
+                                       "false") + "}"
+        if canonical != index:
+            raise ValueError("index is not its canonical encoding")
+
+    for item in items:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise TypeError("each item must be a (plan, history) tuple")
+        plan_text, history_text = item
+        if not isinstance(plan_text, str) or not isinstance(history_text, str):
+            raise TypeError("each item's plan and history must be a str")
+        common, direction, units, start_snapshot, plan_snapshot = \
+            _recovery_plan_view(plan_text)
+        _decode_recovery_history(
+            history_text, common, direction, start_snapshot, units,
+            plan_snapshot)
+        if entries:
+            previous_plan, previous_history = entries[-1]
+            previous_complete = '"resume":null' in previous_history
+            if plan_text == previous_plan:
+                if previous_complete:
+                    raise ValueError("an already complete index entry cannot "
+                                     "be replaced")
+            if not previous_complete:
+                if plan_text != previous_plan:
+                    raise ValueError("an incomplete index entry can only be "
+                                     "replaced by a history of the same plan")
+                previous_runs = _history_run_texts(previous_history)
+                new_runs = _history_run_texts(history_text)
+                if len(new_runs) <= len(previous_runs) \
+                        or new_runs[:len(previous_runs)] != previous_runs:
+                    raise ValueError("the replacement history's runs must "
+                                     "strictly extend the entry's runs")
+                previous_audit = _history_audit_rows(previous_history)
+                new_audit = _history_audit_rows(history_text)
+                if len(new_audit) <= len(previous_audit) \
+                        or new_audit[:len(previous_audit)] \
+                        != previous_audit:
+                    raise ValueError("the replacement history's audit must "
+                                     "strictly extend the entry's audit")
+                entries[-1] = [plan_text, history_text]
+                continue
+            previous_end = _history_node_text(previous_history, "end")
+            later_start = "null" if start_snapshot is None else start_snapshot
+            if later_start != previous_end:
+                raise ValueError("each plan after the first must start at "
+                                 "the previous history's end")
+        entries.append([plan_text, history_text])
+
+    for pair in entries[:-1]:
+        if '"resume":null' not in pair[1]:
+            raise ValueError("every entry except the last must hold a "
+                             "complete history")
+
+    seen_ids = set()
+    for pair in entries:
+        for batch_id, _status in _history_audit_rows(pair[1]):
+            if batch_id in seen_ids:
+                raise ValueError(f"duplicate batch id {batch_id!r} across "
+                                 "the recovery index")
+            seen_ids.add(batch_id)
+
+    if entries:
+        last_history = entries[-1][1]
+        snapshot_text = _history_node_text(last_history, "end")
+        last_complete = '"resume":null' in last_history
+        if last_complete:
+            resume_text = "null"
+        else:
+            resume_text = "[" + str(len(entries) - 1) + "," \
+                + _history_node_text(last_history, "resume") + "]"
+    else:
+        snapshot_text = "null"
+        resume_text = "null"
+        last_complete = True
+
+    parts = ['{"entries":[']
+    parts.append(",".join("[" + plan_text + "," + history_text + "]"
+                          for plan_text, history_text in entries))
+    parts.append('],"snapshot":')
+    parts.append(snapshot_text)
+    parts.append(',"resume":')
+    parts.append(resume_text)
+    parts.append(',"complete":')
+    parts.append("true" if last_complete else "false")
+    parts.append("}")
+    return "".join(parts)
