@@ -12033,3 +12033,108 @@ def replay_checkout(log: str, text: str) -> str:
     parts.append(text[snapshot_node[1]:snapshot_node[2]])
     parts.append("}")
     return "".join(parts)
+
+
+def merge_checkout_logs(log: str, ledgers: tuple) -> str:
+    """Merge a batch of :func:`checkout_log` ledgers into one audit view.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log` and ``ledgers`` a ``tuple`` whose items are
+    each a ``str`` byte-for-byte matching the canonical output of
+    :func:`checkout_log`. Every ledger is re-verified with
+    :func:`replay_checkout` against ``log`` before it contributes to the
+    merge.
+
+    An empty ledger (one with no batches) produces no range and leaves
+    the snapshot boundary untouched. The batch ids of the non-empty
+    ledgers must be globally unique across the whole batch, and the first
+    batch's ``before`` of every non-empty ledger after the first must
+    byte-for-byte equal the previous non-empty ledger's ``snapshot``.
+
+    Returns the canonical compact JSON document with exactly the three
+    top-level keys ``ranges``, ``audit`` and ``snapshot`` in that order.
+    ``ranges`` preserves the input order of the non-empty ledgers, each
+    row being ``[first_id, last_id, batch_count, before, after]`` with
+    ``first_id``/``last_id`` the ledger's first and last batch ids,
+    ``batch_count`` its positive number of batches, ``before`` the first
+    batch's ``before`` and ``after`` the ledger's ``snapshot``, both
+    embedded as snapshot objects. ``audit`` lists, in global batch order,
+    one ``[id, status]`` row per batch with ``status`` the verified
+    result's ``"applied"`` or ``"unchanged"``. ``snapshot`` is ``null``
+    when no ledger is non-empty and otherwise the last non-empty
+    ledger's ``snapshot``. The output uses ``ensure_ascii=False``, no
+    whitespace and no trailing newline, and repeated calls return a
+    byte-identical document.
+
+    :raises TypeError: ``log`` or a ledger is not a ``str``, or
+        ``ledgers`` is not a ``tuple``.
+    :raises ValueError: a document is not its canonical encoding or
+        fails :func:`replay_checkout` re-verification, a batch id
+        repeats across the non-empty ledgers, or a non-empty ledger's
+        first ``before`` does not equal the previous non-empty ledger's
+        ``snapshot``.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(ledgers, tuple):
+        raise TypeError("ledgers must be a tuple")
+    for ledger in ledgers:
+        if not isinstance(ledger, str):
+            raise TypeError("each ledger must be a str")
+    _decode_commit_log(log)
+    ranges = []
+    audit_rows = []
+    seen = set()
+    previous_snapshot = None
+    snapshot = None
+    for ledger in ledgers:
+        replay_checkout(log, ledger)
+        node = _parse_json_node(ledger, _skip_json_ws(ledger, 0))
+        top = node[0]
+        batches = top["batches"][0]
+        if not batches:
+            continue
+        first_id = None
+        first_before = None
+        last_id = None
+        for row_node in batches:
+            row = row_node[0]
+            batch_id = row[0][0]
+            if batch_id in seen:
+                raise ValueError(f"duplicate batch id {batch_id!r} across "
+                                 "the ledgers")
+            seen.add(batch_id)
+            if first_id is None:
+                first_id = batch_id
+                first_before = ledger[row[1][1]:row[1][2]]
+            last_id = batch_id
+            audit_rows.append((batch_id, row[3][0]["status"][0]))
+        snapshot_node = top["snapshot"]
+        ledger_snapshot = ledger[snapshot_node[1]:snapshot_node[2]]
+        if previous_snapshot is not None \
+                and first_before != previous_snapshot:
+            raise ValueError(f"ledger starting at batch {first_id!r} must "
+                             "begin from the previous non-empty ledger's "
+                             "snapshot")
+        ranges.append((first_id, last_id, len(batches), first_before,
+                       ledger_snapshot))
+        previous_snapshot = ledger_snapshot
+        snapshot = ledger_snapshot
+    parts = ['{"ranges":[']
+    for index, (first_id, last_id, batch_count, before, after) \
+            in enumerate(ranges):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(first_id) + ","
+                     + _json_string(last_id) + "," + str(batch_count) + ","
+                     + before + "," + after + "]")
+    parts.append('],"audit":[')
+    for index, (batch_id, status) in enumerate(audit_rows):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(batch_id) + ","
+                     + _json_string(status) + "]")
+    parts.append('],"snapshot":')
+    parts.append("null" if snapshot is None else snapshot)
+    parts.append("}")
+    return "".join(parts)
