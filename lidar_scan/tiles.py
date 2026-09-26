@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Iterable
 from decimal import (Decimal, InvalidOperation, ROUND_FLOOR,
                      ROUND_HALF_EVEN, localcontext)
@@ -11245,3 +11246,298 @@ def update_delivery_snapshot(snapshot: str, changes: str,
 
     ready = all(flags)
     return _format_delivery_snapshot(products, ready)
+
+
+# ---------------------------------------------------------------------------
+# Delivery commit logs
+# ---------------------------------------------------------------------------
+
+_COMMIT_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+_JSON_NUMBER_RE = re.compile(
+    r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+
+_JSON_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f",
+                 "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _skip_json_ws(text: str, pos: int) -> int:
+    """Skip JSON insignificant whitespace from ``pos``."""
+    n = len(text)
+    while pos < n and text[pos] in " \t\n\r":
+        pos += 1
+    return pos
+
+
+def _parse_json_string(text: str, pos: int) -> tuple:
+    """Parse the JSON string at ``text[pos]``; return ``(value, end)``."""
+    n = len(text)
+    pos += 1
+    chars = []
+    while True:
+        if pos >= n:
+            raise ValueError("unterminated string in JSON input")
+        ch = text[pos]
+        if ch == '"':
+            return "".join(chars), pos + 1
+        if ch == "\\":
+            pos += 1
+            if pos >= n:
+                raise ValueError("unterminated escape in JSON input")
+            esc = text[pos]
+            if esc in _JSON_ESCAPES:
+                chars.append(_JSON_ESCAPES[esc])
+            elif esc == "u":
+                digits = text[pos + 1:pos + 5]
+                if len(digits) != 4 or any(
+                        c not in "0123456789abcdefABCDEF" for c in digits):
+                    raise ValueError("invalid \\u escape in JSON input")
+                chars.append(chr(int(digits, 16)))
+                pos += 4
+            else:
+                raise ValueError("invalid escape in JSON input")
+            pos += 1
+        elif ord(ch) < 0x20:
+            raise ValueError("unescaped control character in JSON input")
+        else:
+            chars.append(ch)
+            pos += 1
+
+
+def _parse_json_node(text: str, pos: int = 0) -> tuple:
+    """Parse one JSON value at ``text[pos]`` and keep its source span.
+
+    Returns ``(value, start, end)`` with the value's raw source text being
+    ``text[start:end]``; object values map each key to its child node and
+    array values hold child nodes, so any nested value's raw text can be
+    recovered. Raises ``ValueError`` on malformed JSON.
+    """
+    n = len(text)
+    if pos >= n:
+        raise ValueError("unexpected end of JSON input")
+    start = pos
+    ch = text[pos]
+    if ch == '"':
+        value, end = _parse_json_string(text, pos)
+        return value, start, end
+    if ch == "{":
+        pos += 1
+        obj = {}
+        pos = _skip_json_ws(text, pos)
+        if pos < n and text[pos] == "}":
+            return obj, start, pos + 1
+        while True:
+            pos = _skip_json_ws(text, pos)
+            if pos >= n or text[pos] != '"':
+                raise ValueError("JSON object keys must be strings")
+            key, pos = _parse_json_string(text, pos)
+            pos = _skip_json_ws(text, pos)
+            if pos >= n or text[pos] != ":":
+                raise ValueError("expected ':' in JSON object")
+            node = _parse_json_node(text, _skip_json_ws(text, pos + 1))
+            obj[key] = node
+            pos = _skip_json_ws(text, node[2])
+            if pos >= n:
+                raise ValueError("unterminated JSON object")
+            if text[pos] == ",":
+                pos += 1
+                continue
+            if text[pos] == "}":
+                return obj, start, pos + 1
+            raise ValueError("expected ',' or '}' in JSON object")
+    if ch == "[":
+        pos += 1
+        items = []
+        pos = _skip_json_ws(text, pos)
+        if pos < n and text[pos] == "]":
+            return items, start, pos + 1
+        while True:
+            node = _parse_json_node(text, _skip_json_ws(text, pos))
+            items.append(node)
+            pos = _skip_json_ws(text, node[2])
+            if pos >= n:
+                raise ValueError("unterminated JSON array")
+            if text[pos] == ",":
+                pos += 1
+                continue
+            if text[pos] == "]":
+                return items, start, pos + 1
+            raise ValueError("expected ',' or ']' in JSON array")
+    if text.startswith("true", pos):
+        return True, start, pos + 4
+    if text.startswith("false", pos):
+        return False, start, pos + 5
+    if text.startswith("null", pos):
+        return None, start, pos + 4
+    match = _JSON_NUMBER_RE.match(text, pos)
+    if match is None:
+        raise ValueError("invalid JSON value")
+    raw = match.group(0)
+    value = float(raw) if any(c in raw for c in ".eE") else int(raw)
+    return value, start, match.end()
+
+
+def _result_snapshot_text(result: str) -> str:
+    """Extract the raw ``snapshot`` document from a commit result."""
+    node = _parse_json_node(result, 0)
+    snapshot = node[0]["snapshot"]
+    return result[snapshot[1]:snapshot[2]]
+
+
+def delivery_log(entries: tuple) -> str:
+    """Build a commit log chaining :func:`commit_delivery_updates` results.
+
+    ``entries`` must be a ``tuple`` whose items are strictly five-item
+    tuples ``(id, parent, snapshot, target, plan)``. ``id`` must be a
+    unique ``str`` matching ``[A-Za-z0-9._-]+``; ``parent`` must be
+    ``None`` for the first entry and the previous entry's ``id`` for every
+    later one. ``snapshot`` and ``target`` must be canonical delivery
+    snapshot documents and ``plan`` a canonical delivery plan, exactly as
+    required by :func:`commit_delivery_updates`.
+
+    Each entry's ``result`` is generated with
+    ``commit_delivery_updates(snapshot, target, plan)`` and every later
+    entry's ``snapshot`` must byte-for-byte equal the canonical encoding
+    of the previous entry's ``result.snapshot``.
+
+    Returns the canonical compact JSON document with exactly the two
+    top-level keys ``commits`` and ``head`` in that order. ``commits``
+    preserves the entry order, each row being
+    ``[id, parent, snapshot, target, plan, result]`` with the last four
+    items embedded as JSON objects; ``head`` is ``null`` for an empty log
+    and otherwise the last entry's ``id``. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline, and
+    repeated calls return a byte-identical document.
+
+    :raises TypeError: ``entries`` is not a ``tuple``, an entry is not a
+        five-item ``tuple``, or a field has the wrong type.
+    :raises ValueError: an ``id`` is invalid or duplicated, the parent
+        chain or the snapshot linkage is broken, or a snapshot, target or
+        plan document is not its canonical encoding.
+    """
+    if not isinstance(entries, tuple):
+        raise TypeError("entries must be a tuple")
+    rows = []
+    seen = set()
+    previous_id = None
+    previous_snapshot = None
+    for entry in entries:
+        if not isinstance(entry, tuple) or len(entry) != 5:
+            raise TypeError("each entry must be a five-item tuple "
+                            "(id, parent, snapshot, target, plan)")
+        commit_id, parent, snapshot, target, plan = entry
+        if not isinstance(commit_id, str):
+            raise TypeError("commit id must be a str")
+        if parent is not None and not isinstance(parent, str):
+            raise TypeError("parent must be None or a str")
+        if not isinstance(snapshot, str):
+            raise TypeError("snapshot must be a str")
+        if not isinstance(target, str):
+            raise TypeError("target must be a str")
+        if not isinstance(plan, str):
+            raise TypeError("plan must be a str")
+        if _COMMIT_ID_RE.fullmatch(commit_id) is None:
+            raise ValueError(f"invalid commit id {commit_id!r}")
+        if commit_id in seen:
+            raise ValueError(f"duplicate commit id {commit_id!r}")
+        seen.add(commit_id)
+        if previous_id is None:
+            if parent is not None:
+                raise ValueError("the first entry's parent must be None")
+        else:
+            if parent != previous_id:
+                raise ValueError(f"entry {commit_id!r} must name parent "
+                                 f"{previous_id!r}")
+            if snapshot != previous_snapshot:
+                raise ValueError(f"entry {commit_id!r} snapshot must equal "
+                                 "the previous entry's result snapshot")
+        result = commit_delivery_updates(snapshot, target, plan)
+        rows.append((commit_id, parent, snapshot, target, plan, result))
+        previous_id = commit_id
+        previous_snapshot = _result_snapshot_text(result)
+    parts = ['{"commits":[']
+    for index, (commit_id, parent, snapshot, target, plan,
+                result) in enumerate(rows):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(commit_id) + ",")
+        parts.append("null" if parent is None else _json_string(parent))
+        parts.append("," + snapshot + "," + target + "," + plan + ","
+                     + result + "]")
+    parts.append('],"head":')
+    parts.append("null" if previous_id is None
+                 else _json_string(previous_id))
+    parts.append("}")
+    return "".join(parts)
+
+
+def read_commit(log: str, id: str, before: bool = False) -> str:
+    """Read one commit's snapshot from a :func:`delivery_log` document.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log`; the whole chain is recomputed and validated
+    (identifiers, parent linkage, snapshot linkage and every stored
+    ``result`` against :func:`commit_delivery_updates`). ``id`` must be a
+    ``str`` matching ``[A-Za-z0-9._-]+`` and name a commit in the log.
+
+    With ``before`` false (the default) returns the canonical encoding of
+    the matching commit's ``result.snapshot``; with ``before`` true
+    returns the canonical encoding of its ``snapshot``.
+
+    :raises TypeError: ``log``, ``id`` or ``before`` has the wrong type.
+    :raises ValueError: ``id`` is not a valid commit identifier or names
+        no commit in the log, or the log document, its chain or a
+        recomputed result does not match.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(id, str):
+        raise TypeError("id must be a str")
+    if not isinstance(before, bool):
+        raise TypeError("before must be a bool")
+    if _COMMIT_ID_RE.fullmatch(id) is None:
+        raise ValueError(f"invalid commit id {id!r}")
+    try:
+        node = _parse_json_node(log, _skip_json_ws(log, 0))
+    except ValueError as exc:
+        raise ValueError(f"log is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(log, node[2]) != len(log):
+        raise ValueError("log has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != ["commits", "head"]:
+        raise ValueError('log must be a JSON object with the keys '
+                         '"commits" and "head"')
+    commits = top["commits"][0]
+    if not isinstance(commits, list):
+        raise ValueError('"commits" must be an array')
+    entries = []
+    result_nodes = []
+    for row_node in commits:
+        row = row_node[0]
+        if not isinstance(row, list) or len(row) != 6:
+            raise ValueError("each commit must be a six-item array "
+                             "[id, parent, snapshot, target, plan, result]")
+        commit_id, parent = row[0][0], row[1][0]
+        if not isinstance(commit_id, str):
+            raise ValueError("commit id must be a str")
+        if parent is not None and not isinstance(parent, str):
+            raise ValueError("commit parent must be null or a str")
+        documents = []
+        for field in row[2:]:
+            if not isinstance(field[0], dict):
+                raise ValueError("snapshot, target, plan and result must "
+                                 "be JSON objects")
+            documents.append(log[field[1]:field[2]])
+        entries.append((commit_id, parent, documents[0], documents[1],
+                        documents[2]))
+        result_nodes.append(row[5])
+    if delivery_log(tuple(entries)) != log:
+        raise ValueError("log does not match the recomputed delivery log")
+    for entry, result_node in zip(entries, result_nodes):
+        if entry[0] == id:
+            if before:
+                return entry[2]
+            snapshot_node = result_node[0]["snapshot"]
+            return log[snapshot_node[1]:snapshot_node[2]]
+    raise ValueError(f"no commit with id {id!r}")
