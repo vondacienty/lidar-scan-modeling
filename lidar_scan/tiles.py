@@ -11616,6 +11616,12 @@ def plan_delivery_checkout(log: str, source: str, target: str) -> str:
     if _COMMIT_ID_RE.fullmatch(target) is None:
         raise ValueError(f"invalid commit id {target!r}")
     decoded = _decode_commit_log(log)
+    return _build_checkout_plan(decoded, source, target)
+
+
+def _build_checkout_plan(decoded: list, source: str,
+                         target: str) -> str:
+    """Build the canonical checkout plan from a decoded, verified log."""
     index_by_id = {}
     for position, row in enumerate(decoded):
         index_by_id[row[0]] = position
@@ -11650,3 +11656,89 @@ def plan_delivery_checkout(log: str, source: str, target: str) -> str:
         parts.append("]")
     parts.append('],"snapshot":' + decoded[target_pos][5] + "}")
     return "".join(parts)
+
+
+def apply_delivery_checkout(log: str, current: str, plan: str) -> str:
+    """Validate and atomically apply a planned delivery checkout.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log`, ``current`` a ``str`` byte-for-byte matching
+    the canonical output of :func:`build_delivery_snapshot`, and ``plan``
+    a ``str`` byte-for-byte matching the canonical output of
+    :func:`plan_delivery_checkout`. The whole log chain is recomputed and
+    validated, then the plan is recomputed from the plan's ``source`` and
+    ``target`` commits and required to match ``plan`` byte-for-byte.
+
+    When ``current`` equals the ``target`` commit's ``result.snapshot``
+    nothing is applied and ``status`` is ``"unchanged"``. Otherwise, when
+    ``current`` equals the ``source`` commit's ``result.snapshot``, every
+    planned step is applied atomically and ``status`` is ``"applied"``.
+    Any other snapshot is stale or conflicting with the plan and raises
+    :class:`ValueError`.
+
+    Returns the canonical compact JSON document
+    ``{"source":...,"target":...,"direction":...,"status":...,
+    "snapshot":...}`` with exactly these five top-level keys in that
+    order; ``source``, ``target`` and ``direction`` echo the verified
+    plan, ``status`` is ``"unchanged"`` or ``"applied"`` and the final
+    ``snapshot`` embeds ``target``'s canonical snapshot. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline; the
+    inputs are never modified and repeated calls return a byte-identical
+    document.
+
+    :raises TypeError: ``log``, ``current`` or ``plan`` is not a ``str``.
+    :raises ValueError: a document is not its canonical encoding, a plan
+        identifier names no commit, the log chain or a recomputed result
+        does not match, the recomputed plan does not byte-for-byte equal
+        ``plan``, or ``current`` is neither the source nor the target
+        snapshot of the plan.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(current, str):
+        raise TypeError("current must be a str")
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+
+    try:
+        plan_node = _parse_json_node(plan, _skip_json_ws(plan, 0))
+    except ValueError as exc:
+        raise ValueError(f"plan is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(plan, plan_node[2]) != len(plan):
+        raise ValueError("plan has trailing data after the JSON document")
+    plan_top = plan_node[0]
+    if not isinstance(plan_top, dict) or list(plan_top) != [
+            "source", "target", "direction", "steps", "snapshot"]:
+        raise ValueError("plan must be a JSON object with exactly the "
+                         'keys "source", "target", "direction", "steps" '
+                         'and "snapshot"')
+    source = plan_top["source"][0]
+    target = plan_top["target"][0]
+    if not isinstance(source, str) or not isinstance(target, str):
+        raise ValueError("plan source and target must be strings")
+
+    decoded = _decode_commit_log(log)
+    recomputed = _build_checkout_plan(decoded, source, target)
+    if recomputed != plan:
+        raise ValueError("plan does not match the checkout plan recomputed "
+                         "from the log")
+
+    _decode_delivery_snapshot(current)
+
+    index_by_id = {row[0]: position for position, row in enumerate(decoded)}
+    target_snapshot = decoded[index_by_id[target]][5]
+    source_snapshot = decoded[index_by_id[source]][5]
+    if current == target_snapshot:
+        status = "unchanged"
+    elif current == source_snapshot:
+        status = "applied"
+    else:
+        raise ValueError("current snapshot is neither the source nor the "
+                         "target snapshot of the plan")
+
+    direction = plan_top["direction"][0]
+    return ('{"source":' + _json_string(source) + ',"target":'
+            + _json_string(target) + ',"direction":'
+            + _json_string(direction) + ',"status":'
+            + _json_string(status) + ',"snapshot":' + target_snapshot + "}")
