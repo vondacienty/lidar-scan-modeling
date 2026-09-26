@@ -10050,6 +10050,99 @@ def query_delivery_range(snapshot: str, product: str, batch_min: int,
     return None
 
 
+def _ranges_result_to_json(value):
+    """Recursively convert tuples to lists for JSON serialization."""
+    if isinstance(value, tuple):
+        return [_ranges_result_to_json(item) for item in value]
+    return value
+
+
+def audit_delivery_ranges(snapshot: str, ranges: tuple) -> str:
+    """Audit a batch of delivery range queries as a compact JSON document.
+
+    ``snapshot`` must be a ``str`` byte-for-byte matching the canonical
+    output of :func:`build_delivery_snapshot`, exactly as required by
+    :func:`query_delivery_range`. ``ranges`` must be a ``tuple`` whose
+    items are strictly three-tuples ``(product, batch_min, batch_max)``
+    with ``product`` a ``str`` and ``batch_min``/``batch_max`` non-bool
+    ``int`` bounds satisfying ``0 <= batch_min <= batch_max``; no
+    ``(product, batch_min, batch_max)`` key may repeat.
+
+    Returns the canonical compact JSON document
+    ``{"ranges":[...],"ready":...}`` with exactly these two top-level
+    keys in this order. ``ranges`` holds one
+    ``[product, batch_min, batch_max, result]`` array per requested
+    range, sorted lexicographically by the three key fields, where
+    ``result`` is the return value of :func:`query_delivery_range`
+    called with the same arguments, recursively converted to JSON
+    arrays (``None`` becomes ``null``, so an unknown product yields a
+    ``null`` result). The top-level ``ready`` is true exactly when
+    every ``result`` is non-null and its own ``ready`` flag is true
+    (an empty ``ranges`` being ``true``).
+
+    The output uses ``ensure_ascii=False``, decimal integers, lowercase
+    booleans and canonical ``null``, with no whitespace, no
+    ``NaN``/``Infinity`` and no trailing newline. The inputs are never
+    modified and reordering ``ranges`` leaves the output byte-identical.
+
+    :raises TypeError: ``snapshot`` or ``ranges`` has the wrong type,
+        a range item is not a three-tuple, or a field has the wrong
+        type.
+    :raises ValueError: ``snapshot`` is not the canonical delivery
+        snapshot encoding, a batch bound is negative,
+        ``batch_min > batch_max``, or a range key repeats.
+    """
+    if not isinstance(snapshot, str):
+        raise TypeError("snapshot must be a str")
+    if not isinstance(ranges, tuple):
+        raise TypeError("ranges must be a tuple")
+    for item in ranges:
+        if not isinstance(item, tuple) or len(item) != 3:
+            raise TypeError("each range must be a (product, batch_min, "
+                            "batch_max) tuple")
+        product, batch_min, batch_max = item
+        if not isinstance(product, str):
+            raise TypeError("product must be a str")
+        if isinstance(batch_min, bool) or not isinstance(batch_min, int):
+            raise TypeError("batch_min must be a non-bool int")
+        if isinstance(batch_max, bool) or not isinstance(batch_max, int):
+            raise TypeError("batch_max must be a non-bool int")
+
+    _decode_delivery_snapshot(snapshot)
+
+    seen = set()
+    for product, batch_min, batch_max in ranges:
+        if batch_min < 0 or batch_max < 0:
+            raise ValueError("batch bounds must be non-negative")
+        if batch_min > batch_max:
+            raise ValueError("batch_min must not exceed batch_max")
+        key = (product, batch_min, batch_max)
+        if key in seen:
+            raise ValueError(f"duplicate range key {key!r}")
+        seen.add(key)
+
+    rows = []
+    for product, batch_min, batch_max in ranges:
+        result = query_delivery_range(snapshot, product, batch_min,
+                                      batch_max)
+        rows.append((product, batch_min, batch_max, result))
+    rows.sort(key=lambda row: (row[0], row[1], row[2]))
+
+    document = {
+        "ranges": [
+            [product, batch_min, batch_max,
+             _ranges_result_to_json(result)]
+            for product, batch_min, batch_max, result in rows
+        ],
+        "ready": all(
+            result is not None and result[3]
+            for _product, _batch_min, _batch_max, result in rows
+        ),
+    }
+    return json.dumps(document, ensure_ascii=False,
+                      separators=(",", ":"), allow_nan=False)
+
+
 def update_delivery_snapshot(snapshot: str, changes: str,
                              receipts: str) -> str:
     """Apply new delivery changes and receipts to a delivery snapshot.
