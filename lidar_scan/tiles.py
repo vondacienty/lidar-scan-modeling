@@ -13337,3 +13337,238 @@ def merge_recovery_receipts(plan: str, receipts: tuple) -> str:
              ",".join(receipts), '],"complete":',
              "true" if complete else "false", "}"]
     return "".join(parts)
+
+
+def _decode_recovery_history_summary(text: str, direction: str,
+                                     start_snapshot) -> tuple:
+    """Validate a canonical :func:`merge_recovery_receipts` summary.
+
+    ``direction`` is the plan's active recovery arm (``"pending"``,
+    ``"missing"`` or ``"none"``) and ``start_snapshot`` is ``None`` or the
+    raw snapshot document the summary's ``start`` must equal.
+
+    Returns ``(receipt_texts, receipts, end_snapshot, complete)`` with
+    ``receipt_texts`` the raw canonical embedded receipt documents,
+    ``receipts`` a tuple of :func:`_decode_recovery_receipt` results,
+    ``end_snapshot`` ``None`` or the raw ``end`` document, and
+    ``complete`` the summary's boolean.
+
+    :raises ValueError: the JSON or shape is bad, the direction or start
+        does not match the plan, an embedded receipt is not its canonical
+        encoding, or the text is not its canonical summary encoding.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"summary is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("summary has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "direction", "start", "end", "receipts", "complete"]:
+        raise ValueError("summary must be a JSON object with exactly the keys "
+                         '"direction", "start", "end", "receipts" and '
+                         '"complete"')
+    summary_direction = top["direction"][0]
+    if summary_direction not in ("pending", "missing", "none"):
+        raise ValueError('summary "direction" must be "pending", "missing" or '
+                         '"none"')
+    if summary_direction != direction:
+        raise ValueError('summary "direction" does not match the plan')
+
+    def _raw_snapshot(key):
+        snapshot_node = top[key]
+        if snapshot_node[0] is None:
+            return None
+        if isinstance(snapshot_node[0], dict):
+            raw = text[snapshot_node[1]:snapshot_node[2]]
+            _decode_delivery_snapshot(raw)
+            return raw
+        raise ValueError(f'summary "{key}" must be null or a JSON object')
+
+    summary_start = _raw_snapshot("start")
+    if summary_start != start_snapshot:
+        raise ValueError('summary "start" does not match the plan')
+    summary_end = _raw_snapshot("end")
+
+    receipt_nodes = top["receipts"][0]
+    if not isinstance(receipt_nodes, list):
+        raise ValueError('summary "receipts" must be an array')
+    receipt_texts = []
+    receipts = []
+    for receipt_node in receipt_nodes:
+        if not isinstance(receipt_node[0], dict):
+            raise ValueError("each summary receipt must be a JSON object")
+        raw = text[receipt_node[1]:receipt_node[2]]
+        receipts.append(_decode_recovery_receipt(
+            raw, direction, start_snapshot))
+        receipt_texts.append(raw)
+
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('summary "complete" must be a boolean')
+
+    parts = ['{"direction":', _json_string(summary_direction), ',"start":',
+             "null" if summary_start is None else summary_start, ',"end":',
+             "null" if summary_end is None else summary_end, ',"receipts":[',
+             ",".join(receipt_texts), '],"complete":',
+             "true" if complete else "false", "}"]
+    if "".join(parts) != text:
+        raise ValueError("summary is not its canonical encoding")
+    return tuple(receipt_texts), tuple(receipts), summary_end, complete
+
+
+def build_recovery_history(plan: str, summaries: tuple) -> str:
+    """Build a history across :func:`merge_recovery_receipts` summaries.
+
+    ``plan`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`plan_checkout_recovery`. ``summaries`` must be a ``tuple``
+    whose items are each a ``str`` byte-for-byte matching the canonical
+    output of :func:`merge_recovery_receipts` for that same plan.
+
+    Every summary's ``direction`` and ``start`` must agree with the plan.
+    The summaries are read in tuple order: each summary's embedded
+    receipts must chain against the plan exactly as in
+    :func:`merge_recovery_receipts`, and after the first summary each
+    summary's ``receipts`` array must be a strict extension of the previous
+    summary's array (identical embedded receipts included), so the
+    confirmed unit count keeps strictly increasing with no batch id
+    repeated across newly covered units. Nothing may be appended after the
+    plan is already complete.
+
+    Returns the canonical compact JSON document with exactly the seven
+    top-level keys ``direction``, ``start``, ``end``, ``runs``, ``audit``,
+    ``resume`` and ``complete`` in that order. ``direction`` is the plan's
+    active arm (``"pending"``, ``"missing"`` or ``"none"``) and ``start``
+    is the first unit's ``before`` snapshot, otherwise the plan's
+    ``snapshot`` (possibly ``null``). ``end`` is the last summary's ``end``
+    embedded byte for byte, or ``start`` when ``summaries`` is empty.
+    ``runs`` follows the summaries in order; each is
+    ``[confirmed, end, complete]`` with ``confirmed`` the cumulative number
+    of confirmed units at that summary. ``audit`` collects the newly
+    covered ``[id, status]`` rows in plan order. ``resume`` embeds the
+    canonical :func:`execute_checkout_recovery` state object at the
+    confirmed prefix when work remains and is ``null`` once complete.
+    ``complete`` is the last summary's ``complete`` value, and is true only
+    when the plan has no units when ``summaries`` is empty. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline; the
+    inputs are never modified and repeated calls return a byte-identical
+    document.
+
+    :raises TypeError: ``plan`` or a summary is not a ``str``, or
+        ``summaries`` is not a ``tuple``.
+    :raises ValueError: the plan is not the canonical plan encoding or is
+        forked (both arms non-empty), a summary is malformed or not its
+        canonical encoding, a summary's ``direction`` or ``start`` does
+        not match the plan, a summary's receipts do not strictly extend
+        the previous summary's, the embedded receipts do not chain
+        against the plan, a batch id repeats, or an ``end`` or
+        ``complete`` value does not match the confirmed prefix.
+    """
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(summaries, tuple):
+        raise TypeError("summaries must be a tuple")
+
+    common, missing, pending, plan_snapshot = \
+        _decode_checkout_recovery_plan(plan)
+    if missing and pending:
+        raise ValueError("the plan forks: both missing and pending units "
+                         "remain")
+    if pending:
+        direction = "pending"
+        units = pending
+    elif missing:
+        direction = "missing"
+        units = missing
+    else:
+        direction = "none"
+        units = []
+
+    if units:
+        start_snapshot = units[0][0][3]
+    else:
+        start_snapshot = plan_snapshot
+
+    runs = []
+    audit_rows = []
+    seen_ids = set()
+    confirmed = 0
+    previous_receipts = ()
+    end_snapshot = start_snapshot
+    complete = not units
+    for summary_index, summary in enumerate(summaries):
+        if not isinstance(summary, str):
+            raise TypeError("each summary must be a str")
+        receipt_texts, receipts, summary_end, summary_complete = \
+            _decode_recovery_history_summary(
+                summary, direction, start_snapshot)
+        if merge_recovery_receipts(plan, receipt_texts) != summary:
+            raise ValueError("summary is not the canonical merge of its "
+                             "receipts for this plan")
+        if summary_index > 0 and (
+                len(receipts) <= len(previous_receipts)
+                or receipts[:len(previous_receipts)] != previous_receipts):
+            raise ValueError("each summary's receipts must strictly extend "
+                             "the previous summary's receipts")
+        target = confirmed
+        skip_segments = (len(previous_receipts[-1][0])
+                         if previous_receipts else 0)
+        for segments, _receipt_end, _receipt_complete in \
+                receipts[len(previous_receipts):]:
+            for origin, segment_target, batches in \
+                    segments[skip_segments:]:
+                expected = []
+                for unit in units[origin:segment_target]:
+                    expected.extend(unit[1])
+                if tuple(expected) != batches:
+                    raise ValueError("a receipt segment's batches do not match "
+                                     "the plan's confirmed prefix")
+                for batch_id, _status in batches:
+                    if batch_id in seen_ids:
+                        raise ValueError(f"duplicate batch id {batch_id!r}")
+                    seen_ids.add(batch_id)
+                audit_rows.extend(batches)
+            target = segments[-1][1] if segments else 0
+            confirmed = target
+            skip_segments = len(segments)
+        complete = summary_complete
+        end_snapshot = summary_end
+        runs.append([confirmed, summary_end, summary_complete])
+        previous_receipts = receipts
+
+    if not summaries:
+        end_snapshot = start_snapshot
+
+    if complete:
+        resume = "null"
+    else:
+        records = units[:confirmed]
+        if confirmed:
+            resume_snapshot = units[confirmed - 1][0][4]
+        elif units:
+            resume_snapshot = units[0][0][3]
+        else:
+            resume_snapshot = plan_snapshot
+        resume = _format_checkout_recovery_state(
+            common, direction, confirmed, records, resume_snapshot, False)
+
+    parts = ['{"direction":', _json_string(direction), ',"start":',
+             "null" if start_snapshot is None else start_snapshot, ',"end":',
+             "null" if end_snapshot is None else end_snapshot, ',"runs":[']
+    run_text = []
+    for run_confirmed, run_end, run_complete in runs:
+        run_text.append("[" + str(run_confirmed) + ","
+                        + ("null" if run_end is None else run_end) + ","
+                        + ("true" if run_complete else "false") + "]")
+    parts.append(",".join(run_text))
+    parts.append('],"audit":[')
+    parts.append(",".join(_checkout_audit_row_text(row)
+                          for row in audit_rows))
+    parts.append('],"resume":')
+    parts.append(resume)
+    parts.append(',"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
