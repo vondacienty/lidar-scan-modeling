@@ -8631,6 +8631,88 @@ def audit_delivery_changes(changes: str) -> str:
     return _format_audit_delivery(products, releasable)
 
 
+def _decode_failure_rows(raw_failures) -> list:
+    """Validate and normalize product failure rows.
+
+    Shared by the audit and plan decoders. Each row must be an eight-value
+    ``[batch, version, level, ix_min, iy_min, ix_max, iy_max, R]`` array with
+    ``R`` ``None`` or ``[emin, emax, rmse, amean, n]``; the four metrics are
+    returned as finite Decimals (``rmse``/``amean`` non-negative) and ``n`` as
+    a positive non-bool int.
+    """
+    if not isinstance(raw_failures, list):
+        raise ValueError("product failures must be an array")
+
+    failures = []
+    for raw_failure in raw_failures:
+        if not isinstance(raw_failure, list) or len(raw_failure) != 8:
+            raise ValueError("each product failure must be an array of "
+                             "eight values")
+        batch, version = raw_failure[:2]
+        if isinstance(batch, bool) or not isinstance(batch, int):
+            raise ValueError("product failure batch must be a non-bool "
+                             "integer")
+        if batch < 0:
+            raise ValueError("product failure batch must be "
+                             "non-negative")
+        if not isinstance(version, str):
+            raise ValueError("product failure version must be a str")
+        if not version or not set(version) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "product failure version must be non-empty and contain "
+                "only ASCII alphanumeric characters and ._-"
+            )
+        for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
+                                "iy_max"), raw_failure[2:7]):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"product failure {name} must be a "
+                                 "non-bool integer")
+        level, ix_min, iy_min, ix_max, iy_max = raw_failure[2:7]
+        if level < 0:
+            raise ValueError("product failure level must be "
+                             "non-negative")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("product failure bounds must satisfy "
+                             "ix_min <= ix_max and iy_min <= iy_max")
+
+        raw_summary = raw_failure[7]
+        summary = None
+        if raw_summary is not None:
+            if not isinstance(raw_summary, list) or len(raw_summary) != 5:
+                raise ValueError("product failure R must be null or an "
+                                 "array of five values")
+            metrics_raw = list(raw_summary[:4])
+            match_count = raw_summary[4]
+            for name, value in zip(("emin", "emax", "rmse", "amean"),
+                                   metrics_raw):
+                if isinstance(value, bool) or not isinstance(value,
+                                                             (int,
+                                                              Decimal)):
+                    raise ValueError(f"product failure {name} must be a "
+                                     "number")
+            metrics = [Decimal(value) for value in metrics_raw]
+            for name, value in zip(("emin", "emax", "rmse", "amean"),
+                                   metrics):
+                if not value.is_finite():
+                    raise ValueError(f"product failure {name} must be "
+                                     "finite")
+            if isinstance(match_count, bool) or not isinstance(
+                    match_count, int):
+                raise ValueError("product failure n must be a non-bool "
+                                 "integer")
+            if match_count < 1:
+                raise ValueError("product failure n must be a positive "
+                                 "integer")
+            if metrics[2] < 0 or metrics[3] < 0:
+                raise ValueError("product failure rmse and amean must "
+                                 "be non-negative")
+            summary = [*metrics, match_count]
+
+        failures.append([batch, version, level, ix_min, iy_min, ix_max,
+                         iy_max, summary])
+    return failures
+
+
 def _decode_audit_delivery(text: str) -> tuple:
     """Parse and validate a canonical :func:`audit_delivery_changes` string.
 
@@ -8718,76 +8800,7 @@ def _decode_audit_delivery(text: str) -> tuple:
                for index in range(len(affected) - 1)):
             raise ValueError("product affected batches must be strictly "
                              "ascending")
-        if not isinstance(raw_failures, list):
-            raise ValueError("product failures must be an array")
-
-        failures = []
-        for raw_failure in raw_failures:
-            if not isinstance(raw_failure, list) or len(raw_failure) != 8:
-                raise ValueError("each product failure must be an array of "
-                                 "eight values")
-            batch, version = raw_failure[:2]
-            if isinstance(batch, bool) or not isinstance(batch, int):
-                raise ValueError("product failure batch must be a non-bool "
-                                 "integer")
-            if batch < 0:
-                raise ValueError("product failure batch must be "
-                                 "non-negative")
-            if not isinstance(version, str):
-                raise ValueError("product failure version must be a str")
-            if not version or not set(version) <= _DELIVERY_IDENT_CHARS:
-                raise ValueError(
-                    "product failure version must be non-empty and contain "
-                    "only ASCII alphanumeric characters and ._-"
-                )
-            for name, value in zip(("level", "ix_min", "iy_min", "ix_max",
-                                    "iy_max"), raw_failure[2:7]):
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise ValueError(f"product failure {name} must be a "
-                                     "non-bool integer")
-            level, ix_min, iy_min, ix_max, iy_max = raw_failure[2:7]
-            if level < 0:
-                raise ValueError("product failure level must be "
-                                 "non-negative")
-            if ix_min > ix_max or iy_min > iy_max:
-                raise ValueError("product failure bounds must satisfy "
-                                 "ix_min <= ix_max and iy_min <= iy_max")
-
-            raw_summary = raw_failure[7]
-            summary = None
-            if raw_summary is not None:
-                if not isinstance(raw_summary, list) or len(raw_summary) != 5:
-                    raise ValueError("product failure R must be null or an "
-                                     "array of five values")
-                metrics_raw = list(raw_summary[:4])
-                match_count = raw_summary[4]
-                for name, value in zip(("emin", "emax", "rmse", "amean"),
-                                       metrics_raw):
-                    if isinstance(value, bool) or not isinstance(value,
-                                                                 (int,
-                                                                  Decimal)):
-                        raise ValueError(f"product failure {name} must be a "
-                                         "number")
-                metrics = [Decimal(value) for value in metrics_raw]
-                for name, value in zip(("emin", "emax", "rmse", "amean"),
-                                       metrics):
-                    if not value.is_finite():
-                        raise ValueError(f"product failure {name} must be "
-                                         "finite")
-                if isinstance(match_count, bool) or not isinstance(
-                        match_count, int):
-                    raise ValueError("product failure n must be a non-bool "
-                                     "integer")
-                if match_count < 1:
-                    raise ValueError("product failure n must be a positive "
-                                     "integer")
-                if metrics[2] < 0 or metrics[3] < 0:
-                    raise ValueError("product failure rmse and amean must "
-                                     "be non-negative")
-                summary = [*metrics, match_count]
-
-            failures.append([batch, version, level, ix_min, iy_min, ix_max,
-                             iy_max, summary])
+        failures = _decode_failure_rows(raw_failures)
 
         # Row field association: a passing row carries no rollback state,
         # a failing row carries at least one affected batch and one
@@ -8912,3 +8925,263 @@ def build_delivery_plan(audit: str) -> str:
             operations.append([product, "block", current, None, affected,
                                failures])
     return _format_delivery_plan(operations, releasable)
+
+def _decode_delivery_plan(text: str) -> list:
+    """Parse and validate a canonical :func:`build_delivery_plan` string.
+
+    Returns a list of ``[product, action, current, target, affected,
+    failures]`` operations in document order (``target`` is ``None`` or a
+    version string, ``affected`` a list of batch ints and ``failures`` a
+    list of normalized failure rows; see :func:`_decode_failure_rows`).
+
+    Beyond JSON, shape and canonical-format checks, the plan contract is
+    revalidated: each operation's action is ``publish``, ``rollback`` or
+    ``block``; a ``publish`` operation targets ``current`` with empty
+    ``affected``/``failures``; a ``rollback`` operation carries a non-null
+    ``target`` and a ``block`` operation a null one, both with at least one
+    affected batch and one failure; ``affected`` is strictly ascending and
+    matches exactly the batches of the operation's failures, which are
+    ordered by batch; and the top-level ``releasable`` flag is true exactly
+    when every action is ``publish`` (an empty operation set being
+    ``true``).
+
+    :raises ValueError: the JSON syntax or shape is bad, a value violates
+        the plan contract, the text is not the canonical plan encoding, or
+        the top-level ``releasable`` flag is inconsistent.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("plan is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"operations",
+                                                           "releasable"}:
+        raise ValueError("plan top-level value must be an object with only "
+                         "'operations' and 'releasable'")
+    raw_operations = document["operations"]
+    if not isinstance(raw_operations, list):
+        raise ValueError("'operations' must be an array")
+    releasable = document["releasable"]
+    if not isinstance(releasable, bool):
+        raise ValueError("'releasable' must be a boolean")
+
+    operations = []
+    for raw_operation in raw_operations:
+        if not isinstance(raw_operation, list) or len(raw_operation) != 6:
+            raise ValueError("each operation must be an array of six "
+                             "values")
+        product, action, current, target, raw_affected, raw_failures = (
+            raw_operation)
+        if not isinstance(product, str):
+            raise ValueError("product name must be a str")
+        if not product or not set(product) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "product name must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+        if action not in ("publish", "rollback", "block"):
+            raise ValueError("operation action must be publish, rollback "
+                             "or block")
+        if not isinstance(current, str):
+            raise ValueError("operation current must be a str")
+        if not current or not set(current) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "operation current must be non-empty and contain only "
+                "ASCII alphanumeric characters and ._-"
+            )
+        if target is not None and not isinstance(target, str):
+            raise ValueError("operation target must be null or a str")
+        if target is not None and (
+                not target or not set(target) <= _DELIVERY_IDENT_CHARS):
+            raise ValueError(
+                "operation target must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+        if not isinstance(raw_affected, list):
+            raise ValueError("operation affected must be an array")
+        affected = []
+        for batch in raw_affected:
+            if isinstance(batch, bool) or not isinstance(batch, int):
+                raise ValueError("operation affected batches must be "
+                                 "non-bool integers")
+            if batch < 0:
+                raise ValueError("operation affected batches must be "
+                                 "non-negative")
+            affected.append(batch)
+        if any(affected[index] >= affected[index + 1]
+               for index in range(len(affected) - 1)):
+            raise ValueError("operation affected batches must be strictly "
+                             "ascending")
+
+        failures = _decode_failure_rows(raw_failures)
+
+        # A publish carries no target delta or failure state; a rollback or
+        # block lists at least one affected batch and one failure, and the
+        # failures expand exactly the affected batches in batch order.
+        if action == "publish":
+            if target != current or affected or failures:
+                raise ValueError("a publish operation must target current "
+                                 "with no affected batches or failures")
+        else:
+            if action == "rollback" and target is None:
+                raise ValueError("a rollback operation must carry a "
+                                 "non-null target")
+            if action == "block" and target is not None:
+                raise ValueError("a block operation must carry a null "
+                                 "target")
+            if not affected or not failures:
+                raise ValueError("a rollback or block operation must list "
+                                 "an affected batch and a failure")
+            failure_batches = [failure[0] for failure in failures]
+            if any(failure_batches[index] > failure_batches[index + 1]
+                   for index in range(len(failure_batches) - 1)):
+                raise ValueError("operation failures must be ordered by "
+                                 "batch")
+            if sorted(set(failure_batches)) != affected:
+                raise ValueError("operation affected batches must match "
+                                 "the batches of its failures")
+
+        operations.append([product, action, current, target, affected,
+                           failures])
+
+    # Operations inherit the audit's product order: strictly ascending by
+    # name with no duplicates; a byte-for-byte re-encode alone would
+    # tolerate reordering.
+    names = [operation[0] for operation in operations]
+    if any(names[index] >= names[index + 1]
+           for index in range(len(names) - 1)):
+        raise ValueError("operations must be sorted uniquely by product "
+                         "name")
+
+    if releasable != all(operation[1] == "publish"
+                         for operation in operations):
+        raise ValueError("'releasable' must be true exactly when every "
+                         "operation action is publish")
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal metric formatting and any other
+    # non-canonical spelling.
+    if _format_delivery_plan(operations, releasable) != text:
+        raise ValueError("plan is not the canonical delivery plan "
+                         "encoding")
+    return operations
+
+
+def _format_delivery_receipt(receipts: list, ready: bool) -> str:
+    """Serialize per-product receipts to the two-key receipt document."""
+    parts = ['{"receipts":[']
+    for index, (product, action, current, target, affected, status, reason,
+                failures) in enumerate(receipts):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(product) + ","
+                     + _json_string(action) + ","
+                     + _json_string(current) + ",")
+        parts.append("null" if target is None else _json_string(target))
+        parts.append(",[" + ",".join(str(batch) for batch in affected) + "],")
+        parts.append(_json_string(status) + "," + _json_string(reason) + ",[")
+        parts.append(_format_failure_rows(failures))
+        parts.append("]]")
+    parts.append('],"ready":')
+    parts.append("true}" if ready else "false}")
+    return "".join(parts)
+
+
+def build_delivery_receipt(plan: str, results: tuple) -> str:
+    """Build a per-product delivery receipt from a plan and execution results.
+
+    ``plan`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`build_delivery_plan`: the compact document whose sole
+    top-level keys are ``operations`` and ``releasable`` in that order, with
+    operations ``[product, action, current, target, affected, failures]``
+    in product order. ``results`` must be a ``tuple`` whose items are
+    strictly three-value tuples ``(product, status, reason)`` of ``str``.
+    The result products must match the plan products one-to-one with no
+    duplicates, but may appear in any order. A ``publish`` or ``rollback``
+    operation accepts only ``succeeded`` or ``failed``; a ``block``
+    operation accepts only ``blocked``. A ``succeeded`` result carries an
+    empty ``reason``; ``failed`` and ``blocked`` results carry a non-empty
+    one.
+
+    Returns a canonical compact JSON document with exactly the two keys
+    ``receipts`` and ``ready`` in that order. Receipts follow the plan
+    order and each receipt is the array ``[product, action, current,
+    target, affected, status, reason, failures]`` with every planned field
+    preserved verbatim. ``ready`` is true only when every operation is a
+    ``publish`` and every result is ``succeeded``; an empty plan yields
+    ``{"receipts":[],"ready":true}``. Strings use ``ensure_ascii=False``,
+    integers are decimal, the four failure metrics use exactly six decimal
+    places (negative zero written as ``0.000000``), ``NaN``/``Infinity``
+    never appear and the output has no whitespace or trailing newline. The
+    inputs are never modified and reordering ``results`` yields a
+    byte-identical document.
+
+    :raises TypeError: ``plan`` is not a ``str``, ``results`` is not a
+        ``tuple``, or a result item is not a three-value tuple of ``str``.
+    :raises ValueError: the plan is not the canonical plan encoding, a
+        result product is missing, unknown or duplicated, or a status or
+        reason violates the per-action contract.
+    """
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(results, tuple):
+        raise TypeError("results must be a tuple")
+
+    operations = _decode_delivery_plan(plan)
+
+    normalized = []
+    for item in results:
+        if not isinstance(item, tuple) or len(item) != 3:
+            raise TypeError("each result must be a three-value tuple "
+                            "(product, status, reason)")
+        product, status, reason = item
+        if not all(isinstance(value, str)
+                   for value in (product, status, reason)):
+            raise TypeError("product, status and reason must each be a str")
+        normalized.append((product, status, reason))
+
+    by_product = {}
+    for product, status, reason in normalized:
+        if product in by_product:
+            raise ValueError(f"duplicate result for product {product!r}")
+        by_product[product] = (status, reason)
+
+    receipts = []
+    for product, action, current, target, affected, failures in operations:
+        if product not in by_product:
+            raise ValueError(f"missing result for product {product!r}")
+        status, reason = by_product.pop(product)
+        if action in ("publish", "rollback"):
+            if status not in ("succeeded", "failed"):
+                raise ValueError(
+                    f"{action} result for product {product!r} must be "
+                    "succeeded or failed"
+                )
+        elif status != "blocked":
+            raise ValueError(
+                f"block result for product {product!r} must be blocked"
+            )
+        if status == "succeeded":
+            if reason:
+                raise ValueError(
+                    f"succeeded result for product {product!r} must carry "
+                    "an empty reason"
+                )
+        elif not reason:
+            raise ValueError(
+                f"{status} result for product {product!r} must carry a "
+                "non-empty reason"
+            )
+        receipts.append([product, action, current, target, affected, status,
+                         reason, failures])
+
+    if by_product:
+        product = next(iter(by_product))
+        raise ValueError(f"unknown result for product {product!r}")
+
+    ready = all(receipt[1] == "publish" and receipt[5] == "succeeded"
+                for receipt in receipts)
+    return _format_delivery_receipt(receipts, ready)
