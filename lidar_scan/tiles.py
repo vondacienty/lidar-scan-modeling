@@ -13885,7 +13885,10 @@ def update_recovery_index(index, items) -> str:
         if combined:
             chain_start = entry["units"][0][0][3] if entry["units"] \
                 else entry["plan_snapshot"]
-            if chain_start != previous_end:
+            # A completed zero-todo plan ends at null: like the start of an
+            # index it carries no state, so it leaves the next boundary
+            # unconstrained; a real end snapshot must still be matched.
+            if previous_end is not None and chain_start != previous_end:
                 raise ValueError("consecutive items must chain at the "
                                  "previous history's end")
         combined.append(entry)
@@ -13900,29 +13903,166 @@ def update_recovery_index(index, items) -> str:
                                  "index")
             seen.add(batch_id)
 
-    if not entries:
-        snapshot = None
-        resume_text = "null"
-        complete = True
-    else:
-        last = entries[-1]
-        snapshot = last["end"]
-        complete = last["complete"]
-        if complete:
-            resume_text = "null"
-        else:
-            resume_text = "[" + str(len(entries) - 1) + "," + \
-                last["resume"] + "]"
+    return _format_recovery_index(entries)
 
+
+def _recovery_entry_text(entry: dict) -> str:
+    """Render one index ``[plan, history]`` entry byte for byte."""
+    return "[" + entry["plan"] + "," + entry["history"] + "]"
+
+
+def _format_recovery_index(entries: list) -> str:
+    """Render canonical ``entries``/``snapshot``/``resume``/``complete``.
+
+    ``entries`` use the dict shape produced by
+    :func:`_decode_recovery_index`; ``resume`` points at the last entry
+    only while it is in progress.
+    """
+    if not entries:
+        return '{"entries":[],"snapshot":null,"resume":null,' \
+            '"complete":true}'
+    last = entries[-1]
+    snapshot = last["end"]
+    if last["complete"]:
+        resume_text = "null"
+    else:
+        resume_text = "[" + str(len(entries) - 1) + "," + last["resume"] + "]"
     parts = ['{"entries":[']
-    parts.append(",".join("[" + entry["plan"] + "," + entry["history"] + "]"
-                          for entry in entries))
+    parts.append(",".join(_recovery_entry_text(entry) for entry in entries))
     parts.append('],"snapshot":')
     parts.append("null" if snapshot is None else snapshot)
     parts.append(',"resume":')
     parts.append(resume_text)
     parts.append(',"complete":')
-    parts.append("true" if complete else "false")
+    parts.append("true" if last["complete"] else "false")
+    parts.append("}")
+    return "".join(parts)
+
+
+def merge_recovery_indexes(indexes) -> str:
+    """Concatenate canonical :func:`update_recovery_index` documents.
+
+    ``indexes`` must be a ``tuple`` whose items are each a ``str``
+    byte-for-byte matching a previous output of
+    :func:`update_recovery_index`. Empty indexes are skipped in tuple
+    order and the surviving entries are concatenated as though appended
+    through a single index.
+
+    Where two non-empty indexes meet, the same rules apply as in
+    :func:`update_recovery_index`: if the previous index's last entry is
+    in progress, the next index's first entry must continue that same
+    plan with a history strictly extending the old ``runs`` and ``audit``
+    prefixes, replacing the old entry; a completed entry (including a
+    plan with zero units left) can never be replaced or repeated. The
+    history at the join must chain: the next entry's start must equal the
+    previous history's end (a completed zero-todo plan ends at ``null``
+    and leaves the boundary unconstrained). No audit batch id may appear
+    in two different entries of the merged index.
+
+    Returns a canonical compact JSON document with exactly the five
+    top-level keys ``entries``, ``audit``, ``snapshot``, ``resume`` and
+    ``complete`` in that order. ``entries`` embeds each ``[plan,
+    history]`` pair byte for byte. ``audit`` is the entries' audit rows
+    in order as ``[entry_index, batch_id, status]`` triples with
+    ``entry_index`` the zero-based position in ``entries``. ``snapshot``
+    is the last history's ``end``, or ``null`` when no entry survives.
+    ``resume`` is ``[entry_index, state]`` for the last entry only while
+    it is in progress and ``null`` otherwise; ``complete`` is true only
+    when no entry survives or the last entry is complete. An empty tuple
+    (or one holding only empty indexes) yields empty arrays, null
+    ``snapshot``/``resume`` and ``complete`` true. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline; inputs
+    are never modified and merging the same indexes again returns a
+    byte-identical document.
+
+    :raises TypeError: ``indexes`` is not a tuple or a member is not a
+        ``str``.
+    :raises ValueError: a member is not a canonical index, a completed
+        plan (a zero-todo plan included) is repeated or rewritten, a
+        replacement does not strictly extend the unfinished last entry
+        for the same plan, histories do not chain at the join, or a batch
+        id repeats across the merged index.
+    """
+    if not isinstance(indexes, tuple):
+        raise TypeError("indexes must be a tuple")
+    for value in indexes:
+        if not isinstance(value, str):
+            raise TypeError("each index must be a str")
+
+    groups = []
+    for text in indexes:
+        entries = _decode_recovery_index(text)
+        if entries:
+            groups.append(entries)
+    if not groups:
+        return '{"entries":[],"audit":[],"snapshot":null,"resume":null,' \
+            '"complete":true}'
+
+    combined = list(groups[0])
+    for entries in groups[1:]:
+        previous = combined[-1]
+        first = entries[0]
+        if previous["complete"]:
+            if first["plan"] == previous["plan"]:
+                raise ValueError("a completed plan may not be appended to the "
+                                 "index again")
+            base = combined
+        else:
+            if first["plan"] != previous["plan"]:
+                raise ValueError("the next index must continue the previous "
+                                 "index's unfinished plan")
+            if not _history_strictly_extends(previous, first):
+                raise ValueError("the replacement history must strictly "
+                                 "extend the previous index's unfinished "
+                                 "history")
+            base = combined[:-1]
+        combined = list(base)
+        previous_end = combined[-1]["end"] if combined else None
+        for entry in entries:
+            if combined:
+                chain_start = entry["units"][0][0][3] if entry["units"] \
+                    else entry["plan_snapshot"]
+                # A completed zero-todo plan ends at null and leaves the
+                # next boundary unconstrained, just like the index start.
+                if previous_end is not None and chain_start != previous_end:
+                    raise ValueError("indexes must chain at the shared "
+                                     "history boundary")
+            combined.append(entry)
+            previous_end = entry["end"]
+
+    seen_plans = set()
+    seen = set()
+    audit_text = []
+    for position, entry in enumerate(combined):
+        if entry["complete"] and entry["plan"] in seen_plans:
+            raise ValueError("a completed plan may not appear more than once "
+                             "in the merged index")
+        seen_plans.add(entry["plan"])
+        for batch_id, status in entry["audit"]:
+            if batch_id in seen:
+                raise ValueError(f"duplicate batch id {batch_id!r} across the "
+                                 "merged index")
+            seen.add(batch_id)
+            audit_text.append(
+                "[" + str(position) + "," + _json_string(batch_id) + ","
+                + _json_string(status) + "]")
+    last = combined[-1]
+    snapshot = last["end"]
+    if last["complete"]:
+        resume_text = "null"
+    else:
+        resume_text = "[" + str(len(combined) - 1) + "," \
+            + last["resume"] + "]"
+    parts = ['{"entries":[']
+    parts.append(",".join(_recovery_entry_text(entry) for entry in combined))
+    parts.append('],"audit":[')
+    parts.append(",".join(audit_text))
+    parts.append('],"snapshot":')
+    parts.append("null" if snapshot is None else snapshot)
+    parts.append(',"resume":')
+    parts.append(resume_text)
+    parts.append(',"complete":')
+    parts.append("true" if last["complete"] else "false")
     parts.append("}")
     return "".join(parts)
 
@@ -14024,7 +14164,10 @@ def _decode_recovery_index(text: str) -> list:
             raise ValueError("only the last index entry may be incomplete")
         if entries:
             chain_start = units[0][0][3] if units else plan_snapshot
-            if chain_start != entries[-1]["end"]:
+            previous_end = entries[-1]["end"]
+            # A completed zero-todo plan ends at null and leaves the next
+            # boundary unconstrained, just like the start of the index.
+            if previous_end is not None and chain_start != previous_end:
                 raise ValueError("index entries must chain at the previous "
                                  "history's end")
         for batch_id, _status in hist_audit:

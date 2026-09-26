@@ -151,6 +151,26 @@ def test_completed_entries_are_kept_not_replaced(scene):
     assert update_recovery_index(index, ()) == index
 
 
+def test_completed_zero_todo_plan_chains_at_null(scene):
+    log, _snaps = recovery_fixtures._chain()
+    plan_zero = plan_checkout_recovery(log, None, ())
+    history_zero = build_recovery_history(plan_zero, ())
+    index = update_recovery_index(None, ((plan_zero, history_zero),))
+    # a completed zero-todo plan ends at null and must not block a fresh
+    # plan starting there
+    text = update_recovery_index(
+        index, ((scene["plan_one"], scene["completed_one"]),))
+    document = json.loads(text)
+    assert len(document["entries"]) == 2
+    assert document["complete"] is True
+    # the same completed zero-todo plan may be recorded again
+    repeated = update_recovery_index(index, ((plan_zero, history_zero),))
+    assert json.loads(repeated)["complete"] is True
+    assert len(json.loads(repeated)["entries"]) == 2
+    # and the resulting index round-trips through the validator
+    assert update_recovery_index(repeated, ()) == repeated
+
+
 # ---------------------------------------------------------------------------
 # type validation
 # ---------------------------------------------------------------------------
