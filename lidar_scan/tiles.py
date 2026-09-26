@@ -13820,7 +13820,9 @@ def update_recovery_index(index, items) -> str:
         non-last item is incomplete, a replacement does not strictly
         extend the index's unfinished last entry for the same plan, a
         completed entry would be replaced, consecutive items do not
-        chain, or a batch id repeats across the index.
+        chain, a completed plan (including one with no remaining units)
+        would be appended again, or a batch id repeats across the
+        index.
     """
     if index is not None and not isinstance(index, str):
         raise TypeError("index must be None or a str")
@@ -13880,6 +13882,10 @@ def update_recovery_index(index, items) -> str:
         replace = True
     base = entries[:-1] if replace else list(entries)
     combined = list(base)
+    completed_plans = set()
+    for entry in base:
+        if entry["complete"]:
+            completed_plans.add(entry["plan"])
     previous_end = base[-1]["end"] if base else None
     for entry in decoded_items:
         if combined:
@@ -13888,7 +13894,12 @@ def update_recovery_index(index, items) -> str:
             if chain_start != previous_end:
                 raise ValueError("consecutive items must chain at the "
                                  "previous history's end")
+            if entry["plan"] in completed_plans:
+                raise ValueError("a completed plan may not be appended "
+                                 "again")
         combined.append(entry)
+        if entry["complete"]:
+            completed_plans.add(entry["plan"])
         previous_end = entry["end"]
     entries = combined
 
@@ -13979,8 +13990,9 @@ def _decode_recovery_index(text: str) -> list:
 
     :raises ValueError: the document is malformed, an embedded document is
         not canonical for its plan, entries do not chain, a non-last entry
-        is incomplete, the snapshot/resume/complete fields disagree, a
-        batch id repeats, or the text is not its canonical encoding.
+        is incomplete, a completed plan appears twice, the
+        snapshot/resume/complete fields disagree, a batch id repeats, or
+        the text is not its canonical encoding.
     """
     try:
         node = _parse_json_node(text, _skip_json_ws(text, 0))
@@ -13999,6 +14011,7 @@ def _decode_recovery_index(text: str) -> list:
         raise ValueError('index "entries" must be an array')
     entries = []
     seen = set()
+    completed_plans = set()
     for position, entry_node in enumerate(entry_nodes):
         children = entry_node[0]
         if not isinstance(children, list) or len(children) != 2:
@@ -14027,11 +14040,16 @@ def _decode_recovery_index(text: str) -> list:
             if chain_start != entries[-1]["end"]:
                 raise ValueError("index entries must chain at the previous "
                                  "history's end")
+            if plan in completed_plans:
+                raise ValueError("a completed plan may not appear twice in "
+                                 "the index")
         for batch_id, _status in hist_audit:
             if batch_id in seen:
                 raise ValueError(f"duplicate batch id {batch_id!r} across the "
                                  "index")
             seen.add(batch_id)
+        if hist_complete:
+            completed_plans.add(plan)
         entries.append({
             "plan": plan, "history": history, "units": units,
             "plan_snapshot": plan_snapshot, "start": hist_start,
@@ -14097,3 +14115,128 @@ def _decode_recovery_index(text: str) -> list:
     if "".join(parts) != text:
         raise ValueError("index is not its canonical encoding")
     return entries
+
+
+def merge_recovery_indexes(indexes) -> str:
+    """Merge canonical :func:`update_recovery_index` indexes into one index.
+
+    ``indexes`` must be a ``tuple`` whose items are each a ``str``
+    byte-for-byte matching a canonical output of
+    :func:`update_recovery_index`.
+
+    The indexes are read in tuple order and empty indexes (those holding
+    no entry) are ignored. The remaining entries are concatenated into a
+    single sequence: every entry must chain onto the previous one, its
+    recovery starting exactly where the previous history ended. When the
+    entries merged so far end in an unfinished recovery, the next
+    non-empty index's first entry must continue that same plan: its
+    history must keep the unfinished history's ``runs`` and ``audit``
+    prefix, strictly extending both, and the unfinished entry is replaced
+    by the extension. A completed plan (including one with no remaining
+    units) may never appear again, a completed entry can never be
+    replaced, and no audit batch id may repeat across the whole merge.
+
+    Returns the canonical compact JSON document with exactly the five
+    top-level keys ``entries``, ``audit``, ``snapshot``, ``resume`` and
+    ``complete`` in that order. ``entries`` preserves the merged order,
+    each entry a two-item array embedding the plan object and then the
+    history object byte for byte. ``audit`` flattens the merged entries'
+    audit rows in entry order, each row a three-item array
+    ``[entry_index, batch_id, status]`` with ``entry_index`` the
+    zero-based position of the entry the row belongs to. ``snapshot`` is
+    the last history's ``end`` snapshot, or ``null`` when the merge holds
+    no entry (or that end is null). ``resume`` is ``[entry_index, state]``
+    with ``entry_index`` the zero-based position of the last entry and
+    ``state`` that history's embedded :func:`execute_checkout_recovery`
+    resume object when the last entry is in progress, and ``null``
+    otherwise. ``complete`` is true only when the merge holds no entry or
+    its last entry is complete. The output uses ``ensure_ascii=False``,
+    no whitespace and no trailing newline; the inputs are never modified
+    and repeated calls return a byte-identical document.
+
+    :raises TypeError: ``indexes`` is not a ``tuple`` or an item is not a
+        ``str``.
+    :raises ValueError: an index is malformed or not its canonical
+        encoding, consecutive entries do not chain at the previous
+        history's end, the first entry of an index does not continue the
+        previous index's unfinished plan for the same plan, a replacement
+        history does not strictly extend the unfinished history, a
+        completed plan appears again, or a batch id repeats across the
+        merge.
+    """
+    if not isinstance(indexes, tuple):
+        raise TypeError("indexes must be a tuple")
+    for index in indexes:
+        if not isinstance(index, str):
+            raise TypeError("each index must be a str")
+
+    merged = []
+    completed_plans = set()
+    for index in indexes:
+        entries = _decode_recovery_index(index)
+        if not entries:
+            continue
+        position = 0
+        if merged and not merged[-1]["complete"]:
+            old = merged[-1]
+            first = entries[0]
+            if first["plan"] != old["plan"]:
+                raise ValueError("the first entry must continue the "
+                                 "previous index's unfinished plan")
+            if not _history_strictly_extends(old, first):
+                raise ValueError("the replacement history must strictly "
+                                 "extend the unfinished history")
+            merged[-1] = first
+            if first["complete"]:
+                completed_plans.add(first["plan"])
+            position = 1
+        for entry in entries[position:]:
+            if merged:
+                if entry["start"] != merged[-1]["end"]:
+                    raise ValueError("consecutive entries must chain at the "
+                                     "previous history's end")
+                if entry["plan"] in completed_plans:
+                    raise ValueError("a completed plan may not be repeated")
+            merged.append(entry)
+            if entry["complete"]:
+                completed_plans.add(entry["plan"])
+
+    seen = set()
+    audit_rows = []
+    for entry_index, entry in enumerate(merged):
+        for batch_id, status in entry["audit"]:
+            if batch_id in seen:
+                raise ValueError(f"duplicate batch id {batch_id!r} across "
+                                 "the merge")
+            seen.add(batch_id)
+            audit_rows.append("[" + str(entry_index) + ","
+                              + _json_string(batch_id) + ","
+                              + _json_string(status) + "]")
+
+    if not merged:
+        snapshot = None
+        resume_text = "null"
+        complete = True
+    else:
+        last = merged[-1]
+        snapshot = last["end"]
+        complete = last["complete"]
+        if complete:
+            resume_text = "null"
+        else:
+            resume_text = "[" + str(len(merged) - 1) + "," + \
+                last["resume"] + "]"
+
+    parts = ['{"entries":[']
+    parts.append(",".join("[" + entry["plan"] + "," + entry["history"] + "]"
+                          for entry in merged))
+    parts.append('],"audit":[')
+    parts.append(",".join(audit_rows))
+    parts.append('],"snapshot":')
+    parts.append("null" if snapshot is None else snapshot)
+    parts.append(',"resume":')
+    parts.append(resume_text)
+    parts.append(',"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
