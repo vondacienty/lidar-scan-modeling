@@ -12955,3 +12955,118 @@ def execute_checkout_recovery(plan: str, state=None, max_units=None) -> str:
         units[-1][0][4] if units else plan_snapshot)
     return _format_checkout_recovery_state(
         common, direction, target, records, snapshot, complete)
+
+
+def build_recovery_receipt(plan: str, states: tuple) -> str:
+    """Build a receipt across a sequence of :func:`execute_checkout_recovery`
+    states of one :func:`plan_checkout_recovery` plan.
+
+    ``plan`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`plan_checkout_recovery`. ``states`` must be a ``tuple`` whose
+    items are each a ``str`` byte-for-byte matching a canonical output of
+    :func:`execute_checkout_recovery` for that same plan. The states are
+    read in tuple order: each state's ``common`` and ``direction`` must
+    agree with the plan, its ``confirmed`` count must strictly increase
+    over the previous state (starting from zero units confirmed before the
+    first state), its ``records`` must extend the previous state's records
+    by exactly the newly confirmed units, and its snapshot must match the
+    confirmed prefix.
+
+    Returns the canonical compact JSON document with exactly the five
+    top-level keys ``direction``, ``start``, ``end``, ``segments`` and
+    ``complete`` in that order. ``direction`` is the plan's active arm
+    (``"pending"``, ``"missing"`` or ``"none"``). ``start`` is the first
+    unit's ``before`` snapshot when the plan has units and otherwise the
+    plan's ``snapshot`` (possibly ``null``). ``end`` is the last state's
+    snapshot, or ``start`` when ``states`` is empty. ``segments`` follow
+    the states in order; each is ``[from, to, batches]`` with ``from`` zero
+    for the first segment and the previous state's ``confirmed`` count for
+    every later one, ``to`` this state's ``confirmed`` count, and
+    ``batches`` the ``[id, status]`` audit rows of the records newly
+    covered by this state with no id repeated anywhere in the receipt. An
+    empty ``states`` tuple yields ``"segments":[]``. ``complete`` is true
+    exactly when every unit is confirmed and ``end`` byte-for-byte equals
+    the plan's ``snapshot``; a plan with no units is complete. The output
+    uses ``ensure_ascii=False``, no whitespace and no trailing newline.
+
+    :raises TypeError: ``plan`` is not a ``str``, ``states`` is not a
+        ``tuple``, or a state is not a ``str``.
+    :raises ValueError: the plan is not the canonical plan encoding or is
+        forked (both arms non-empty), a state is malformed or not its
+        canonical encoding, a state's ``common`` or ``direction`` does not
+        match the plan, ``confirmed`` does not strictly increase, the
+        records do not extend the previous prefix, or a snapshot or batch
+        id is inconsistent.
+    """
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(states, tuple):
+        raise TypeError("states must be a tuple")
+
+    common, missing, pending, plan_snapshot = \
+        _decode_checkout_recovery_plan(plan)
+    if missing and pending:
+        raise ValueError("the plan forks: both missing and pending units "
+                         "remain")
+    if pending:
+        direction = "pending"
+        units = pending
+    elif missing:
+        direction = "missing"
+        units = missing
+    else:
+        direction = "none"
+        units = []
+
+    if units:
+        start_snapshot = units[0][0][3]
+    else:
+        start_snapshot = plan_snapshot
+
+    segments = []
+    previous_confirmed = 0
+    previous_snapshot = start_snapshot
+    seen_ids = set()
+    end_snapshot = start_snapshot
+    for state in states:
+        if not isinstance(state, str):
+            raise TypeError("each state must be a str")
+        confirmed, records, snapshot = _decode_checkout_recovery_state(
+            state, common, direction, units, plan_snapshot)
+        if confirmed <= previous_confirmed:
+            raise ValueError('state "confirmed" must strictly increase '
+                             "across the states")
+        batches = []
+        for unit in records[previous_confirmed:]:
+            for batch_id, status in unit[1]:
+                if batch_id in seen_ids:
+                    raise ValueError(f"duplicate batch id {batch_id!r}")
+                seen_ids.add(batch_id)
+                batches.append((batch_id, status))
+        if previous_snapshot is not None \
+                and records[previous_confirmed][0][3] != previous_snapshot:
+            raise ValueError("the state's new records do not extend the "
+                             "previous state's records")
+        segments.append([previous_confirmed, confirmed, batches])
+        previous_confirmed = confirmed
+        previous_snapshot = snapshot
+        end_snapshot = snapshot
+
+    complete = previous_confirmed == len(units) \
+        and end_snapshot == (units[-1][0][4] if units else plan_snapshot)
+
+    parts = ['{"direction":', _json_string(direction), ',"start":',
+             "null" if start_snapshot is None else start_snapshot,
+             ',"end":',
+             "null" if end_snapshot is None else end_snapshot,
+             ',"segments":[']
+    segment_text = []
+    for origin, target, batches in segments:
+        segment_text.append("[" + str(origin) + "," + str(target) + ",["
+                            + ",".join(_checkout_audit_row_text(row)
+                                       for row in batches) + "]]")
+    parts.append(",".join(segment_text))
+    parts.append('],"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
