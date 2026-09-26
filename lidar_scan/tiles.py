@@ -9455,3 +9455,567 @@ def merge_delivery_receipts(receipts: tuple) -> str:
     ready = all(product[1] == "publish" and product[6] == "succeeded"
                 for product in products)
     return _format_merged_receipts(products, ready)
+
+
+def _decode_receipt_fields(raw_fields) -> list:
+    """Validate the seven receipt fields shared by merged receipts and
+    delivery snapshots.
+
+    ``raw_fields`` must be a list of the seven decoded values ``[action,
+    current, target, affected, history, final, failures]``. Returns the
+    normalized row with ``affected`` a list of non-bool ints, ``history`` a
+    non-empty list of ``[status, reason]`` pairs and ``failures`` normalized
+    by :func:`_decode_failure_rows`.
+
+    :raises ValueError: any field violates the receipt contract.
+    """
+    (action, current, target, raw_affected, raw_history, final,
+     raw_failures) = raw_fields
+    if action not in ("publish", "rollback", "block"):
+        raise ValueError("receipt action must be publish, rollback or "
+                         "block")
+    if not isinstance(current, str):
+        raise ValueError("receipt current must be a str")
+    if not current or not set(current) <= _DELIVERY_IDENT_CHARS:
+        raise ValueError(
+            "receipt current must be non-empty and contain only ASCII "
+            "alphanumeric characters and ._-"
+        )
+    if target is not None and not isinstance(target, str):
+        raise ValueError("receipt target must be null or a str")
+    if target is not None and (
+            not target or not set(target) <= _DELIVERY_IDENT_CHARS):
+        raise ValueError(
+            "receipt target must be non-empty and contain only ASCII "
+            "alphanumeric characters and ._-"
+        )
+    if not isinstance(raw_affected, list):
+        raise ValueError("receipt affected must be an array")
+    affected = []
+    for batch in raw_affected:
+        if isinstance(batch, bool) or not isinstance(batch, int):
+            raise ValueError("receipt affected batches must be non-bool "
+                             "integers")
+        if batch < 0:
+            raise ValueError("receipt affected batches must be "
+                             "non-negative")
+        affected.append(batch)
+    if any(affected[index] >= affected[index + 1]
+           for index in range(len(affected) - 1)):
+        raise ValueError("receipt affected batches must be strictly "
+                         "ascending")
+    if not isinstance(raw_history, list) or not raw_history:
+        raise ValueError("receipt history must be a non-empty array")
+    history = []
+    for raw_entry in raw_history:
+        if not isinstance(raw_entry, list) or len(raw_entry) != 2:
+            raise ValueError("each receipt history entry must be an array "
+                             "of two values")
+        status, reason = raw_entry
+        if status not in ("succeeded", "failed", "blocked"):
+            raise ValueError("receipt history status must be succeeded, "
+                             "failed or blocked")
+        if not isinstance(reason, str):
+            raise ValueError("receipt history reason must be a str")
+        history.append([status, reason])
+    if final not in ("succeeded", "failed", "blocked"):
+        raise ValueError("receipt final must be succeeded, failed or "
+                         "blocked")
+    if history[-1][0] != final:
+        raise ValueError("receipt final must equal the status of its last "
+                         "history entry")
+
+    failures = _decode_failure_rows(raw_failures)
+
+    # Field associations mirror the plan contract: a publish carries no
+    # target delta or failure state; a rollback or block lists at least one
+    # affected batch and one failure, and the failures expand exactly the
+    # affected batches in batch order.
+    if action == "publish":
+        if target != current or affected or failures:
+            raise ValueError("a publish receipt must target current with "
+                             "no affected batches or failures")
+    else:
+        if action == "rollback" and target is None:
+            raise ValueError("a rollback receipt must carry a non-null "
+                             "target")
+        if action == "block" and target is not None:
+            raise ValueError("a block receipt must carry a null target")
+        if not affected or not failures:
+            raise ValueError("a rollback or block receipt must list an "
+                             "affected batch and a failure")
+        failure_batches = [failure[0] for failure in failures]
+        if any(failure_batches[index] > failure_batches[index + 1]
+               for index in range(len(failure_batches) - 1)):
+            raise ValueError("receipt failures must be ordered by batch")
+        if sorted(set(failure_batches)) != affected:
+            raise ValueError("receipt affected batches must match the "
+                             "batches of its failures")
+
+    # Every history entry resolves like its receipt: a publish or rollback
+    # is succeeded or failed, a block stays blocked, and only a succeeded
+    # entry carries no reason.
+    for status, reason in history:
+        if action in ("publish", "rollback"):
+            if status not in ("succeeded", "failed"):
+                raise ValueError("a publish or rollback history entry must "
+                                 "be succeeded or failed")
+        elif status != "blocked":
+            raise ValueError("a block history entry must be blocked")
+        if status == "succeeded":
+            if reason:
+                raise ValueError("a succeeded history entry must carry an "
+                                 "empty reason")
+        elif not reason:
+            raise ValueError("a failed or blocked history entry must "
+                             "carry a non-empty reason")
+
+    return [action, current, target, affected, history, final, failures]
+
+
+def _decode_merged_receipts(text: str) -> list:
+    """Parse and validate a canonical :func:`merge_delivery_receipts` string.
+
+    Returns a list of ``[product, action, current, target, affected,
+    history, final, failures]`` rows in document order (``target`` is
+    ``None`` or a version string, ``affected`` a list of batch ints,
+    ``history`` a non-empty list of ``[status, reason]`` pairs and
+    ``failures`` a list of normalized failure rows; see
+    :func:`_decode_failure_rows`).
+
+    Beyond JSON, shape and canonical-format checks, the merged contract is
+    revalidated: the seven per-product fields satisfy the receipt contract
+    (see :func:`_decode_receipt_fields`), ``final`` equals the status of the
+    last history entry, products are sorted uniquely by name, and the
+    top-level ``ready`` flag is true exactly when every product's action is
+    ``publish`` and its ``final`` status is ``succeeded`` (an empty product
+    set being ``true``).
+
+    :raises ValueError: the JSON syntax or shape is bad, a value violates
+        the merged receipts contract, the text is not the canonical merged
+        receipts encoding, or the top-level ``ready`` flag is inconsistent.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("merged receipts are not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"products",
+                                                           "ready"}:
+        raise ValueError("merged receipts top-level value must be an "
+                         "object with only 'products' and 'ready'")
+    raw_products = document["products"]
+    if not isinstance(raw_products, list):
+        raise ValueError("'products' must be an array")
+    ready = document["ready"]
+    if not isinstance(ready, bool):
+        raise ValueError("'ready' must be a boolean")
+
+    products = []
+    for raw_product in raw_products:
+        if not isinstance(raw_product, list) or len(raw_product) != 8:
+            raise ValueError("each product must be an array of eight "
+                             "values")
+        product = raw_product[0]
+        if not isinstance(product, str):
+            raise ValueError("product name must be a str")
+        if not product or not set(product) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "product name must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+        products.append([product]
+                        + _decode_receipt_fields(raw_product[1:]))
+
+    # Products must appear strictly ascending by name; a byte-for-byte
+    # re-encode alone would tolerate reordering.
+    names = [product[0] for product in products]
+    if any(names[index] >= names[index + 1]
+           for index in range(len(names) - 1)):
+        raise ValueError("products must be sorted uniquely by product "
+                         "name")
+
+    if ready != all(product[1] == "publish" and product[6] == "succeeded"
+                    for product in products):
+        raise ValueError("'ready' must be true exactly when every product "
+                         "is a publish whose final status is succeeded")
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal metric formatting and any other
+    # non-canonical spelling.
+    if _format_merged_receipts(products, ready) != text:
+        raise ValueError("merged receipts are not the canonical merged "
+                         "receipts encoding")
+    return products
+
+
+def _batch_gaps(batches: list) -> list:
+    """Compress the numbers missing from ``batches`` within ``[0, max]``.
+
+    ``batches`` is a non-empty list of distinct non-negative integers.
+    Returns the maximal closed intervals ``[first, last]`` of the integers
+    between ``0`` and the greatest batch that no batch covers, in ascending
+    order; the result is empty when every number is covered.
+    """
+    present = set(batches)
+    final = max(batches)
+    gaps = []
+    first = None
+    for number in range(final + 1):
+        if number in present:
+            if first is not None:
+                gaps.append([first, number - 1])
+                first = None
+        elif first is None:
+            first = number
+    if first is not None:
+        gaps.append([first, final])
+    return gaps
+
+
+def _format_receipt_fields(fields: list) -> str:
+    """Serialize the seven receipt fields to the compact array body."""
+    action, current, target, affected, history, final, failures = fields
+    parts = ["[" + _json_string(action) + "," + _json_string(current) + ","]
+    parts.append("null" if target is None else _json_string(target))
+    parts.append(",[" + ",".join(str(batch) for batch in affected) + "],[")
+    parts.append(",".join("[" + _json_string(status) + ","
+                          + _json_string(reason) + "]"
+                          for status, reason in history))
+    parts.append("]," + _json_string(final) + ",[")
+    parts.append(_format_failure_rows(failures))
+    parts.append("]]")
+    return "".join(parts)
+
+
+def _format_delivery_snapshot(products: list, ready: bool) -> str:
+    """Serialize per-product snapshot rows to the two-key document."""
+    parts = ['{"products":[']
+    for index, (product, versions, gaps, receipt) in enumerate(products):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(product) + ",[")
+        for version_index, (batch, previous, version,
+                            passed) in enumerate(versions):
+            if version_index:
+                parts.append(",")
+            parts.append("[" + str(batch) + ",")
+            parts.append("null" if previous is None
+                         else _json_string(previous))
+            parts.append("," + _json_string(version) + ",")
+            parts.append("true]" if passed else "false]")
+        parts.append("],[")
+        parts.append(",".join("[" + str(first) + "," + str(last) + "]"
+                              for first, last in gaps))
+        parts.append("],")
+        parts.append("null" if receipt is None
+                     else _format_receipt_fields(receipt))
+        parts.append("]")
+    parts.append('],"ready":')
+    parts.append("true}" if ready else "false}")
+    return "".join(parts)
+
+
+def _snapshot_ready(products: list) -> bool:
+    """Compute the snapshot ``ready`` flag from its product rows.
+
+    Ready exactly when every product has no batch gaps, its last version
+    passed and it carries a receipt whose action is ``publish`` and whose
+    ``final`` status is ``succeeded``; an empty product set is ready.
+    """
+    return all(not gaps
+               and receipt is not None
+               and versions[-1][3]
+               and receipt[0] == "publish"
+               and receipt[5] == "succeeded"
+               for _product, versions, gaps, receipt in products)
+
+
+def build_delivery_snapshot(changes: str, receipts: str) -> str:
+    """Build a per-product delivery snapshot from changes and receipts.
+
+    ``changes`` must be a ``str`` byte-for-byte matching the canonical
+    output of :func:`merge_delivery_manifests`: the compact document whose
+    sole top-level keys are ``changes`` and ``releasable`` in that order,
+    with changes ``[batch, product, previous, version, passed, failures]``
+    sorted uniquely by ``(batch, product)``. ``receipts`` must be a ``str``
+    byte-for-byte matching the canonical output of
+    :func:`merge_delivery_receipts`: the compact document whose sole
+    top-level keys are ``products`` and ``ready`` in that order, with
+    products ``[product, action, current, target, affected, history, final,
+    failures]`` sorted uniquely by product name. Every receipt product must
+    appear in ``changes`` and its ``current`` must equal the version of
+    that product's last (greatest-batch) change.
+
+    Returns a canonical compact JSON document with exactly the two keys
+    ``products`` and ``ready`` in that order. Products are sorted
+    lexicographically by name and each product is the array ``[product,
+    versions, gaps, receipt]``. ``versions`` lists the product's changes in
+    ascending batch order as ``[batch, previous, version, passed]`` arrays.
+    ``gaps`` compresses the batch numbers missing between ``0`` and the
+    product's final batch into maximal closed intervals ``[first, last]``.
+    ``receipt`` is ``null`` when the merged receipts do not cover the
+    product, otherwise the product's merged receipt row without its name:
+    ``[action, current, target, affected, history, final, failures]``.
+    ``ready`` is true only when every product has no gaps, its last version
+    passed and it carries a receipt whose action is ``publish`` and whose
+    ``final`` status is ``succeeded``; an empty product set yields
+    ``{"products":[],"ready":true}``. Strings use ``ensure_ascii=False``,
+    integers are decimal, the four failure metrics use exactly six decimal
+    places (negative zero written as ``0.000000``), ``NaN``/``Infinity``
+    never appear and the output has no whitespace or trailing newline. The
+    inputs are never modified and repeated calls return a byte-identical
+    document.
+
+    :raises TypeError: ``changes`` or ``receipts`` is not a ``str``.
+    :raises ValueError: either document is not its canonical encoding, a
+        receipt product is unknown to the changes, or a receipt's
+        ``current`` is not the version of its product's last change.
+    """
+    if not isinstance(changes, str):
+        raise TypeError("changes must be a str")
+    if not isinstance(receipts, str):
+        raise TypeError("receipts must be a str")
+
+    decoded_changes, _releasable = _decode_delivery_changes(changes)
+    receipt_rows = _decode_merged_receipts(receipts)
+
+    versions_by_product = {}
+    for batch, product, previous, version, passed, _failures in (
+            decoded_changes):
+        versions_by_product.setdefault(product, []).append(
+            [batch, previous, version, passed])
+
+    receipts_by_product = {}
+    for row in receipt_rows:
+        product = row[0]
+        if product not in versions_by_product:
+            raise ValueError(f"receipt product {product!r} is unknown to "
+                             "the changes")
+        receipts_by_product[product] = row[1:]
+
+    products = []
+    for product in sorted(versions_by_product):
+        # Changes are (batch, product)-sorted, so each product's versions
+        # are already in ascending batch order.
+        versions = versions_by_product[product]
+        receipt = receipts_by_product.get(product)
+        if receipt is not None and receipt[1] != versions[-1][2]:
+            raise ValueError(f"receipt current for product {product!r} "
+                             "must equal the version of its last change")
+        products.append([product, versions,
+                         _batch_gaps([version[0] for version in versions]),
+                         receipt])
+
+    return _format_delivery_snapshot(products, _snapshot_ready(products))
+
+
+def _decode_delivery_snapshot(text: str) -> list:
+    """Parse and validate a canonical :func:`build_delivery_snapshot` string.
+
+    Returns a list of ``[product, versions, gaps, receipt]`` rows in
+    document order, where ``versions`` is a non-empty list of ``[batch,
+    previous, version, passed]`` (``previous`` is ``None`` or a version
+    string), ``gaps`` a list of ``[first, last]`` intervals and ``receipt``
+    ``None`` or the seven-field receipt row (see
+    :func:`_decode_receipt_fields`).
+
+    Beyond JSON, shape and canonical-format checks, the snapshot contract
+    is revalidated: versions are sorted uniquely by batch with ``previous``
+    chaining to the preceding batch's version (``null`` for the first) and
+    no version reused; ``gaps`` are exactly the maximal closed intervals of
+    the batch numbers missing between ``0`` and the final batch; a non-null
+    receipt's ``current`` equals the last version; products are sorted
+    uniquely by name; and the top-level ``ready`` flag is true exactly when
+    every product is gap-free, its last version passed and it carries a
+    ``publish`` receipt whose ``final`` status is ``succeeded`` (an empty
+    product set being ``true``).
+
+    :raises ValueError: the JSON syntax or shape is bad, a value violates
+        the snapshot contract, the text is not the canonical snapshot
+        encoding, or the top-level ``ready`` flag is inconsistent.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("snapshot is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"products",
+                                                           "ready"}:
+        raise ValueError("snapshot top-level value must be an object with "
+                         "only 'products' and 'ready'")
+    raw_products = document["products"]
+    if not isinstance(raw_products, list):
+        raise ValueError("'products' must be an array")
+    ready = document["ready"]
+    if not isinstance(ready, bool):
+        raise ValueError("'ready' must be a boolean")
+
+    products = []
+    for raw_product in raw_products:
+        if not isinstance(raw_product, list) or len(raw_product) != 4:
+            raise ValueError("each product must be an array of four "
+                             "values")
+        product, raw_versions, raw_gaps, raw_receipt = raw_product
+        if not isinstance(product, str):
+            raise ValueError("product name must be a str")
+        if not product or not set(product) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "product name must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+
+        if not isinstance(raw_versions, list) or not raw_versions:
+            raise ValueError("product versions must be a non-empty array")
+        versions = []
+        for raw_version in raw_versions:
+            if not isinstance(raw_version, list) or len(raw_version) != 4:
+                raise ValueError("each version must be an array of four "
+                                 "values")
+            batch, previous, version, passed = raw_version
+            if isinstance(batch, bool) or not isinstance(batch, int):
+                raise ValueError("version batch must be a non-bool "
+                                 "integer")
+            if batch < 0:
+                raise ValueError("version batch must be non-negative")
+            if previous is not None and not isinstance(previous, str):
+                raise ValueError("version previous must be null or a str")
+            if previous is not None and (
+                    not previous
+                    or not set(previous) <= _DELIVERY_IDENT_CHARS):
+                raise ValueError(
+                    "version previous must be non-empty and contain only "
+                    "ASCII alphanumeric characters and ._-"
+                )
+            if not isinstance(version, str):
+                raise ValueError("version version must be a str")
+            if not version or not set(version) <= _DELIVERY_IDENT_CHARS:
+                raise ValueError(
+                    "version version must be non-empty and contain only "
+                    "ASCII alphanumeric characters and ._-"
+                )
+            if not isinstance(passed, bool):
+                raise ValueError("version passed flag must be a boolean")
+            versions.append([batch, previous, version, passed])
+
+        # Versions must appear strictly ascending by batch, chained by
+        # previous and never reusing a version.
+        batches = [version[0] for version in versions]
+        if any(batches[index] >= batches[index + 1]
+               for index in range(len(batches) - 1)):
+            raise ValueError("product versions must be sorted uniquely by "
+                             "batch")
+        seen_versions = set()
+        for version_index, (batch, previous, version, passed) in enumerate(
+                versions):
+            expected_previous = (None if version_index == 0
+                                 else versions[version_index - 1][2])
+            if previous != expected_previous:
+                raise ValueError("version previous must be the version of "
+                                 "the preceding batch")
+            if version in seen_versions:
+                raise ValueError(f"version {version!r} is reused by "
+                                 f"product {product!r}")
+            seen_versions.add(version)
+
+        if not isinstance(raw_gaps, list):
+            raise ValueError("product gaps must be an array")
+        gaps = []
+        for raw_gap in raw_gaps:
+            if not isinstance(raw_gap, list) or len(raw_gap) != 2:
+                raise ValueError("each gap must be an array of two values")
+            first, last = raw_gap
+            for name, value in (("first", first), ("last", last)):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(f"gap {name} must be a non-bool "
+                                     "integer")
+            if first < 0 or first > last:
+                raise ValueError("gap bounds must satisfy "
+                                 "0 <= first <= last")
+            gaps.append([first, last])
+        if gaps != _batch_gaps(batches):
+            raise ValueError("product gaps must be the maximal closed "
+                             "intervals of the batch numbers missing "
+                             "between 0 and the final batch")
+
+        receipt = None
+        if raw_receipt is not None:
+            if not isinstance(raw_receipt, list) or len(raw_receipt) != 7:
+                raise ValueError("product receipt must be null or an "
+                                 "array of seven values")
+            receipt = _decode_receipt_fields(raw_receipt)
+            if receipt[1] != versions[-1][2]:
+                raise ValueError("receipt current must equal the version "
+                                 "of the product's last change")
+
+        products.append([product, versions, gaps, receipt])
+
+    # Products must appear strictly ascending by name; a byte-for-byte
+    # re-encode alone would tolerate reordering.
+    names = [product[0] for product in products]
+    if any(names[index] >= names[index + 1]
+           for index in range(len(names) - 1)):
+        raise ValueError("products must be sorted uniquely by product "
+                         "name")
+
+    if ready != _snapshot_ready(products):
+        raise ValueError("'ready' must be true exactly when every product "
+                         "is gap-free, its last version passed and it "
+                         "carries a succeeded publish receipt")
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal metric formatting, negative zero as
+    # anything but ``0.000000``, leading zeros, exponents and any other
+    # non-canonical spelling.
+    if _format_delivery_snapshot(products, ready) != text:
+        raise ValueError("snapshot is not the canonical delivery snapshot "
+                         "encoding")
+    return products
+
+
+def _tupleize_json(value):
+    """Recursively convert decoded JSON arrays to tuples."""
+    if isinstance(value, list):
+        return tuple(_tupleize_json(item) for item in value)
+    return value
+
+
+def query_delivery_snapshot(snapshot: str, product: str) -> tuple | None:
+    """Look up one product row in a canonical delivery snapshot.
+
+    ``snapshot`` must be a ``str`` byte-for-byte matching the canonical
+    output of :func:`build_delivery_snapshot`: the compact document whose
+    sole top-level keys are ``products`` and ``ready`` in that order, with
+    products ``[product, versions, gaps, receipt]`` sorted uniquely by
+    product name. ``product`` is the product name to select.
+
+    Returns the product's row with every array recursively converted to a
+    tuple and every ``null`` converted to ``None`` — that is, a 4-tuple
+    ``(product, versions, gaps, receipt)`` where ``versions`` is a tuple of
+    ``(batch, previous, version, passed)`` tuples, ``gaps`` a tuple of
+    ``(first, last)`` tuples and ``receipt`` ``None`` or a 7-tuple
+    ``(action, current, target, affected, history, final, failures)``.
+    Returns ``None`` when the snapshot has no row for ``product``. The
+    input is never modified and repeated calls return equal results.
+
+    :raises TypeError: ``snapshot`` or ``product`` is not a ``str``.
+    :raises ValueError: ``snapshot`` is not the canonical delivery
+        snapshot encoding.
+    """
+    if not isinstance(snapshot, str):
+        raise TypeError("snapshot must be a str")
+    if not isinstance(product, str):
+        raise TypeError("product must be a str")
+
+    _decode_delivery_snapshot(snapshot)
+    document = json.loads(snapshot)
+    for raw_product in document["products"]:
+        if raw_product[0] == product:
+            return _tupleize_json(raw_product)
+    return None
