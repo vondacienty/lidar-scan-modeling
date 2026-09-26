@@ -12442,3 +12442,122 @@ def update_checkout_checkpoint(log: str, checkpoint, ledgers: tuple) -> str:
                         for row in new_audit))
     parts.append("]}")
     return "".join(parts)
+
+
+def _checkout_recovery_units(ranges: list, audit_rows: list) -> list:
+    """Group checkpoint rows into ``(range, audit_segment)`` units.
+
+    Each unit pairs one ``ranges`` row with the ``audit`` segment of
+    ``batch_count`` rows it covers, in row order.
+    """
+    units = []
+    position = 0
+    for row in ranges:
+        batch_count = row[2]
+        units.append((row, tuple(audit_rows[position:position + batch_count])))
+        position += batch_count
+    return units
+
+
+def _format_checkout_recovery_units(units: list) -> str:
+    """Format a ``missing``/``pending`` array of ``[range, audit]`` rows."""
+    rows = []
+    for range_row, segment in units:
+        rows.append("[" + _checkout_range_row_text(range_row) + ",["
+                    + ",".join(_checkout_audit_row_text(row)
+                               for row in segment) + "]]")
+    return ",".join(rows)
+
+
+def plan_checkout_recovery(log: str, checkpoint, ledgers: tuple) -> str:
+    """Plan how a checkpoint can recover from a replayed ledger batch.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log`; the whole chain is recomputed and validated.
+    ``checkpoint`` is either ``None`` (no accumulated state yet), a
+    ``str`` byte-for-byte matching the canonical output of
+    :func:`merge_checkout_logs`, or a ``str`` byte-for-byte matching a
+    previous output of :func:`update_checkout_checkpoint`. ``ledgers``
+    must be a ``tuple`` whose items are each a ``str`` byte-for-byte
+    matching the canonical output of :func:`checkout_log`; every ledger
+    is re-verified with :func:`replay_checkout` against ``log`` before it
+    contributes.
+
+    An empty ledger (one with no batches) produces no range and leaves
+    the snapshot boundary untouched. The non-empty ledgers are merged
+    into a candidate checkpoint exactly as in
+    :func:`merge_checkout_logs`: their batch ids must be globally unique
+    across the batch and the first batch's ``before`` of every non-empty
+    ledger after the first must byte-for-byte equal the previous
+    non-empty ledger's ``snapshot``.
+
+    The candidate and the old checkpoint are then compared in units of
+    one ``ranges`` row plus the ``audit`` segment of ``batch_count`` rows
+    it covers, and the longest common prefix of units is determined. If
+    both sides still hold units after the prefix, the histories have
+    forked and the recovery is rejected. The old checkpoint's remaining
+    units are the ``missing`` rows to re-apply and the candidate's
+    remaining units are the ``pending`` rows to commit; one of the two
+    is always empty.
+
+    Returns the canonical compact JSON document with exactly the four
+    top-level keys ``common``, ``missing``, ``pending`` and ``snapshot``
+    in that order. ``common`` is the number of shared prefix units.
+    ``missing`` and ``pending`` are arrays of ``[range, audit]`` pairs
+    with ``range`` a five-item ``[first_id, last_id, batch_count, before,
+    after]`` row (``before``/``after`` embedded as snapshot objects) and
+    ``audit`` the segment's ``[id, status]`` rows. ``snapshot`` is the
+    candidate's terminal snapshot object when ``pending`` is non-empty
+    and otherwise the old checkpoint's terminal snapshot object, being
+    ``null`` when both are empty. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline, and
+    repeated calls return a byte-identical document.
+
+    :raises TypeError: ``log`` or a ledger is not a ``str``,
+        ``checkpoint`` is neither ``None`` nor a ``str``, or ``ledgers``
+        is not a ``tuple``.
+    :raises ValueError: a document is not its canonical encoding, a
+        ledger fails :func:`replay_checkout` re-verification, a batch id
+        repeats across the non-empty ledgers, a non-empty ledger's first
+        ``before`` does not equal the previous non-empty ledger's
+        ``snapshot``, or the candidate and the old checkpoint fork after
+        their common prefix.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if checkpoint is not None and not isinstance(checkpoint, str):
+        raise TypeError("checkpoint must be None or a str")
+    if not isinstance(ledgers, tuple):
+        raise TypeError("ledgers must be a tuple")
+    for ledger in ledgers:
+        if not isinstance(ledger, str):
+            raise TypeError("each ledger must be a str")
+    candidate = merge_checkout_logs(log, ledgers)
+    new_ranges, new_audit, new_snapshot = \
+        _decode_checkout_checkpoint(candidate)
+    if checkpoint is None:
+        old_ranges, old_audit, old_snapshot = [], [], None
+    else:
+        old_ranges, old_audit, old_snapshot = \
+            _decode_checkout_checkpoint(checkpoint)
+    old_units = _checkout_recovery_units(old_ranges, old_audit)
+    new_units = _checkout_recovery_units(new_ranges, new_audit)
+    common = 0
+    for old_unit, new_unit in zip(old_units, new_units):
+        if old_unit != new_unit:
+            break
+        common += 1
+    if common < len(old_units) and common < len(new_units):
+        raise ValueError("the checkpoint and the ledgers fork after "
+                         f"{common} common range(s)")
+    missing = old_units[common:]
+    pending = new_units[common:]
+    snapshot = new_snapshot if pending else old_snapshot
+    parts = ['{"common":', str(common), ',"missing":[']
+    parts.append(_format_checkout_recovery_units(missing))
+    parts.append('],"pending":[')
+    parts.append(_format_checkout_recovery_units(pending))
+    parts.append('],"snapshot":')
+    parts.append("null" if snapshot is None else snapshot)
+    parts.append("}")
+    return "".join(parts)
