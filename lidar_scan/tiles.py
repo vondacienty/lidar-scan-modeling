@@ -11742,3 +11742,159 @@ def apply_delivery_checkout(log: str, current: str, plan: str) -> str:
             + _json_string(target) + ',"direction":'
             + _json_string(direction) + ',"status":'
             + _json_string(status) + ',"snapshot":' + target_snapshot + "}")
+
+
+def _parse_checkout_plan_endpoints(plan: str) -> tuple:
+    """Return ``(source, target)`` from a checkout plan document.
+
+    Only parses the document and checks the top-level shape and the two
+    identifiers; full canonical verification is the caller's job via
+    :func:`_build_checkout_plan`.
+
+    :raises ValueError: the text is not a single JSON object with exactly
+        the checkout plan keys, or ``source``/``target`` are not strings.
+    """
+    try:
+        plan_node = _parse_json_node(plan, _skip_json_ws(plan, 0))
+    except ValueError as exc:
+        raise ValueError(f"plan is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(plan, plan_node[2]) != len(plan):
+        raise ValueError("plan has trailing data after the JSON document")
+    plan_top = plan_node[0]
+    if not isinstance(plan_top, dict) or list(plan_top) != [
+            "source", "target", "direction", "steps", "snapshot"]:
+        raise ValueError("plan must be a JSON object with exactly the "
+                         'keys "source", "target", "direction", "steps" '
+                         'and "snapshot"')
+    source = plan_top["source"][0]
+    target = plan_top["target"][0]
+    if not isinstance(source, str) or not isinstance(target, str):
+        raise ValueError("plan source and target must be strings")
+    return source, target
+
+
+def apply_delivery_checkouts(log: str, current: str, plans: tuple) -> str:
+    """Validate and atomically apply a batch of planned delivery checkouts.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log`, ``current`` a ``str`` byte-for-byte matching
+    the canonical output of :func:`build_delivery_snapshot`, and ``plans``
+    a non-empty ``tuple`` whose members are ``str`` values, each
+    byte-for-byte matching the canonical output of
+    :func:`plan_delivery_checkout`.
+
+    Every plan is verified against the log independently: the whole log
+    chain is recomputed and validated, and each plan must equal the plan
+    recomputed from its own ``source`` and ``target`` commits. Adjacent
+    plans must chain -- one plan's ``target`` must equal the next plan's
+    ``source`` -- and the commit id of every step across every plan must
+    be unique within the batch.
+
+    Only after every precheck passes is the batch applied atomically.
+    When ``current`` equals the last plan's ``target`` snapshot nothing is
+    applied and ``status`` is ``"unchanged"``. Otherwise, when ``current``
+    equals the first plan's ``source`` snapshot the whole batch is applied
+    and ``status`` is ``"applied"``. Any other snapshot is stale or
+    conflicting with the batch and raises :class:`ValueError`.
+
+    Returns the canonical compact JSON document
+    ``{"source":...,"target":...,"status":...,"plans":[...],"snapshot":...}``
+    with exactly these five top-level keys in that order. ``source`` and
+    ``target`` are the first plan's source and the last plan's target;
+    ``plans`` preserves the input order, each member being
+    ``[source, target, direction, step_count]`` where ``step_count`` is
+    the length of that plan's ``steps`` list; the final ``snapshot``
+    embeds the last target's canonical snapshot. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline; the
+    inputs are never modified and repeated calls return a byte-identical
+    document.
+
+    :raises TypeError: ``log`` or ``current`` is not a ``str``, ``plans``
+        is not a ``tuple``, or one of its members is not a ``str``.
+    :raises ValueError: ``plans`` is empty, a document is not its
+        canonical encoding, a plan identifier names no commit, the log
+        chain or a recomputed result or plan does not match, two adjacent
+        plans do not chain, a step commit id repeats within the batch, or
+        ``current`` is neither the first source nor the last target
+        snapshot of the batch.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(current, str):
+        raise TypeError("current must be a str")
+    if not isinstance(plans, tuple):
+        raise TypeError("plans must be a tuple")
+    if not plans:
+        raise ValueError("plans must be a non-empty tuple")
+    for plan in plans:
+        if not isinstance(plan, str):
+            raise TypeError("each plan must be a str")
+
+    endpoints = [_parse_checkout_plan_endpoints(plan) for plan in plans]
+
+    decoded = _decode_commit_log(log)
+    index_by_id = {row[0]: position for position, row in enumerate(decoded)}
+
+    verified = []
+    for plan, (source, target) in zip(plans, endpoints):
+        if source not in index_by_id or target not in index_by_id:
+            raise ValueError("a plan names a commit absent from the log")
+        recomputed = _build_checkout_plan(decoded, source, target)
+        if recomputed != plan:
+            raise ValueError("a plan does not match the checkout plan "
+                             "recomputed from the log")
+        source_pos = index_by_id[source]
+        target_pos = index_by_id[target]
+        if source_pos == target_pos:
+            direction = "none"
+            step_ids = []
+        elif source_pos < target_pos:
+            direction = "forward"
+            step_ids = [row[0] for row in
+                        decoded[source_pos + 1:target_pos + 1]]
+        else:
+            direction = "rollback"
+            step_ids = [row[0] for row in
+                        reversed(decoded[target_pos + 1:source_pos + 1])]
+        verified.append((source, target, direction, step_ids))
+
+    for index in range(len(verified) - 1):
+        if verified[index][1] != verified[index + 1][0]:
+            raise ValueError("adjacent plans must chain: one plan's target "
+                             "must equal the next plan's source")
+
+    seen_steps = set()
+    for _source, _target, _direction, step_ids in verified:
+        for commit_id in step_ids:
+            if commit_id in seen_steps:
+                raise ValueError(f"step commit id {commit_id!r} is reused "
+                                 "within the batch")
+            seen_steps.add(commit_id)
+
+    _decode_delivery_snapshot(current)
+
+    first_source = verified[0][0]
+    last_target = verified[-1][1]
+    target_snapshot = decoded[index_by_id[last_target]][5]
+    source_snapshot = decoded[index_by_id[first_source]][5]
+    if current == target_snapshot:
+        status = "unchanged"
+    elif current == source_snapshot:
+        status = "applied"
+    else:
+        raise ValueError("current snapshot is neither the first source nor "
+                         "the last target snapshot of the batch")
+
+    parts = ['{"source":', _json_string(first_source), ',"target":',
+             _json_string(last_target), ',"status":', _json_string(status),
+             ',"plans":[']
+    for index, (source, target, direction, step_ids) in enumerate(verified):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(source) + ","
+                     + _json_string(target) + ","
+                     + _json_string(direction) + ","
+                     + str(len(step_ids)) + "]")
+    parts.append('],"snapshot":' + target_snapshot + "}")
+    return "".join(parts)
