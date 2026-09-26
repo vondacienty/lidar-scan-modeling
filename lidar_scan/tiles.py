@@ -11245,3 +11245,285 @@ def update_delivery_snapshot(snapshot: str, changes: str,
 
     ready = all(flags)
     return _format_delivery_snapshot(products, ready)
+
+
+def _validate_commit_id(value, label: str) -> None:
+    """Validate a delivery log identifier against ``[A-Za-z0-9._-]+``."""
+    if not value or any(ch not in _DELIVERY_IDENT_CHARS for ch in value):
+        raise ValueError(f"invalid {label} {value!r}")
+
+
+def delivery_log(entries: tuple) -> str:
+    """Build a canonical delivery commit log from a chain of commits.
+
+    ``entries`` must be a ``tuple`` whose items are strictly 5-tuples
+    ``(id, parent, snapshot, target, plan)``. ``id`` must be a unique
+    ``str`` matching ``[A-Za-z0-9._-]+`` and ``parent`` must be ``None``
+    or such a ``str``: the first entry's ``parent`` is ``None`` and every
+    later entry's ``parent`` is the previous entry's ``id``.
+    ``snapshot`` and ``target`` must each be a ``str`` byte-for-byte
+    matching the canonical output of :func:`build_delivery_snapshot` and
+    ``plan`` a canonical :func:`plan_delivery_updates` document, exactly
+    as required by :func:`commit_delivery_updates`.
+
+    Each entry is committed in order via :func:`commit_delivery_updates`
+    and the chain must be continuous: every entry after the first must
+    carry a ``snapshot`` byte-for-byte equal to the canonical encoding of
+    the previous entry's ``result.snapshot`` (the adopted ``target`` on a
+    successful commit, the unchanged input ``snapshot`` on a conflict),
+    otherwise :class:`ValueError` is raised.
+
+    Returns the canonical compact JSON document ``{"commits":[...],
+    "head":...}`` with exactly these two top-level keys in this order.
+    ``commits`` preserves the entry order and each row is
+    ``[id, parent, snapshot, target, plan, result]`` where the last four
+    items are the JSON documents themselves (not strings) and ``result``
+    is the :func:`commit_delivery_updates` document for the entry.
+    ``head`` is ``null`` when ``entries`` is empty and otherwise the last
+    entry's ``id``. The output uses ``ensure_ascii=False`` with no
+    whitespace and no trailing newline; the inputs are never modified and
+    repeated calls return a byte-identical document.
+
+    :raises TypeError: ``entries`` is not a ``tuple``, an entry is not a
+        5-tuple, or a field is not of its required type.
+    :raises ValueError: an ``id`` or ``parent`` does not match
+        ``[A-Za-z0-9._-]+``, an ``id`` is duplicated, the parent or
+        snapshot chain is broken, or ``snapshot``, ``target`` or ``plan``
+        is not its canonical encoding.
+    """
+    if not isinstance(entries, tuple):
+        raise TypeError("entries must be a tuple")
+
+    commits = []
+    seen_ids = set()
+    previous_id = None
+    previous_snapshot = None
+    for entry in entries:
+        if not isinstance(entry, tuple) or len(entry) != 5:
+            raise TypeError("each entry must be a 5-tuple "
+                            "(id, parent, snapshot, target, plan)")
+        commit_id, parent, snapshot, target, plan = entry
+        if not isinstance(commit_id, str):
+            raise TypeError("commit id must be a str")
+        _validate_commit_id(commit_id, "commit id")
+        if commit_id in seen_ids:
+            raise ValueError(f"duplicate commit id {commit_id!r}")
+        if parent is not None:
+            if not isinstance(parent, str):
+                raise TypeError("parent must be None or a str")
+            _validate_commit_id(parent, "parent id")
+        if not isinstance(snapshot, str):
+            raise TypeError("snapshot must be a str")
+        if not isinstance(target, str):
+            raise TypeError("target must be a str")
+        if not isinstance(plan, str):
+            raise TypeError("plan must be a str")
+        if previous_id is None:
+            if parent is not None:
+                raise ValueError("the first commit's parent must be None")
+        else:
+            if parent != previous_id:
+                raise ValueError("each commit's parent must be the "
+                                 "previous commit's id")
+            if snapshot != previous_snapshot:
+                raise ValueError("each commit's snapshot must equal the "
+                                 "previous commit's result snapshot")
+
+        result = commit_delivery_updates(snapshot, target, plan)
+        previous_snapshot = (target
+                             if result.endswith(',"committed":true}')
+                             else snapshot)
+        previous_id = commit_id
+        seen_ids.add(commit_id)
+        commits.append("[" + _json_string(commit_id) + ","
+                       + ("null" if parent is None
+                          else _json_string(parent))
+                       + "," + snapshot + "," + target + "," + plan + ","
+                       + result + "]")
+
+    head = "null" if previous_id is None else _json_string(previous_id)
+    return '{"commits":[' + ",".join(commits) + '],"head":' + head + "}"
+
+
+def _json_value_end(text: str, pos: int) -> int:
+    """Return the index just past the JSON value starting at ``pos``."""
+    if pos >= len(text):
+        raise ValueError("unexpected end of JSON document")
+    ch = text[pos]
+    if ch == '"':
+        pos += 1
+        while pos < len(text):
+            ch = text[pos]
+            if ch == "\\":
+                pos += 2
+                continue
+            pos += 1
+            if ch == '"':
+                return pos
+        raise ValueError("unterminated JSON string")
+    if ch == "{" or ch == "[":
+        depth = 0
+        while pos < len(text):
+            ch = text[pos]
+            if ch == '"':
+                pos = _json_value_end(text, pos)
+                continue
+            if ch == "{" or ch == "[":
+                depth += 1
+            elif ch == "}" or ch == "]":
+                depth -= 1
+                if depth == 0:
+                    return pos + 1
+            pos += 1
+        raise ValueError("unterminated JSON value")
+    end = pos
+    while end < len(text) and text[end] not in ",]}":
+        end += 1
+    if end == pos:
+        raise ValueError("invalid JSON value")
+    return end
+
+
+def _decode_log_ident(raw: str, label: str) -> str:
+    """Decode a raw JSON string as a delivery log identifier."""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(f"{label} must be a JSON string") from None
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a JSON string")
+    _validate_commit_id(value, label)
+    return value
+
+
+def _decode_log_commit(raw: str) -> list:
+    """Split one raw commit array into its six decoded or raw fields."""
+    if not raw.startswith("[") or not raw.endswith("]"):
+        raise ValueError("each commit must be a JSON array")
+    fields = []
+    pos = 1
+    for index in range(6):
+        end = _json_value_end(raw, pos)
+        fields.append(raw[pos:end])
+        pos = end
+        if index < 5:
+            if pos >= len(raw) or raw[pos] != ",":
+                raise ValueError("each commit must have six fields")
+            pos += 1
+    if pos != len(raw) - 1:
+        raise ValueError("each commit must have exactly six fields")
+    commit_id = _decode_log_ident(fields[0], "commit id")
+    parent = (None if fields[1] == "null"
+              else _decode_log_ident(fields[1], "parent id"))
+    return [commit_id, parent, fields[2], fields[3], fields[4], fields[5]]
+
+
+def _decode_delivery_log(text: str) -> list:
+    """Split a canonical delivery log document into its raw commits."""
+    prefix = '{"commits":['
+    if not text.startswith(prefix):
+        raise ValueError("log must be a canonical delivery log document")
+    pos = len(prefix)
+    commits = []
+    if pos < len(text) and text[pos] == "]":
+        pos += 1
+    else:
+        while True:
+            end = _json_value_end(text, pos)
+            commits.append(_decode_log_commit(text[pos:end]))
+            pos = end
+            if pos < len(text) and text[pos] == ",":
+                pos += 1
+                continue
+            if pos < len(text) and text[pos] == "]":
+                pos += 1
+                break
+            raise ValueError("the log's commits array is malformed")
+    suffix = ',"head":'
+    if not text.startswith(suffix, pos):
+        raise ValueError("log must carry exactly the keys 'commits' and "
+                         "'head' in this order")
+    pos += len(suffix)
+    end = _json_value_end(text, pos)
+    if text[end:] != "}":
+        raise ValueError("log has trailing content after 'head'")
+    return commits
+
+
+def read_commit(log: str, id: str, before: bool = False) -> str:
+    """Read one commit's snapshot from a canonical delivery log.
+
+    ``log`` must be a ``str`` byte-for-byte matching the canonical output
+    of :func:`delivery_log` and ``id`` the ``str`` identifier of one of
+    its commits. The whole chain is recomputed and validated first:
+    identifiers must match ``[A-Za-z0-9._-]+`` and be unique, the first
+    commit's ``parent`` must be ``null`` and every later commit's
+    ``parent`` the previous commit's ``id``, every commit's ``snapshot``
+    must byte-for-byte equal the previous commit's ``result.snapshot``,
+    each stored ``result`` must equal the document recomputed via
+    :func:`commit_delivery_updates` from the commit's ``snapshot``,
+    ``target`` and ``plan``, and ``head`` must be ``null`` for an empty
+    log and the last commit's ``id`` otherwise; any mismatch raises
+    :class:`ValueError`.
+
+    With ``before`` false (the default) returns the hit commit's
+    ``result.snapshot`` — the adopted ``target`` on a successful commit,
+    the unchanged input ``snapshot`` on a conflict; with ``before`` true
+    returns the commit's own ``snapshot``. The returned ``str`` is the
+    canonical compact snapshot encoding. The input is never modified and
+    repeated calls return a byte-identical document.
+
+    :raises TypeError: ``log`` or ``id`` is not a ``str`` or ``before``
+        is not a ``bool``.
+    :raises ValueError: ``log`` is not the canonical delivery log
+        encoding, an identifier, the chain or a recomputed result does
+        not match, or ``id`` does not name a commit of the log.
+    """
+    if not isinstance(log, str):
+        raise TypeError("log must be a str")
+    if not isinstance(id, str):
+        raise TypeError("id must be a str")
+    if not isinstance(before, bool):
+        raise TypeError("before must be a bool")
+
+    commits = _decode_delivery_log(log)
+    rebuilt = []
+    seen_ids = set()
+    previous_id = None
+    previous_snapshot = None
+    hit = None
+    for commit_id, parent, snapshot, target, plan, _result in commits:
+        if commit_id in seen_ids:
+            raise ValueError(f"duplicate commit id {commit_id!r}")
+        seen_ids.add(commit_id)
+        if previous_id is None:
+            if parent is not None:
+                raise ValueError("the first commit's parent must be null")
+        else:
+            if parent != previous_id:
+                raise ValueError("each commit's parent must be the "
+                                 "previous commit's id")
+            if snapshot != previous_snapshot:
+                raise ValueError("each commit's snapshot must equal the "
+                                 "previous commit's result snapshot")
+        result = commit_delivery_updates(snapshot, target, plan)
+        previous_snapshot = (target
+                             if result.endswith(',"committed":true}')
+                             else snapshot)
+        rebuilt.append("[" + _json_string(commit_id) + ","
+                       + ("null" if parent is None
+                          else _json_string(parent))
+                       + "," + snapshot + "," + target + "," + plan + ","
+                       + result + "]")
+        if commit_id == id:
+            hit = (snapshot, previous_snapshot)
+        previous_id = commit_id
+
+    head = "null" if previous_id is None else _json_string(previous_id)
+    canonical = ('{"commits":[' + ",".join(rebuilt) + '],"head":' + head
+                 + "}")
+    if canonical != log:
+        raise ValueError("log is not the canonical delivery log encoding")
+    if hit is None:
+        raise ValueError(f"unknown commit id {id!r}")
+    return hit[0] if before else hit[1]
