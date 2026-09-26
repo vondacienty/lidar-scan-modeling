@@ -9185,3 +9185,273 @@ def build_delivery_receipt(plan: str, results: tuple) -> str:
     ready = all(receipt[1] == "publish" and receipt[5] == "succeeded"
                 for receipt in receipts)
     return _format_delivery_receipt(receipts, ready)
+
+
+def _decode_delivery_receipt(text: str) -> list:
+    """Parse and validate a canonical :func:`build_delivery_receipt` string.
+
+    Returns a list of ``[product, action, current, target, affected, status,
+    reason, failures]`` receipts in document order (``target`` is ``None``
+    or a version string, ``affected`` a list of batch ints and ``failures``
+    a list of normalized failure rows; see :func:`_decode_failure_rows`).
+
+    Beyond JSON, shape and canonical-format checks, the receipt contract is
+    revalidated: each receipt's action is ``publish``, ``rollback`` or
+    ``block`` with the same target/affected/failures associations as the
+    plan contract; a ``publish`` or ``rollback`` receipt's status is
+    ``succeeded`` or ``failed`` while a ``block`` receipt's status is
+    ``blocked``; a ``succeeded`` receipt carries an empty ``reason`` and a
+    ``failed`` or ``blocked`` receipt a non-empty one; receipts are sorted
+    uniquely by product name; and the top-level ``ready`` flag is true
+    exactly when every receipt is a ``publish`` whose status is
+    ``succeeded`` (an empty receipt set being ``true``).
+
+    :raises ValueError: the JSON syntax or shape is bad, a value violates
+        the receipt contract, the text is not the canonical receipt
+        encoding, or the top-level ``ready`` flag is inconsistent.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=Decimal)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("receipt is not valid JSON") from exc
+
+    if not isinstance(document, dict) or set(document) != {"receipts",
+                                                           "ready"}:
+        raise ValueError("receipt top-level value must be an object with "
+                         "only 'receipts' and 'ready'")
+    raw_receipts = document["receipts"]
+    if not isinstance(raw_receipts, list):
+        raise ValueError("'receipts' must be an array")
+    ready = document["ready"]
+    if not isinstance(ready, bool):
+        raise ValueError("'ready' must be a boolean")
+
+    receipts = []
+    for raw_receipt in raw_receipts:
+        if not isinstance(raw_receipt, list) or len(raw_receipt) != 8:
+            raise ValueError("each receipt must be an array of eight "
+                             "values")
+        (product, action, current, target, raw_affected, status, reason,
+         raw_failures) = raw_receipt
+        if not isinstance(product, str):
+            raise ValueError("product name must be a str")
+        if not product or not set(product) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "product name must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+        if action not in ("publish", "rollback", "block"):
+            raise ValueError("receipt action must be publish, rollback "
+                             "or block")
+        if not isinstance(current, str):
+            raise ValueError("receipt current must be a str")
+        if not current or not set(current) <= _DELIVERY_IDENT_CHARS:
+            raise ValueError(
+                "receipt current must be non-empty and contain only "
+                "ASCII alphanumeric characters and ._-"
+            )
+        if target is not None and not isinstance(target, str):
+            raise ValueError("receipt target must be null or a str")
+        if target is not None and (
+                not target or not set(target) <= _DELIVERY_IDENT_CHARS):
+            raise ValueError(
+                "receipt target must be non-empty and contain only ASCII "
+                "alphanumeric characters and ._-"
+            )
+        if not isinstance(raw_affected, list):
+            raise ValueError("receipt affected must be an array")
+        affected = []
+        for batch in raw_affected:
+            if isinstance(batch, bool) or not isinstance(batch, int):
+                raise ValueError("receipt affected batches must be "
+                                 "non-bool integers")
+            if batch < 0:
+                raise ValueError("receipt affected batches must be "
+                                 "non-negative")
+            affected.append(batch)
+        if any(affected[index] >= affected[index + 1]
+               for index in range(len(affected) - 1)):
+            raise ValueError("receipt affected batches must be strictly "
+                             "ascending")
+        if status not in ("succeeded", "failed", "blocked"):
+            raise ValueError("receipt status must be succeeded, failed "
+                             "or blocked")
+        if not isinstance(reason, str):
+            raise ValueError("receipt reason must be a str")
+
+        failures = _decode_failure_rows(raw_failures)
+
+        # Field associations mirror the plan contract: a publish carries
+        # no target delta or failure state; a rollback or block lists at
+        # least one affected batch and one failure, and the failures expand
+        # exactly the affected batches in batch order.
+        if action == "publish":
+            if target != current or affected or failures:
+                raise ValueError("a publish receipt must target current "
+                                 "with no affected batches or failures")
+        else:
+            if action == "rollback" and target is None:
+                raise ValueError("a rollback receipt must carry a "
+                                 "non-null target")
+            if action == "block" and target is not None:
+                raise ValueError("a block receipt must carry a null "
+                                 "target")
+            if not affected or not failures:
+                raise ValueError("a rollback or block receipt must list "
+                                 "an affected batch and a failure")
+            failure_batches = [failure[0] for failure in failures]
+            if any(failure_batches[index] > failure_batches[index + 1]
+                   for index in range(len(failure_batches) - 1)):
+                raise ValueError("receipt failures must be ordered by "
+                                 "batch")
+            if sorted(set(failure_batches)) != affected:
+                raise ValueError("receipt affected batches must match "
+                                 "the batches of its failures")
+
+        # A publish or rollback resolves as succeeded or failed; a block
+        # stays blocked. Only a succeeded receipt carries no reason.
+        if action in ("publish", "rollback"):
+            if status not in ("succeeded", "failed"):
+                raise ValueError("a publish or rollback receipt must be "
+                                 "succeeded or failed")
+        elif status != "blocked":
+            raise ValueError("a block receipt must be blocked")
+        if status == "succeeded":
+            if reason:
+                raise ValueError("a succeeded receipt must carry an "
+                                 "empty reason")
+        elif not reason:
+            raise ValueError("a failed or blocked receipt must carry a "
+                             "non-empty reason")
+
+        receipts.append([product, action, current, target, affected,
+                         status, reason, failures])
+
+    # Receipts inherit the plan's product order: strictly ascending by
+    # name with no duplicates; a byte-for-byte re-encode alone would
+    # tolerate reordering.
+    names = [receipt[0] for receipt in receipts]
+    if any(names[index] >= names[index + 1]
+           for index in range(len(names) - 1)):
+        raise ValueError("receipts must be sorted uniquely by product "
+                         "name")
+
+    if ready != all(receipt[1] == "publish" and receipt[5] == "succeeded"
+                    for receipt in receipts):
+        raise ValueError("'ready' must be true exactly when every "
+                         "receipt is a succeeded publish")
+
+    # Byte-for-byte canonical equality rejects whitespace, reordered or
+    # duplicate keys, non-six-decimal metric formatting and any other
+    # non-canonical spelling.
+    if _format_delivery_receipt(receipts, ready) != text:
+        raise ValueError("receipt is not the canonical delivery receipt "
+                         "encoding")
+    return receipts
+
+
+def _format_merged_receipts(products: list, ready: bool) -> str:
+    """Serialize merged per-product receipt rows to the two-key document."""
+    parts = ['{"products":[']
+    for index, (product, action, current, target, affected, history,
+                final, failures) in enumerate(products):
+        if index:
+            parts.append(",")
+        parts.append("[" + _json_string(product) + ","
+                     + _json_string(action) + ","
+                     + _json_string(current) + ",")
+        parts.append("null" if target is None else _json_string(target))
+        parts.append(",[" + ",".join(str(batch) for batch in affected)
+                     + "],[")
+        parts.append(",".join("[" + _json_string(status) + ","
+                              + _json_string(reason) + "]"
+                              for status, reason in history))
+        parts.append("]," + _json_string(final) + ",[")
+        parts.append(_format_failure_rows(failures))
+        parts.append("]]")
+    parts.append('],"ready":')
+    parts.append("true}" if ready else "false}")
+    return "".join(parts)
+
+
+def merge_delivery_receipts(receipts: tuple) -> str:
+    """Merge canonical delivery receipts into a products-history document.
+
+    ``receipts`` is a tuple of strings, each byte-for-byte matching the
+    canonical output of :func:`build_delivery_receipt`: the compact
+    document whose sole top-level keys are ``receipts`` and ``ready`` in
+    that order, with receipts ``[product, action, current, target,
+    affected, status, reason, failures]`` sorted uniquely by product name.
+
+    Every receipt must cover the same products, and the receipts must
+    agree on each product's ``action``, ``current``, ``target``,
+    ``affected`` and ``failures``; only the per-receipt ``status`` and
+    ``reason`` may differ.
+
+    Returns a canonical compact JSON document with exactly the two keys
+    ``products`` and ``ready`` in that order. Products are sorted
+    lexicographically by name and each product is the array ``[product,
+    action, current, target, affected, history, final, failures]`` where
+    ``history`` lists every receipt's ``[status, reason]`` pair in input
+    receipt order, ``final`` is the status of the last history entry and
+    ``failures`` keeps the receipts' original row order. ``ready`` is true
+    only when every product's action is ``publish`` and its ``final``
+    status is ``succeeded``; an empty ``receipts`` or an empty product set
+    yields ``{"products":[],"ready":true}``. Strings use
+    ``ensure_ascii=False``, integers are decimal, the four failure metrics
+    use exactly six decimal places (negative zero written as
+    ``0.000000``), ``NaN``/``Infinity`` never appear and the output has no
+    whitespace or trailing newline. The inputs are never modified and
+    repeated calls return a byte-identical document.
+
+    :raises TypeError: ``receipts`` is not a tuple or one of its members
+        is not a ``str``.
+    :raises ValueError: a receipt is not the canonical receipt encoding,
+        the receipts do not share the same products, or the per-product
+        ``action``, ``current``, ``target``, ``affected`` or ``failures``
+        disagree.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a tuple")
+
+    decoded = []
+    for receipt in receipts:
+        if not isinstance(receipt, str):
+            raise TypeError("each receipt must be a str")
+        decoded.append(_decode_delivery_receipt(receipt))
+
+    merged = {}
+    names = None
+    for rows in decoded:
+        # Canonical receipts are sorted uniquely by product, so equal
+        # product sets appear in the same order.
+        if names is None:
+            names = [row[0] for row in rows]
+        elif [row[0] for row in rows] != names:
+            raise ValueError("receipts must share the same products")
+        for (product, action, current, target, affected, status, reason,
+             failures) in rows:
+            entry = merged.get(product)
+            if entry is None:
+                merged[product] = [product, action, current, target,
+                                   affected, [[status, reason]], failures]
+            else:
+                if (entry[1], entry[2], entry[3], entry[4], entry[6]) != (
+                        action, current, target, affected, failures):
+                    raise ValueError(f"conflicting receipt fields for "
+                                     f"product {product!r}")
+                entry[5].append([status, reason])
+
+    products = []
+    for product in sorted(merged):
+        _, action, current, target, affected, history, failures = (
+            merged[product])
+        products.append([product, action, current, target, affected,
+                         history, history[-1][0], failures])
+
+    ready = all(product[1] == "publish" and product[6] == "succeeded"
+                for product in products)
+    return _format_merged_receipts(products, ready)
