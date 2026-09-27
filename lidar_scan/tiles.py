@@ -14686,3 +14686,80 @@ def plan_recovery_index_migration(before, after) -> str:
     parts.append("true" if after_complete else "false")
     parts.append("}")
     return "".join(parts)
+
+
+def apply_recovery_index_migration(before: str, after: str, plan: str,
+                                   current: str) -> str:
+    """Validate and apply a planned recovery index migration.
+
+    ``before``, ``after`` and ``current`` must each be a ``str``
+    byte-for-byte matching the canonical output of
+    :func:`merge_recovery_indexes`; their derived ``audit``,
+    ``snapshot``, ``resume`` and ``complete`` fields are recomputed from
+    the embedded entries and must agree. ``plan`` must be a ``str``
+    byte-for-byte equal to ``plan_recovery_index_migration(before,
+    after)``.
+
+    When ``current`` equals ``after`` nothing is applied and ``status``
+    is ``"unchanged"`` with empty ``steps``. Otherwise ``current`` must
+    equal ``before``: the migration is applied and ``status`` is
+    ``"applied"`` with ``steps`` listing the plan's ``rollback`` rows
+    mapped to ``["rollback", batch_id, status]`` in their original order
+    followed by its ``pending`` rows mapped to ``["pending", batch_id,
+    status]`` in their original order. Any other ``current`` is stale or
+    conflicting with the plan and raises :class:`ValueError`.
+
+    Returns the canonical compact JSON document with exactly the three
+    top-level keys ``status``, ``steps`` and ``index`` in that order;
+    ``index`` embeds ``after``'s original canonical document (including
+    its ``snapshot``, ``resume`` and ``complete`` states), so re-entering
+    with the returned ``index`` as ``current`` yields ``"unchanged"``.
+    The output uses ``ensure_ascii=False``, no whitespace and no trailing
+    newline; the inputs are never modified and repeated calls return a
+    byte-identical document.
+
+    :raises TypeError: ``before``, ``after``, ``plan`` or ``current`` is
+        not a ``str``.
+    :raises ValueError: an index is malformed or not its canonical
+        encoding (including a wrong derived field), ``plan`` does not
+        byte-for-byte equal the recomputed migration plan, or ``current``
+        is neither ``before`` nor ``after``.
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(current, str):
+        raise TypeError("current must be a str")
+
+    recomputed = plan_recovery_index_migration(before, after)
+    if recomputed != plan:
+        raise ValueError("plan does not match the migration plan "
+                         "recomputed from before and after")
+    _decode_merged_recovery_index(current)
+
+    if current == after:
+        status = "unchanged"
+        steps = ""
+    elif current == before:
+        status = "applied"
+        plan_node = _parse_json_node(plan, _skip_json_ws(plan, 0))
+        plan_top = plan_node[0]
+        rows = []
+        for row_node in plan_top["rollback"][0]:
+            rows.append('["rollback",'
+                        + _json_string(row_node[0][0][0]) + ","
+                        + _json_string(row_node[0][1][0]) + "]")
+        for row_node in plan_top["pending"][0]:
+            rows.append('["pending",'
+                        + _json_string(row_node[0][0][0]) + ","
+                        + _json_string(row_node[0][1][0]) + "]")
+        steps = ",".join(rows)
+    else:
+        raise ValueError("current is neither the before nor the after "
+                         "index of the plan")
+
+    return ('{"status":' + _json_string(status) + ',"steps":[' + steps
+            + '],"index":' + after + "}")
