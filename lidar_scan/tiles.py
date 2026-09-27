@@ -15861,3 +15861,426 @@ def publish_migration_journal(journal_path, index_path, before, after,
     return "".join(parts)
 
 
+_PUBLISH_UPDATES_ID_RE = re.compile(r"[A-Za-z0-9._-]+\Z")
+
+
+def _atomic_write_text(path: str, text: str, prefix: str) -> None:
+    """Atomically replace ``path`` with the UTF-8 encoding of ``text``.
+
+    The text is encoded as UTF-8 with no added byte order mark or trailing
+    newline and written to a temporary file in the same directory as
+    ``path``; the temporary file is flushed and fsynced and then atomically
+    moved over ``path``. On failure the previous content of ``path`` is
+    left unchanged and the temporary file is removed.
+
+    :raises OSError: the file cannot be written or replaced.
+    """
+    data = text.encode("utf-8")
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, temporary = tempfile.mkstemp(prefix=prefix, dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _apply_publish_update_items(before: str, items: tuple) -> str:
+    """Apply :func:`update_recovery_index` ``items`` to a merged index.
+
+    ``before`` must be a canonical :func:`merge_recovery_indexes` index.
+    Its entries are rebuilt into an :func:`update_recovery_index` index,
+    ``items`` are applied there (so an unfinished last entry is replaced
+    exactly as that contract dictates), and the result is normalized back
+    to a canonical merged index. Item type and value problems surface
+    from :func:`update_recovery_index`.
+    """
+    entries = _decode_merged_recovery_index(before)[0]
+    pairs = tuple((entry["plan"], entry["history"]) for entry in entries)
+    base = update_recovery_index(None, pairs)
+    updated = update_recovery_index(base, items)
+    return merge_recovery_indexes((updated,))
+
+
+def _format_publish_updates_state(rows: list, index: str,
+                                  complete: bool) -> str:
+    """Serialize a :func:`publish_updates` state document."""
+    row_text = []
+    for row in rows:
+        receipt = row["receipt"]
+        receipt_text = "null" if receipt is None else (
+            "[" + str(receipt[0]) + "," + str(receipt[1]) + ","
+            + str(receipt[2]) + "]")
+        row_text.append(
+            "[" + _json_string(row["id"]) + "," + row["before"] + ","
+            + row["after"] + "," + str(row["confirmed"]) + ","
+            + str(row["total"]) + ","
+            + ("true" if row["published"] else "false") + ","
+            + receipt_text + "]")
+    return ('{"batches":[' + ",".join(row_text) + '],"index":' + index
+            + ',"complete":' + ("true" if complete else "false") + "}")
+
+
+def _decode_publish_updates_state(text: str) -> tuple:
+    """Validate a canonical :func:`publish_updates` state document.
+
+    Returns ``(rows, index, complete)`` with ``rows`` a list of row dicts
+    (``id``, raw ``before``/``after`` index texts, ``confirmed``,
+    ``total``, ``published``, ``receipt``), ``index`` the raw index the
+    state last committed and ``complete`` the flag. Each embedded index is
+    revalidated as a canonical :func:`merge_recovery_indexes` document.
+    The committed index lags no more than one batch behind the disk when a
+    publication crashed after replacing the index but before rewriting the
+    state; that case is left to :func:`publish_updates` to reconcile.
+
+    :raises ValueError: the document is malformed or not its canonical
+        encoding, a row is misshapen or internally inconsistent, the rows
+        do not chain, an embedded index is invalid, or the committed index
+        or completion flag disagrees with the rows.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"state is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("state has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "batches", "index", "complete"]:
+        raise ValueError("state must be a JSON object with exactly the keys "
+                         '"batches", "index" and "complete"')
+
+    def _embedded_index(child, what):
+        if not isinstance(child[0], dict):
+            raise ValueError(what + " must be a JSON object")
+        raw = text[child[1]:child[2]]
+        _decode_merged_recovery_index(raw)
+        return raw
+
+    def _count(child, what):
+        value = child[0]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(what + " must be a non-bool non-negative integer")
+        return value
+
+    row_nodes = top["batches"][0]
+    if not isinstance(row_nodes, list):
+        raise ValueError('state "batches" must be an array')
+    rows = []
+    for row_node in row_nodes:
+        cells = row_node[0]
+        if not isinstance(cells, list) or len(cells) != 7:
+            raise ValueError("each state batch must be a seven-item array "
+                             "[id, before, after, confirmed, total, "
+                             "published, receipt]")
+        batch_id = cells[0][0]
+        if not isinstance(batch_id, str) \
+                or _PUBLISH_UPDATES_ID_RE.fullmatch(batch_id) is None:
+            raise ValueError("each state batch id must match "
+                             "[A-Za-z0-9._-]+")
+        before = _embedded_index(cells[1], "each state batch before")
+        after = _embedded_index(cells[2], "each state batch after")
+        confirmed = _count(cells[3], "each state batch confirmed")
+        total = _count(cells[4], "each state batch total")
+        published = cells[5][0]
+        if not isinstance(published, bool):
+            raise ValueError("each state batch published must be a boolean")
+        receipt_node = cells[6][0]
+        if receipt_node is None:
+            receipt = None
+        elif isinstance(receipt_node, list) and len(receipt_node) == 3:
+            receipt = tuple(_count(cells[6][0][i],
+                                   "each state batch receipt component")
+                            for i in range(3))
+        else:
+            raise ValueError("each state batch receipt must be null or a "
+                             "three-item array")
+        if confirmed > total:
+            raise ValueError("each state batch confirmed must not exceed its "
+                             "total")
+        if published:
+            if confirmed != total:
+                raise ValueError("a published state batch must confirm every "
+                                 "planned step")
+            if receipt is None or receipt[2] != total \
+                    or receipt[0] + receipt[1] != total:
+                raise ValueError("a published state batch receipt must count "
+                                 "its rollback and pending steps")
+        elif receipt is not None:
+            raise ValueError("an unpublished state batch receipt must be "
+                             "null")
+        rows.append({"id": batch_id, "before": before, "after": after,
+                     "confirmed": confirmed, "total": total,
+                     "published": published, "receipt": receipt})
+
+    for position in range(1, len(rows)):
+        if rows[position]["before"] != rows[position - 1]["after"]:
+            raise ValueError("each state batch must start at the previous "
+                             "batch's after index")
+    for position, row in enumerate(rows[:-1]):
+        if not row["published"]:
+            raise ValueError("only the last recorded batch may be unfinished")
+
+    index = _embedded_index(top["index"], 'state "index"')
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('state "complete" must be a boolean')
+    if rows:
+        # The committed index is the last batch's after once it is published;
+        # while the last batch is merely confirmed (including the ready state
+        # recorded immediately before the atomic replacement) it is before.
+        last = rows[-1]
+        expected_index = last["after"] if last["published"] else last["before"]
+        if index != expected_index:
+            raise ValueError('state "index" does not match its last committed '
+                             "batch")
+        if complete != last["published"]:
+            raise ValueError('state "complete" does not match its last batch')
+    elif not complete:
+        raise ValueError('state "complete" must be true when no batch is '
+                         "recorded")
+
+    canonical = _format_publish_updates_state(rows, index, complete)
+    if canonical != text:
+        raise ValueError("state is not its canonical encoding")
+    return rows, index, complete
+
+
+def publish_updates(state, index, batches, limit=None) -> str:
+    """Publish recovery-index update batches under a confirmation budget.
+
+    ``state`` and ``index`` must each be a non-empty ``str`` file path and
+    the two must differ. ``batches`` must be a ``tuple`` whose items are
+    each a ``(id, items)`` pair; ``id`` must be a unique ``str`` matching
+    ``[A-Za-z0-9._-]+`` and ``items`` follow the
+    :func:`update_recovery_index` contract. The first batch's ``before``
+    index is read from ``index``; every later batch's ``before`` is the
+    previous batch's ``after``. Each ``after`` is that batch's items
+    applied with :func:`update_recovery_index` and normalized as a
+    canonical :func:`merge_recovery_indexes` index.
+
+    Publishing a batch confirms the steps of
+    ``plan_recovery_index_migration(before, after)`` in plan order (the
+    rollback rows then the pending rows). ``limit`` is either ``None``
+    (no bound) or a non-bool non-negative ``int`` capping the number of
+    steps newly confirmed by this call; batches are taken in order and
+    processing stops at the first batch the budget cannot finish. Once a
+    batch's every step is confirmed the published index is atomically
+    replaced with ``after`` and only then is ``state`` rewritten with the
+    batch marked published. A missing ``state`` is initialized; an
+    existing state's batches must be an id prefix of the input, so old
+    batches can only be extended by appending. Every progress point is
+    written atomically; re-entering after an interruption records the
+    already replaced ``after`` without redoing the replacement and resumes
+    an unfinished batch at its confirmed prefix, and re-publishing a
+    completed prefix returns a byte-identical document. On failure the
+    previously valid files are left in place.
+
+    Returns the canonical compact JSON written to ``state`` with exactly
+    the three top-level keys ``batches``, ``index`` and ``complete`` in
+    that order. Each batch is ``[id, before, after, confirmed, total,
+    published, receipt]``; ``receipt`` is ``null`` until publication and
+    ``[rollback_count, pending_count, total_count]`` taken from the
+    migration plan afterwards. ``index`` is the committed published index
+    and ``complete`` is true only when every batch is published. The
+    output uses ``ensure_ascii=False``, no whitespace and no trailing
+    newline.
+
+    :raises TypeError: ``state`` or ``index`` is not a ``str``,
+        ``batches`` is not a ``tuple``, a batch is not an ``(id, items)``
+        pair, an ``id`` is not a ``str``, ``items`` is not a ``tuple`` or
+        contains the wrong item types (the :func:`update_recovery_index`
+        type errors), or ``limit`` is neither ``None`` nor a non-bool
+        ``int``.
+    :raises ValueError: either path is empty or equal to the other, an
+        ``id`` is malformed or repeated, an index or the state file is not
+        valid UTF-8 or not a canonical document, a batch's items violate
+        :func:`update_recovery_index`, the state batches are not a prefix
+        of the input or disagree with the recomputed chain or plan, or the
+        on-disk index matches neither the batch before nor after index.
+    :raises OSError: the index file is missing or cannot be read, or the
+        state or index file cannot be written or replaced.
+    """
+    if not isinstance(state, str):
+        raise TypeError("state must be a str")
+    if not isinstance(index, str):
+        raise TypeError("index must be a str")
+    if not isinstance(batches, tuple):
+        raise TypeError("batches must be a tuple")
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be None or a non-bool int")
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+    if not state:
+        raise ValueError("state must not be empty")
+    if not index:
+        raise ValueError("index must not be empty")
+    if state == index:
+        raise ValueError("state and index must differ")
+
+    normalized = []
+    seen_ids = set()
+    for batch in batches:
+        if not isinstance(batch, tuple) or len(batch) != 2:
+            raise TypeError("each batch must be an (id, items) tuple")
+        batch_id, items = batch
+        if not isinstance(batch_id, str):
+            raise TypeError("each batch id must be a str")
+        if _PUBLISH_UPDATES_ID_RE.fullmatch(batch_id) is None:
+            raise ValueError("each batch id must match [A-Za-z0-9._-]+")
+        if batch_id in seen_ids:
+            raise ValueError(f"duplicate batch id {batch_id!r}")
+        seen_ids.add(batch_id)
+        if not isinstance(items, tuple):
+            raise TypeError("each batch items must be a tuple")
+        normalized.append((batch_id, items))
+
+    with open(index, "rb") as stream:
+        index_data = stream.read()
+    try:
+        disk_index = index_data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("the index file is not valid UTF-8") from exc
+    _decode_merged_recovery_index(disk_index)
+
+    try:
+        with open(state, "rb") as stream:
+            state_data = stream.read()
+    except FileNotFoundError:
+        saved = []
+    else:
+        try:
+            state_text = state_data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("the state file is not valid UTF-8") from exc
+        saved, saved_index, _saved_complete = \
+            _decode_publish_updates_state(state_text)
+        if not saved and saved_index != disk_index:
+            raise ValueError("the recorded state index must equal the index "
+                             "on disk when no batch is recorded")
+
+    saved_ids = [row["id"] for row in saved]
+    input_ids = [batch_id for batch_id, _items in normalized]
+    if len(saved) > len(normalized) or saved_ids != input_ids[:len(saved)]:
+        raise ValueError("the recorded state batches must be an id prefix of "
+                         "the input batches")
+
+    rows = [dict(row) for row in saved]
+    if rows and rows[-1]["published"]:
+        # Every recorded batch is already published; the disk must already be
+        # at the terminal after index.
+        if disk_index != rows[-1]["after"]:
+            raise ValueError("the on-disk index must equal the last published "
+                             "batch's after index")
+
+    # The first batch starts at the index recorded by the state when
+    # re-entering, otherwise at the index currently on disk.
+    starting_index = saved[0]["before"] if saved else disk_index
+    budget = limit
+
+    for position, (batch_id, items) in enumerate(normalized):
+        before = starting_index if position == 0 \
+            else rows[position - 1]["after"]
+        recorded = rows[position] if position < len(rows) else None
+
+        if recorded is not None and recorded["published"]:
+            # Already committed on a previous call; never redo it. The chain
+            # onto the next batch (and the on-disk index at the active batch)
+            # is checked below rather than here, because once a later batch is
+            # published the disk has moved past this batch's after.
+            continue
+
+        after = _apply_publish_update_items(before, items)
+        plan = plan_recovery_index_migration(before, after)
+        plan_document = json.loads(plan)
+        rollback_count = len(plan_document["rollback"])
+        pending_count = len(plan_document["pending"])
+        total = rollback_count + pending_count
+
+        if recorded is not None:
+            if recorded["before"] != before or recorded["after"] != after:
+                raise ValueError("a recorded batch does not match its input "
+                                 "batch")
+            if recorded["total"] != total:
+                raise ValueError("a recorded batch total does not match its "
+                                 "migration plan")
+
+        # A crash after the atomic index replacement but before the state
+        # rewrite: finish the bookkeeping without replacing the index again.
+        if disk_index == after:
+            confirmed = total
+        elif disk_index != before:
+            raise ValueError("the on-disk index must equal the batch before "
+                             "or after index")
+        else:
+            start_confirmed = 0 if recorded is None else recorded["confirmed"]
+            if start_confirmed > total:
+                raise ValueError("a recorded batch confirmed more steps than "
+                                 "its migration plan")
+            remaining = total - start_confirmed
+            if budget is None:
+                added = remaining
+            else:
+                added = min(remaining, budget)
+            confirmed = start_confirmed + added
+            if budget is not None:
+                budget -= added
+
+        # Build the row as committed so far: never published until the index
+        # replacement below is also recorded.
+        row = {"id": batch_id, "before": before, "after": after,
+               "confirmed": confirmed, "total": total,
+               "published": False, "receipt": None}
+        if position < len(rows):
+            rows[position] = row
+        else:
+            rows.append(row)
+
+        if confirmed < total:
+            # Batch still in progress: record the confirmed prefix against
+            # the unchanged before index and stop at the budget.
+            _atomic_write_text(
+                state,
+                _format_publish_updates_state(rows, before, False),
+                ".publish-updates-")
+            break
+
+        # Every step is confirmed. Record the ready state first (index still
+        # before), atomically replace the index, and only then mark the batch
+        # published. A crash in any window is reconciled on re-entry.
+        _atomic_write_text(
+            state,
+            _format_publish_updates_state(rows, before, False),
+            ".publish-updates-")
+        if disk_index != after:
+            _atomic_write_text(index, after, ".published-index-")
+            disk_index = after
+        rows[position]["published"] = True
+        rows[position]["receipt"] = (rollback_count, pending_count, total)
+        complete = position == len(normalized) - 1
+        _atomic_write_text(
+            state,
+            _format_publish_updates_state(rows, after, complete),
+            ".publish-updates-")
+
+    complete = bool(rows) and rows[-1]["published"] \
+        and len(rows) == len(normalized)
+    if not normalized:
+        complete = True
+    terminal_index = rows[-1]["after"] if (
+        rows and rows[-1]["published"]) else (
+            rows[-1]["before"] if rows else starting_index)
+    result = _format_publish_updates_state(rows, terminal_index, complete)
+    _atomic_write_text(state, result, ".publish-updates-")
+    return result
+
+
