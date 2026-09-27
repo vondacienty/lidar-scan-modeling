@@ -15397,3 +15397,106 @@ def commit_migration_checkpoint(before, after, plan, current, state,
         plan, states + [state], index, complete, receipt)
 
 
+def advance_migration_journal(before, after, journal=None,
+                              max_steps=None) -> str:
+    """Advance a migration journal by confirming plan steps atomically.
+
+    ``before`` and ``after`` must each be a ``str`` byte-for-byte matching
+    the canonical output of :func:`merge_recovery_indexes`: entries chain,
+    a non-last entry is never unfinished, a completed plan never repeats
+    and no audit batch id repeats; their derived ``audit``,
+    ``snapshot``, ``resume`` and ``complete`` fields are recomputed from
+    the embedded entries and must agree. ``journal`` is either ``None``
+    (no entry committed yet) or a ``str`` byte-for-byte matching a
+    previous output of this function for the same ``before`` and
+    ``after``. ``max_steps`` must be either ``None`` (confirm every
+    remaining step) or a non-bool non-negative ``int`` bounding the
+    number of steps newly confirmed by this call.
+
+    The migration plan is recomputed as
+    ``plan_recovery_index_migration(before, after)`` and its steps are
+    its ``rollback`` rows (``["rollback", id, status]`` in plan order)
+    followed by its ``pending`` rows (``["pending", id, status]`` in
+    plan order). Advancement resumes after the journal's last confirmed
+    prefix (or from zero with no journal) and commits up to
+    ``max_steps`` further steps as one atomic append. Even the first
+    call with ``max_steps=0`` commits the initial ``confirmed=0``
+    state; with a journal supplied a bound of zero appends nothing and
+    returns the journal byte for byte. A plan with no steps commits the
+    completed state on the first call with a ``[0, 0, 0]`` receipt; a
+    journal whose migration is already complete is returned byte for
+    byte.
+
+    Returns the canonical compact JSON document with exactly the five
+    top-level keys ``plan``, ``states``, ``index``, ``complete`` and
+    ``receipt`` in that order. ``states`` preserves order and embeds
+    every committed :func:`execute_recovery_index_migration` state
+    document, each with the key order ``status``, ``confirmed``,
+    ``steps``, ``index`` and ``complete``. While steps remain
+    unconfirmed ``index`` embeds ``before`` and ``receipt`` is
+    ``null``; once every step is confirmed ``index`` embeds ``after``
+    and ``receipt`` is ``[rollback_count, pending_count, total_count]``
+    recomputed from the plan. The output uses ``ensure_ascii=False``,
+    no whitespace and no trailing newline; the inputs are never
+    modified and completed journals are returned byte-identical.
+
+    :raises TypeError: ``before`` or ``after`` is not a ``str``,
+        ``journal`` is neither ``None`` nor a ``str``, or
+        ``max_steps`` is neither ``None`` nor a non-bool ``int``.
+    :raises ValueError: an index is malformed or not its canonical
+        encoding (including a wrong derived field), the indexes do not
+        meet or fork so no plan exists, ``max_steps`` is negative, or
+        the journal is malformed, not its canonical encoding or does
+        not match the plan recomputed from ``before`` and ``after``.
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if journal is not None and not isinstance(journal, str):
+        raise TypeError("journal must be None or a str")
+    if max_steps is not None:
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+            raise TypeError("max_steps must be None or a non-bool int")
+        if max_steps < 0:
+            raise ValueError("max_steps must be non-negative")
+
+    plan = plan_recovery_index_migration(before, after)
+    document = json.loads(plan)
+    steps = [("rollback", batch_id, row_status)
+             for batch_id, row_status in document["rollback"]] + \
+        [("pending", batch_id, row_status)
+         for batch_id, row_status in document["pending"]]
+    rollback_count = len(document["rollback"])
+    pending_count = len(document["pending"])
+    total_count = rollback_count + pending_count
+    receipt_tuple = (rollback_count, pending_count, total_count)
+
+    if journal is None:
+        states = []
+        confirmed = 0
+    else:
+        states, confirmed, complete = \
+            _decode_committed_migration_checkpoint(
+                journal, before, after, plan, steps, receipt_tuple)
+        if complete or max_steps == 0:
+            return journal
+
+    if max_steps is None:
+        target = total_count
+    else:
+        target = min(total_count, confirmed + max_steps)
+
+    if target == total_count:
+        status = "unchanged" if total_count == 0 else "applied"
+        state = _format_recovery_index_migration_state(
+            status, steps, after, True)
+        return _format_committed_migration_checkpoint(
+            plan, states + [state], after, True, list(receipt_tuple))
+
+    state = _format_recovery_index_migration_state(
+        "pending", steps[:target], before, False)
+    return _format_committed_migration_checkpoint(
+        plan, states + [state], before, False, None)
+
+
