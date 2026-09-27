@@ -15723,3 +15723,141 @@ def resume_migration_journal(path, before, after, max_steps=None) -> str:
     return result
 
 
+def publish_migration_journal(journal_path, index_path, before, after,
+                              max_steps=None) -> str:
+    """Resume a migration journal and publish it as a recovery index.
+
+    ``journal_path`` and ``index_path`` must each be a non-empty ``str``
+    giving a file path and the two paths must differ. ``before`` and
+    ``after`` must each be a ``str`` byte-for-byte matching the canonical
+    output of :func:`merge_recovery_indexes`; their derived ``audit``,
+    ``snapshot``, ``resume`` and ``complete`` fields are recomputed from
+    the embedded entries and must agree. ``max_steps`` must be either
+    ``None`` (confirm every remaining step) or a non-bool non-negative
+    ``int`` bounding the number of steps newly confirmed by this call.
+
+    The file at ``index_path`` must exist and is read and decoded as
+    strict UTF-8; its decoded text must equal either ``before`` or
+    ``after`` byte for byte. A missing ``journal_path`` is treated as a
+    migration that has not started; an existing journal file must be a
+    canonical :func:`advance_migration_journal` output bound to both
+    indexes. :func:`resume_migration_journal` is then used to advance the
+    journal by at most ``max_steps`` newly confirmed steps.
+
+    When the published index is ``after`` the (possibly advanced)
+    journal must be complete; otherwise the inputs are inconsistent and
+    a :class:`ValueError` is raised. When the journal is still
+    unfinished the index file is left untouched and the result reports
+    the previously published index (necessarily ``before``). When the
+    journal is complete the index currently published must be ``before``
+    (a completed journal paired with ``before`` simply retries the
+    publication): ``after`` is encoded as UTF-8 (with no byte order mark
+    and no trailing newline) and written byte for byte to a temporary
+    file in the same directory as ``index_path``; the temporary file is
+    flushed and fsynced and then atomically moved over ``index_path``.
+    On any write failure the previous index file is left unchanged and
+    the temporary file is removed; the journal stays in its already
+    advanced state, so the publication can be retried.
+
+    Returns the canonical compact JSON document with exactly the four
+    top-level keys ``journal``, ``index``, ``published`` and ``receipt``
+    in that order. ``journal`` embeds the canonical journal document and
+    ``index`` the canonical recovery index currently published (``before``
+    while unfinished, ``after`` once published). ``published`` is true
+    exactly when the published index is ``after``. ``receipt`` is
+    ``null`` while the migration is unfinished and ``[rollback_count,
+    pending_count, total_count]`` once complete, taken from the journal.
+    The output uses ``ensure_ascii=False``, no whitespace and no trailing
+    newline; the inputs are never modified, and re-entering a completed
+    publication returns a byte-identical document.
+
+    :raises TypeError: ``journal_path``, ``index_path``, ``before`` or
+        ``after`` is not a ``str``, or ``max_steps`` is neither ``None``
+        nor a non-bool ``int``.
+    :raises ValueError: either path is empty, the two paths are equal,
+        ``max_steps`` is negative, an index is malformed or not its
+        canonical encoding (including a wrong derived field), the index
+        file content is not valid UTF-8 or equals neither ``before`` nor
+        ``after``, the published index is ``after`` while the journal is
+        incomplete, or the journal file is malformed, not its canonical
+        encoding, does not match the recomputed plan or contradicts its
+        own states.
+    :raises OSError: the index file is missing or cannot be read, or the
+        journal or index file cannot be written or replaced.
+    """
+    if not isinstance(journal_path, str):
+        raise TypeError("journal_path must be a str")
+    if not isinstance(index_path, str):
+        raise TypeError("index_path must be a str")
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if max_steps is not None:
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+            raise TypeError("max_steps must be None or a non-bool int")
+        if max_steps < 0:
+            raise ValueError("max_steps must be non-negative")
+    if not journal_path:
+        raise ValueError("journal_path must not be empty")
+    if not index_path:
+        raise ValueError("index_path must not be empty")
+    if journal_path == index_path:
+        raise ValueError("journal_path and index_path must differ")
+
+    with open(index_path, "rb") as stream:
+        index_data = stream.read()
+    try:
+        index_text = index_data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("the index file is not valid UTF-8") from exc
+    if index_text == after:
+        published = True
+    elif index_text == before:
+        published = False
+    else:
+        raise ValueError("the index file must equal before or after")
+
+    journal = resume_migration_journal(
+        journal_path, before, after, max_steps)
+    document = json.loads(journal)
+    complete = document["complete"]
+    receipt = document["receipt"]
+
+    if published and not complete:
+        raise ValueError("when the index is after the journal must be "
+                         "complete")
+
+    if complete and not published:
+        data = after.encode("utf-8")
+        directory = os.path.dirname(os.path.abspath(index_path))
+        fd, temporary = tempfile.mkstemp(prefix=".published-index-",
+                                         dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, index_path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        index_text = after
+        published = True
+
+    parts = ['{"journal":', journal, ',"index":', index_text,
+             ',"published":', "true" if published else "false",
+             ',"receipt":']
+    if receipt is None:
+        parts.append("null")
+    else:
+        rollback_count, pending_count, total_count = receipt
+        parts.append("[" + str(rollback_count) + "," + str(pending_count)
+                     + "," + str(total_count) + "]")
+    parts.append("}")
+    return "".join(parts)
+
+
