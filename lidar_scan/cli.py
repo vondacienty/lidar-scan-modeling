@@ -7,10 +7,14 @@ import json
 import sys
 
 from . import __version__
-from .tiles import _format_z, window_tiles
+from .tiles import _format_z, publish_migration_journal, window_tiles
 
 _TOP_LEVEL_KEYS = frozenset(
     ("points", "windows", "cell_size", "tile_cells", "levels"))
+
+_MIGRATION_TOP_LEVEL_KEYS = frozenset(
+    ("journal_path", "index_path", "before", "after", "max_steps"))
+_MIGRATION_REQUIRED_KEYS = ("journal_path", "index_path", "before", "after")
 
 
 def _reject_constant(raw: str):
@@ -116,12 +120,54 @@ def _run_window_tiles() -> str:
     return _format_window_tiles_text(results)
 
 
+def _parse_publish_migration_document(text: str) -> tuple:
+    """Validate the stdin JSON document and build migration arguments.
+
+    Returns ``(journal_path, index_path, before, after, max_steps)`` where
+    ``max_steps`` is ``None`` when the key is omitted or ``null``.
+    Structural problems (JSON syntax, top-level keys) raise ``ValueError``;
+    field type and value problems are left to
+    :func:`publish_migration_journal`.
+    """
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting is too deep") from exc
+    except ValueError as exc:
+        raise ValueError("stdin is not valid JSON") from exc
+
+    if not isinstance(document, dict):
+        raise ValueError("top-level value must be a JSON object")
+    unknown = set(document) - _MIGRATION_TOP_LEVEL_KEYS
+    if unknown:
+        raise ValueError("top-level keys must be a subset of 'journal_path', "
+                         "'index_path', 'before', 'after' and 'max_steps'")
+    missing = [key for key in _MIGRATION_REQUIRED_KEYS if key not in document]
+    if missing:
+        raise ValueError("top-level object must contain 'journal_path', "
+                         "'index_path', 'before' and 'after'")
+
+    return (document["journal_path"], document["index_path"],
+            document["before"], document["after"],
+            document.get("max_steps"))
+
+
+def _run_publish_migration() -> str:
+    """Run the ``publish-migration`` subcommand and return the JSON text."""
+    journal_path, index_path, before, after, max_steps = \
+        _parse_publish_migration_document(_read_stdin_text())
+    return publish_migration_journal(journal_path, index_path, before, after,
+                                     max_steps)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="lidar-scan-modeling", description="LiDAR point cloud measurement modelling")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("version", help="print the current version")
     sub.add_parser("window-tiles",
                    help="aggregate stdin JSON points into window tiles")
+    sub.add_parser("publish-migration",
+                   help="resume a migration journal and publish the index")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -132,6 +178,17 @@ def main(argv: list[str] | None = None) -> int:
         try:
             text = _run_window_tiles()
         except (TypeError, ValueError) as exc:
+            sys.stderr.write(type(exc).__name__ + "\n")
+            if str(exc):
+                sys.stderr.write(str(exc) + "\n")
+            return 2
+        sys.stdout.write(text + "\n")
+        return 0
+
+    if args.command == "publish-migration":
+        try:
+            text = _run_publish_migration()
+        except (TypeError, ValueError, OSError) as exc:
             sys.stderr.write(type(exc).__name__ + "\n")
             if str(exc):
                 sys.stderr.write(str(exc) + "\n")
