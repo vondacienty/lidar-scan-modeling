@@ -191,7 +191,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "publish-migration":
         try:
             text = _run_publish_migration()
-        except (TypeError, ValueError, OSError) as exc:
+        except OSError as exc:
+            # OSError subclasses (FileNotFoundError, PermissionError, ...)
+            # all report the single first line "OSError".
+            sys.stderr.write("OSError\n")
+            if str(exc):
+                sys.stderr.write(str(exc) + "\n")
+            return 2
+        except (TypeError, ValueError) as exc:
             sys.stderr.write(type(exc).__name__ + "\n")
             if str(exc):
                 sys.stderr.write(str(exc) + "\n")
