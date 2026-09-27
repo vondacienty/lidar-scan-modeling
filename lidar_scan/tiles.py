@@ -14529,3 +14529,160 @@ def summarize_recovery_index(index: str, start: int, stop: int) -> tuple:
     complete = stop == start or all(entry["complete"]
                                     for entry in entries[start:stop])
     return (start, stop, selected, before, after, resume, complete)
+
+
+def plan_recovery_index_migration(before, after) -> str:
+    """Plan a migration between two :func:`merge_recovery_indexes` indexes.
+
+    ``before`` and ``after`` must each be a ``str`` byte-for-byte matching
+    the canonical output of :func:`merge_recovery_indexes`: entries chain,
+    a non-last entry is never unfinished, a completed plan never repeats
+    and no audit batch id repeats; their derived ``audit``,
+    ``snapshot``, ``resume`` and ``complete`` fields are recomputed from
+    the embedded entries and must agree.
+
+    The longest prefix of byte-for-byte identical entries (each entry is
+    compared on its embedded ``[plan, history]`` pair) is taken first.
+    When the next entry on both sides embeds the same plan text, the
+    common prefix is extended within that entry by the longest common
+    prefix of its confirmed units and of the audit rows those units
+    cover. The boundary snapshot ``b`` is then the ``after`` snapshot of
+    the last common unit, else the ``end`` snapshot of the last wholly
+    common entry, else the ``start`` snapshot of the first entry of the
+    non-empty side; with both sides empty it is ``null``. When both
+    sides are non-empty and their first entries' ``start`` snapshots
+    differ the indexes do not meet and migration is rejected.
+
+    Returns the canonical compact JSON document with exactly the six
+    top-level keys ``common``, ``rollback``, ``pending``, ``snapshot``,
+    ``resume`` and ``complete`` in that order. ``common`` is
+    ``[e, u, b]``: ``e`` is the number of wholly common entries, ``u``
+    the number of common confirmed units of the next same-plan entry
+    (zero when the next entries do not share a plan) and ``b`` the
+    boundary snapshot object or ``null``. ``rollback`` lists ``before``'s
+    ``[batch_id, status]`` audit rows strictly after ``b`` in reverse
+    order; ``pending`` lists ``after``'s rows strictly after ``b`` in
+    forward order. When the two sets of batch ids intersect the indexes
+    have forked and migration is rejected. ``snapshot`` is ``after``'s
+    terminal snapshot object or ``null``. ``resume`` is ``after``'s
+    embedded :func:`execute_checkout_recovery` resume state object when
+    its last entry is unfinished and ``null`` otherwise. ``complete`` is
+    ``after``'s derived flag. The output uses ``ensure_ascii=False``, no
+    whitespace and no trailing newline; the inputs are never modified and
+    repeated calls return a byte-identical document.
+
+    :raises TypeError: ``before`` or ``after`` is not a ``str``.
+    :raises ValueError: an index is malformed or not its canonical
+        encoding (including a wrong derived field, a broken entry chain
+        or a repeated batch id), the non-empty sides start at different
+        snapshots, or the rollback and pending batch ids intersect.
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+
+    before_entries, _before_audit, _before_snapshot, _before_resume, \
+        _before_complete = _decode_merged_recovery_index(before)
+    after_entries, _after_audit, after_snapshot, after_resume, \
+        after_complete = _decode_merged_recovery_index(after)
+
+    common_entries = 0
+    for left, right in zip(before_entries, after_entries):
+        if left["plan"] != right["plan"] \
+                or left["history"] != right["history"]:
+            break
+        common_entries += 1
+
+    def _confirmed_pieces(entry):
+        """The entry's leading units fully present in its history audit.
+
+        Each piece is ``(unit, audit_segment)`` with the audit rows the
+        history actually recorded for that unit; a valid index records
+        exactly the plan units' rows in order, so the walk stops at the
+        first unit the history has not fully confirmed.
+        """
+        pieces = []
+        position = 0
+        for unit in entry["units"]:
+            length = len(unit[1])
+            if position + length > len(entry["audit"]):
+                break
+            pieces.append((unit, tuple(entry["audit"][
+                position:position + length])))
+            position += length
+        return tuple(pieces)
+
+    common_units = 0
+    if common_entries < len(before_entries) \
+            and common_entries < len(after_entries):
+        left_next = before_entries[common_entries]
+        right_next = after_entries[common_entries]
+        if left_next["plan"] == right_next["plan"]:
+            for left_piece, right_piece in zip(
+                    _confirmed_pieces(left_next),
+                    _confirmed_pieces(right_next)):
+                if left_piece != right_piece:
+                    break
+                common_units += 1
+
+    before_start = before_entries[0]["start"] if before_entries else None
+    after_start = after_entries[0]["start"] if after_entries else None
+    if before_entries and after_entries and before_start != after_start:
+        raise ValueError("the two indexes start at different snapshots")
+
+    if common_units:
+        boundary = after_entries[common_entries]["units"][
+            common_units - 1][0][4]
+    elif common_entries:
+        boundary = after_entries[common_entries - 1]["end"]
+    elif after_entries:
+        boundary = after_start
+    elif before_entries:
+        boundary = before_start
+    else:
+        boundary = None
+
+    def _audit_after(entries, stop_position, stop_units):
+        """Audit rows of ``entries`` strictly past the (stop) boundary."""
+        rows = []
+        if stop_units:
+            entry = entries[stop_position]
+            offset = sum(len(unit[1])
+                         for unit in entry["units"][:stop_units])
+            rows.extend(entry["audit"][offset:])
+            position = stop_position + 1
+        else:
+            position = stop_position
+        for entry in entries[position:]:
+            rows.extend(entry["audit"])
+        return rows
+
+    rollback_rows = _audit_after(before_entries, common_entries,
+                                 common_units)
+    pending_rows = _audit_after(after_entries, common_entries,
+                                common_units)
+    rollback_ids = {batch_id for batch_id, _status in rollback_rows}
+    pending_ids = {batch_id for batch_id, _status in pending_rows}
+    if rollback_ids & pending_ids:
+        raise ValueError("the indexes fork: a batch id appears on both "
+                         "sides of the boundary")
+
+    parts = ['{"common":[', str(common_entries), ",", str(common_units),
+             ",", "null" if boundary is None else boundary,
+             '],"rollback":[']
+    parts.append(",".join("[" + _json_string(batch_id) + ","
+                          + _json_string(status) + "]"
+                          for batch_id, status in reversed(rollback_rows)))
+    parts.append('],"pending":[')
+    parts.append(",".join("[" + _json_string(batch_id) + ","
+                          + _json_string(status) + "]"
+                          for batch_id, status in pending_rows))
+    parts.append('],"snapshot":')
+    parts.append("null" if after_snapshot is None else after_snapshot)
+    parts.append(',"resume":')
+    parts.append("null" if after_resume is None else after_resume)
+    parts.append(',"complete":')
+    parts.append("true" if after_complete else "false")
+    parts.append("}")
+    return "".join(parts)
