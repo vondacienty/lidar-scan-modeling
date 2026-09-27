@@ -14529,3 +14529,119 @@ def summarize_recovery_index(index: str, start: int, stop: int) -> tuple:
     complete = stop == start or all(entry["complete"]
                                     for entry in entries[start:stop])
     return (start, stop, selected, before, after, resume, complete)
+
+
+def plan_recovery_index_migration(before: str, after: str) -> str:
+    """Plan the migration between two :func:`merge_recovery_indexes` indexes.
+
+    ``before`` and ``after`` must each be a ``str`` byte-for-byte matching
+    a canonical output of :func:`merge_recovery_indexes`; their entries
+    chain and their derived ``audit``, ``snapshot``, ``resume`` and
+    ``complete`` fields are recomputed from the embedded entries and must
+    agree.
+
+    The two indexes are aligned by their longest prefix of byte-identical
+    entries. When both indexes hold a next entry and those entries embed
+    the same plan, the alignment is extended by the longest common prefix
+    of the two histories' confirmed units and their audit segment (both
+    histories cover the same plan units, so the common confirmed prefix
+    and its audit rows always agree).
+
+    Returns the canonical compact JSON document with exactly the six
+    top-level keys ``common``, ``rollback``, ``pending``, ``snapshot``,
+    ``resume`` and ``complete`` in that order. ``common`` is the
+    three-item array ``[e, u, b]`` with ``e`` the number of common
+    entries, ``u`` the number of common confirmed units of the next
+    same-plan entry (zero when there is none) and ``b`` the boundary
+    snapshot: the after snapshot of the last common unit when ``u`` is
+    non-zero, else the end snapshot of the last common entry when ``e``
+    is non-zero, else the first entry's start snapshot of the non-empty
+    side (both first starts must agree when both sides hold an entry), or
+    ``null`` when both indexes are empty. ``rollback`` holds the
+    ``[batch_id, status]`` rows of ``before`` after the boundary in
+    reverse order and ``pending`` those of ``after`` in forward order; a
+    batch id appearing on both sides means the indexes fork. ``snapshot``
+    is ``after``'s terminal snapshot object or ``null``, ``resume`` the
+    embedded :func:`execute_checkout_recovery` state object of ``after``'s
+    unfinished last entry or ``null``, and ``complete`` ``after``'s
+    derived flag. The output uses ``ensure_ascii=False``, no whitespace
+    and no trailing newline; the inputs are never modified and repeated
+    calls return a byte-identical document.
+
+    :raises TypeError: ``before`` or ``after`` is not a ``str``.
+    :raises ValueError: either index is malformed or not its canonical
+        encoding (including derived field, entry chain or batch id
+        errors), both indexes hold an entry but start at different
+        snapshots, or a batch id appears on both sides of the boundary.
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    before_entries, _before_audit, _before_snapshot, _before_resume, \
+        _before_complete = _decode_merged_recovery_index(before)
+    after_entries, _after_audit, snapshot, resume_state, complete = \
+        _decode_merged_recovery_index(after)
+
+    e = 0
+    for before_entry, after_entry in zip(before_entries, after_entries):
+        if before_entry["plan"] != after_entry["plan"] \
+                or before_entry["history"] != after_entry["history"]:
+            break
+        e += 1
+
+    u = 0
+    units = None
+    if e < len(before_entries) and e < len(after_entries) \
+            and before_entries[e]["plan"] == after_entries[e]["plan"]:
+        units = before_entries[e]["units"]
+        before_confirmed = before_entries[e]["runs"][-1][0] \
+            if before_entries[e]["runs"] else 0
+        after_confirmed = after_entries[e]["runs"][-1][0] \
+            if after_entries[e]["runs"] else 0
+        u = min(before_confirmed, after_confirmed)
+
+    if u:
+        boundary = units[u - 1][0][4]
+    elif e:
+        boundary = before_entries[e - 1]["end"]
+    elif before_entries and after_entries:
+        if before_entries[0]["start"] != after_entries[0]["start"]:
+            raise ValueError("the indexes start at different snapshots")
+        boundary = before_entries[0]["start"]
+    elif before_entries:
+        boundary = before_entries[0]["start"]
+    elif after_entries:
+        boundary = after_entries[0]["start"]
+    else:
+        boundary = None
+
+    skip = 0
+    if u:
+        for unit in units[:u]:
+            skip += len(unit[1])
+    before_rows = [row for entry in before_entries[e:]
+                   for row in entry["audit"]][skip:]
+    after_rows = [row for entry in after_entries[e:]
+                  for row in entry["audit"]][skip:]
+    before_ids = {batch_id for batch_id, _status in before_rows}
+    after_ids = {batch_id for batch_id, _status in after_rows}
+    if before_ids & after_ids:
+        raise ValueError("the indexes fork: a batch id appears on both "
+                         "sides of the boundary")
+
+    parts = ['{"common":[', str(e), ",", str(u), ",",
+             "null" if boundary is None else boundary, '],"rollback":[']
+    parts.append(",".join(_checkout_audit_row_text(row)
+                          for row in reversed(before_rows)))
+    parts.append('],"pending":[')
+    parts.append(",".join(_checkout_audit_row_text(row)
+                          for row in after_rows))
+    parts.append('],"snapshot":')
+    parts.append("null" if snapshot is None else snapshot)
+    parts.append(',"resume":')
+    parts.append("null" if resume_state is None else resume_state)
+    parts.append(',"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
