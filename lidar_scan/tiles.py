@@ -15653,3 +15653,101 @@ def load_migration_journal(path, before, after) -> str:
     return journal
 
 
+def resume_migration_journal(path, before, after, max_steps=None) -> str:
+    """Resume a persisted migration journal and advance it atomically.
+
+    ``path`` must be a non-empty ``str`` giving the journal file.
+    ``before`` and ``after`` must each be a ``str`` byte-for-byte matching
+    the canonical output of :func:`merge_recovery_indexes`; their derived
+    ``audit``, ``snapshot``, ``resume`` and ``complete`` fields are
+    recomputed from the embedded entries and must agree. ``max_steps``
+    must be either ``None`` (confirm every remaining step) or a non-bool
+    non-negative ``int`` bounding the number of steps newly confirmed by
+    this call.
+
+    A missing ``path`` is treated as no journal yet and the migration
+    starts from ``before``. Otherwise the file is read and decoded as
+    strict UTF-8 and the decoded document must be a canonical
+    :func:`advance_migration_journal` output bound to ``before`` and
+    ``after``: the migration plan is recomputed as
+    ``plan_recovery_index_migration(before, after)`` and the journal's
+    embedded ``plan`` must match it byte for byte, its ``states`` must
+    confirm strictly increasing prefixes of the plan's steps, and its
+    ``index``, ``complete`` and ``receipt`` fields must agree with the
+    last state. Confirmation then continues after the journal's last
+    confirmed prefix and adds up to ``max_steps`` steps (when given);
+    a zero-step advance or a re-entered completed journal keeps the
+    stored document byte for byte.
+
+    The resulting journal is encoded as UTF-8 (with no byte order mark
+    and no trailing newline) and written byte for byte to a temporary
+    file in the same directory as ``path``; the temporary file is
+    flushed and fsynced and then atomically moved over ``path``. On any
+    failure the previous content of ``path`` is left unchanged and the
+    temporary file is removed. Returns the persisted canonical compact
+    JSON document with exactly the five top-level keys ``plan``,
+    ``states``, ``index``, ``complete`` and ``receipt`` in that order:
+    ``index`` embeds ``before`` and ``receipt`` is ``null`` while the
+    migration is unfinished, and ``index`` embeds ``after`` with
+    ``receipt`` equal to ``[rollback_count, pending_count, total_count]``
+    once it completes. The inputs are never modified and repeated calls
+    on a completed journal return a byte-identical document.
+
+    :raises TypeError: ``path``, ``before`` or ``after`` is not a
+        ``str``, or ``max_steps`` is neither ``None`` nor a non-bool
+        ``int``.
+    :raises ValueError: ``path`` is empty, ``max_steps`` is negative, an
+        index is malformed or not its canonical encoding (including a
+        wrong derived field), the file content is not valid UTF-8, or
+        the decoded journal is malformed, not its canonical encoding,
+        does not match the recomputed plan or contradicts its own
+        states.
+    :raises OSError: the file cannot be read (other than not existing,
+        which starts a fresh journal), written or replaced.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if max_steps is not None:
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+            raise TypeError("max_steps must be None or a non-bool int")
+        if max_steps < 0:
+            raise ValueError("max_steps must be non-negative")
+    if not path:
+        raise ValueError("path must not be empty")
+
+    try:
+        with open(path, "rb") as stream:
+            data = stream.read()
+    except FileNotFoundError:
+        journal = None
+    else:
+        try:
+            journal = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("the journal file is not valid UTF-8") from exc
+
+    result = advance_migration_journal(before, after, journal, max_steps)
+
+    payload = result.encode("utf-8")
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, temporary = tempfile.mkstemp(prefix=".migration-journal-",
+                                     dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return result
+
+
