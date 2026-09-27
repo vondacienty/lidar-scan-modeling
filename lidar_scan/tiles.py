@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import tempfile
 from collections.abc import Iterable
 from decimal import (Decimal, InvalidOperation, ROUND_FLOOR,
                      ROUND_HALF_EVEN, localcontext)
@@ -15505,5 +15507,149 @@ def advance_migration_journal(before, after, journal=None,
     receipt = complete_receipt if complete else None
     return _format_committed_migration_checkpoint(
         plan, states + [state], index, complete, receipt)
+
+
+def _decode_bound_migration_journal(before: str, after: str,
+                                    journal: str) -> None:
+    """Validate ``journal`` as a canonical journal bound to the indexes.
+
+    ``before`` and ``after`` must be canonical
+    :func:`merge_recovery_indexes` documents and ``journal`` a canonical
+    :func:`advance_migration_journal` output for exactly that pair: the
+    migration plan is recomputed and the journal's embedded ``plan``,
+    the confirmed prefixes of its ``states``, its ``index``,
+    ``complete`` flag and ``receipt`` must all agree with it.
+
+    :raises ValueError: an index is malformed or not its canonical
+        encoding, or the journal is malformed, not its canonical
+        encoding or not bound to ``before`` and ``after``.
+    """
+    plan = plan_recovery_index_migration(before, after)
+    document = json.loads(plan)
+    steps = [("rollback", batch_id, row_status)
+             for batch_id, row_status in document["rollback"]] + \
+        [("pending", batch_id, row_status)
+         for batch_id, row_status in document["pending"]]
+    rollback_count = len(document["rollback"])
+    pending_count = len(document["pending"])
+    complete_receipt = (rollback_count, pending_count,
+                        rollback_count + pending_count)
+    _decode_committed_migration_checkpoint(
+        journal, before, after, plan, steps, complete_receipt)
+
+
+def save_migration_journal(path, before, after, journal) -> None:
+    """Persist a migration journal between two recovery indexes.
+
+    ``path`` must be a non-empty ``str`` giving the destination file.
+    ``before`` and ``after`` must each be a ``str`` byte-for-byte
+    matching the canonical output of :func:`merge_recovery_indexes`;
+    their derived ``audit``, ``snapshot``, ``resume`` and ``complete``
+    fields are recomputed from the embedded entries and must agree.
+    ``journal`` must be a ``str`` byte-for-byte matching a canonical
+    :func:`advance_migration_journal` output bound to exactly that
+    ``before``/``after`` pair: the migration plan is recomputed and the
+    journal's embedded ``plan``, the confirmed prefixes of its
+    ``states``, its ``index``, ``complete`` flag and ``receipt`` must
+    all agree with it.
+
+    Every argument is fully validated before the file system is
+    touched. The journal is then encoded as UTF-8 (no byte order mark
+    and no trailing newline) and written byte for byte to a temporary
+    file in the same directory as ``path``; the temporary file is
+    flushed and fsynced and then atomically moved over ``path``. When
+    anything fails the previous content of ``path`` is left unchanged
+    and the temporary file is removed. On success ``None`` is returned;
+    the inputs are never modified and repeated calls with the same
+    arguments leave the same file content behind.
+
+    :raises TypeError: ``path``, ``before``, ``after`` or ``journal``
+        is not a ``str``.
+    :raises ValueError: ``path`` is empty, an index is malformed or not
+        its canonical encoding, or ``journal`` is malformed, not its
+        canonical encoding or not bound to ``before`` and ``after``.
+    :raises OSError: the temporary file cannot be created, written or
+        moved over ``path``.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if not isinstance(journal, str):
+        raise TypeError("journal must be a str")
+    if not path:
+        raise ValueError("path must not be empty")
+
+    _decode_bound_migration_journal(before, after, journal)
+
+    data = journal.encode("utf-8")
+    directory = os.path.dirname(path) or "."
+    fd, temporary = tempfile.mkstemp(dir=directory,
+                                     prefix=".migration-journal-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return None
+
+
+def load_migration_journal(path, before, after) -> str:
+    """Load a persisted migration journal bound to two recovery indexes.
+
+    ``path`` must be a non-empty ``str`` giving the journal file.
+    ``before`` and ``after`` must each be a ``str`` byte-for-byte
+    matching the canonical output of :func:`merge_recovery_indexes`;
+    their derived ``audit``, ``snapshot``, ``resume`` and ``complete``
+    fields are recomputed from the embedded entries and must agree.
+
+    The file is read and decoded as strict UTF-8. The decoded document
+    is only accepted when it is a canonical
+    :func:`advance_migration_journal` output bound to exactly that
+    ``before``/``after`` pair: the migration plan is recomputed and the
+    journal's embedded ``plan``, the confirmed prefixes of its
+    ``states``, its ``index``, ``complete`` flag and ``receipt`` must
+    all agree with it. On success the decoded document is returned
+    verbatim; the inputs are never modified and repeated calls return
+    an equal document.
+
+    :raises TypeError: ``path``, ``before`` or ``after`` is not a
+        ``str``.
+    :raises ValueError: ``path`` is empty, an index is malformed or not
+        its canonical encoding, or the file content is not valid UTF-8,
+        is malformed, is not its canonical encoding or is not bound to
+        ``before`` and ``after``.
+    :raises OSError: the file is missing or cannot be read.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if not path:
+        raise ValueError("path must not be empty")
+
+    _decode_merged_recovery_index(before)
+    _decode_merged_recovery_index(after)
+
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    try:
+        journal = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"journal file is not valid UTF-8 ({exc})") from exc
+
+    _decode_bound_migration_journal(before, after, journal)
+    return journal
 
 
