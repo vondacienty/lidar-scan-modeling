@@ -15165,3 +15165,234 @@ def update_migration_checkpoint(before, after, plan, checkpoint,
                                         complete)
 
 
+def _format_migration_commit(plan: str, states: list, index: str,
+                             complete: bool, receipt) -> str:
+    """Serialize a :func:`commit_migration_checkpoint` journal document."""
+    parts = ['{"plan":', plan, ',"states":[']
+    parts.append(",".join(states))
+    parts.append('],"index":')
+    parts.append(index)
+    parts.append(',"complete":')
+    parts.append("true" if complete else "false")
+    parts.append(',"receipt":')
+    if receipt is None:
+        parts.append("null")
+    else:
+        parts.append("[" + ",".join(str(count) for count in receipt) + "]")
+    parts.append("}")
+    return "".join(parts)
+
+
+def _decode_migration_commit(text: str, before: str, after: str, plan: str,
+                             steps: list, receipt: tuple) -> tuple:
+    """Validate a previous :func:`commit_migration_checkpoint` output.
+
+    ``before`` and ``after`` are the canonical index documents, ``plan``
+    the canonical :func:`plan_recovery_index_migration` document for
+    them, ``steps`` the plan's full ``(kind, batch_id, status)`` step
+    list and ``receipt`` the plan's ``(rollback_count, pending_count,
+    total_count)`` counts. The journal must be canonical, embed ``plan``
+    byte for byte, hold a non-empty ``states`` array whose every entry is
+    a canonical :func:`execute_recovery_index_migration` state for the
+    plan with a strictly increasing confirmed prefix, its ``index`` and
+    ``complete`` fields must agree with the last state, and its
+    ``receipt`` must be ``null`` while the migration is unfinished and
+    the plan's ``[rollback_count, pending_count, total_count]`` counts
+    once it completes. Returns ``(states, confirmed, complete)`` with
+    ``states`` the embedded state documents as a list of raw texts,
+    ``confirmed`` the last state's confirmed prefix length and
+    ``complete`` the journal's flag.
+
+    :raises ValueError: the journal is malformed or not its canonical
+        encoding, its plan does not match, a state is invalid for the
+        plan, the confirmed prefixes do not strictly increase, the
+        embedded index or completion flag contradicts the last state, or
+        the receipt does not match the plan's counts.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"journal is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("journal has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "plan", "states", "index", "complete", "receipt"]:
+        raise ValueError("journal must be a JSON object with exactly the "
+                         'keys "plan", "states", "index", "complete" and '
+                         '"receipt"')
+    plan_node = top["plan"]
+    if not isinstance(plan_node[0], dict):
+        raise ValueError('journal "plan" must be a JSON object')
+    if text[plan_node[1]:plan_node[2]] != plan:
+        raise ValueError('journal "plan" does not match the migration plan')
+    state_nodes = top["states"][0]
+    if not isinstance(state_nodes, list) or not state_nodes:
+        raise ValueError('journal "states" must be a non-empty array')
+    states = []
+    confirmed_values = []
+    for state_node in state_nodes:
+        if not isinstance(state_node[0], dict):
+            raise ValueError("each journal state must be a JSON object")
+        state_text = text[state_node[1]:state_node[2]]
+        _status, confirmed = _decode_recovery_index_migration_state(
+            state_text, before, after, steps)
+        if confirmed_values and confirmed <= confirmed_values[-1]:
+            raise ValueError("journal states must confirm strictly "
+                             "increasing prefixes")
+        confirmed_values.append(confirmed)
+        states.append(state_text)
+    index_node = top["index"]
+    if not isinstance(index_node[0], dict):
+        raise ValueError('journal "index" must be a JSON object')
+    index = text[index_node[1]:index_node[2]]
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('journal "complete" must be a boolean')
+    if complete != (confirmed_values[-1] == len(steps)):
+        raise ValueError('journal "complete" does not match the confirmed '
+                         "prefix")
+    expected_index = after if complete else before
+    if index != expected_index:
+        raise ValueError('journal "index" does not match the last state')
+    receipt_node = top["receipt"][0]
+    if complete:
+        if not isinstance(receipt_node, list) or len(receipt_node) != 3:
+            raise ValueError('a completed journal "receipt" must be a '
+                             "three-item array")
+        counts = []
+        for count_node in receipt_node:
+            count = count_node[0]
+            if isinstance(count, bool) or not isinstance(count, int) \
+                    or count < 0:
+                raise ValueError('journal "receipt" counts must be '
+                                 "non-negative integers")
+            counts.append(count)
+        if tuple(counts) != receipt:
+            raise ValueError('journal "receipt" does not match the plan '
+                             "counts")
+    elif receipt_node is not None:
+        raise ValueError('an unfinished journal "receipt" must be null')
+    canonical = _format_migration_commit(
+        plan, states, index, complete, receipt if complete else None)
+    if canonical != text:
+        raise ValueError("journal is not its canonical encoding")
+    return states, confirmed_values[-1], complete
+
+
+def commit_migration_checkpoint(before, after, plan, current, state,
+                                journal=None) -> str:
+    """Commit an :func:`execute_recovery_index_migration` state to a journal.
+
+    ``before``, ``after`` and ``current`` must each be a ``str``
+    byte-for-byte matching the canonical output of
+    :func:`merge_recovery_indexes`; their derived ``audit``,
+    ``snapshot``, ``resume`` and ``complete`` fields are recomputed from
+    the embedded entries and must agree. ``plan`` must be a ``str``
+    byte-for-byte equal to ``plan_recovery_index_migration(before,
+    after)``. ``state`` must be a ``str`` byte-for-byte matching a
+    canonical :func:`execute_recovery_index_migration` output for that
+    plan: its ``steps`` must be a confirmation prefix of the plan's
+    migration steps and its embedded ``index`` and ``complete`` flag
+    must agree with that prefix. ``current`` must equal the index the
+    committed ``state`` embeds (``before`` while the migration is
+    unfinished, ``after`` once it completes). ``journal`` is either
+    ``None`` (no committed state yet) or a ``str`` byte-for-byte
+    matching a previous output of this function for the same ``before``,
+    ``after`` and ``plan``.
+
+    With no journal the accumulation starts from any valid ``state``.
+    Otherwise the new ``state`` continues the journal's last state:
+    re-entering the journal's last state returns the journal byte for
+    byte; any other state must confirm a strictly longer prefix of the
+    plan's steps (its ``steps`` then necessarily extend the journal's
+    last ``steps`` as a proper prefix), and committing to a journal
+    whose migration is already complete is rejected.
+
+    Returns the canonical compact JSON document with exactly the five
+    top-level keys ``plan``, ``states``, ``index``, ``complete`` and
+    ``receipt`` in that order. ``plan`` is the migration plan embedded
+    byte for byte. ``states`` is the order preserving array of every
+    committed state document, with the new ``state`` appended unless it
+    equals the last committed one. ``index`` and ``complete`` are taken
+    from the last state: ``index`` embeds ``before`` while the migration
+    is unfinished and ``after`` once it completes, and ``complete`` is
+    true exactly when the last state's confirmed prefix reaches the
+    plan's total step count. ``receipt`` is ``null`` while the migration
+    is unfinished and the array ``[rollback_count, pending_count,
+    total_count]`` recomputed from ``plan`` once it completes. The
+    output uses ``ensure_ascii=False``, no whitespace and no trailing
+    newline; the inputs are never modified and repeated calls with the
+    journal's last state return a byte-identical document.
+
+    :raises TypeError: ``before``, ``after``, ``plan``, ``current`` or
+        ``state`` is not a ``str``, or ``journal`` is neither ``None``
+        nor a ``str``.
+    :raises ValueError: an index is malformed or not its canonical
+        encoding (including a wrong derived field), ``plan`` does not
+        match :func:`plan_recovery_index_migration` for ``before`` and
+        ``after``, ``state`` is malformed, not its canonical encoding,
+        not a confirmation prefix of the plan's steps or contradicts its
+        embedded index or completion flag, ``current`` does not equal
+        the committed state's index, ``journal`` is malformed, not its
+        canonical encoding, does not match ``plan`` or contradicts its
+        own states, or ``state`` does not continue the journal (a
+        non-increasing confirmed prefix, or any new state after
+        completion).
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(current, str):
+        raise TypeError("current must be a str")
+    if not isinstance(state, str):
+        raise TypeError("state must be a str")
+    if journal is not None and not isinstance(journal, str):
+        raise TypeError("journal must be None or a str")
+
+    expected = plan_recovery_index_migration(before, after)
+    if plan != expected:
+        raise ValueError("plan does not match "
+                         "plan_recovery_index_migration(before, after)")
+    _decode_merged_recovery_index(current)
+
+    document = json.loads(plan)
+    steps = [("rollback", batch_id, row_status)
+             for batch_id, row_status in document["rollback"]] + \
+        [("pending", batch_id, row_status)
+         for batch_id, row_status in document["pending"]]
+    rollback_count = len(document["rollback"])
+    pending_count = len(document["pending"])
+    plan_receipt = (rollback_count, pending_count,
+                    rollback_count + pending_count)
+
+    _status, confirmed = _decode_recovery_index_migration_state(
+        state, before, after, steps)
+    complete = confirmed == len(steps)
+    index = after if complete else before
+    if current != index:
+        raise ValueError("current must equal the committed state's index")
+    receipt = plan_receipt if complete else None
+
+    if journal is None:
+        return _format_migration_commit(plan, [state], index, complete,
+                                        receipt)
+
+    states, last_confirmed, last_complete = _decode_migration_commit(
+        journal, before, after, plan, steps, plan_receipt)
+    if state == states[-1]:
+        return journal
+    if last_complete:
+        raise ValueError("the migration is complete: no further state may "
+                         "be committed")
+    if confirmed <= last_confirmed:
+        raise ValueError("the state must confirm a strictly longer prefix "
+                         "than the journal's last state")
+    return _format_migration_commit(plan, states + [state], index, complete,
+                                    receipt)
+
+
