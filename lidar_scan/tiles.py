@@ -14686,3 +14686,77 @@ def plan_recovery_index_migration(before, after) -> str:
     parts.append("true" if after_complete else "false")
     parts.append("}")
     return "".join(parts)
+
+
+def apply_recovery_index_migration(before, after, plan, current) -> str:
+    """Apply a planned migration between two recovery indexes.
+
+    ``before``, ``after`` and ``current`` must each be a ``str``
+    byte-for-byte matching the canonical output of
+    :func:`merge_recovery_indexes`; their derived ``audit``,
+    ``snapshot``, ``resume`` and ``complete`` fields are recomputed from
+    the embedded entries and must agree. ``plan`` must be a ``str``
+    byte-for-byte equal to ``plan_recovery_index_migration(before,
+    after)`` and ``current`` must equal ``before`` or ``after``.
+
+    Returns the canonical compact JSON document with exactly the three
+    top-level keys ``status``, ``steps`` and ``index`` in that order.
+    When ``current`` equals ``after`` the migration is already in place:
+    ``status`` is ``"unchanged"`` and ``steps`` is empty. Otherwise
+    ``status`` is ``"applied"`` and ``steps`` lists the plan's
+    ``rollback`` rows mapped to ``["rollback", batch_id, status]`` in
+    their plan order followed by its ``pending`` rows mapped to
+    ``["pending", batch_id, status]`` in their plan order. ``index`` is
+    the ``after`` document embedded byte for byte, including its
+    ``snapshot``, ``resume`` and ``complete`` states, so re-entering
+    with the returned ``index`` as ``current`` yields ``"unchanged"``.
+    The output uses ``ensure_ascii=False``, no whitespace and no
+    trailing newline; the inputs are never modified and repeated calls
+    return a byte-identical document.
+
+    :raises TypeError: ``before``, ``after``, ``plan`` or ``current`` is
+        not a ``str``.
+    :raises ValueError: an index is malformed or not its canonical
+        encoding (including a wrong derived field), ``plan`` does not
+        match :func:`plan_recovery_index_migration` for ``before`` and
+        ``after``, or ``current`` equals neither ``before`` nor
+        ``after``.
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(current, str):
+        raise TypeError("current must be a str")
+
+    expected = plan_recovery_index_migration(before, after)
+    if plan != expected:
+        raise ValueError("plan does not match "
+                         "plan_recovery_index_migration(before, after)")
+    _decode_merged_recovery_index(current)
+
+    if current == after:
+        status = "unchanged"
+        steps = ()
+    elif current == before:
+        status = "applied"
+        document = json.loads(plan)
+        steps = tuple(("rollback", batch_id, row_status)
+                      for batch_id, row_status in document["rollback"]) + \
+            tuple(("pending", batch_id, row_status)
+                  for batch_id, row_status in document["pending"])
+    else:
+        raise ValueError("current must equal before or after")
+
+    parts = ['{"status":', _json_string(status), ',"steps":[']
+    parts.append(",".join("[" + _json_string(kind) + ","
+                          + _json_string(batch_id) + ","
+                          + _json_string(row_status) + "]"
+                          for kind, batch_id, row_status in steps))
+    parts.append('],"index":')
+    parts.append(after)
+    parts.append("}")
+    return "".join(parts)
+
