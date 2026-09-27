@@ -14760,3 +14760,221 @@ def apply_recovery_index_migration(before, after, plan, current) -> str:
     parts.append("}")
     return "".join(parts)
 
+
+def _format_recovery_index_migration_state(status: str, steps: list,
+                                           index: str,
+                                           complete: bool) -> str:
+    """Serialize an :func:`execute_recovery_index_migration` state document."""
+    parts = ['{"status":', _json_string(status), ',"confirmed":',
+             str(len(steps)), ',"steps":[']
+    parts.append(",".join("[" + _json_string(kind) + ","
+                          + _json_string(batch_id) + ","
+                          + _json_string(row_status) + "]"
+                          for kind, batch_id, row_status in steps))
+    parts.append('],"index":')
+    parts.append(index)
+    parts.append(',"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
+
+
+def _decode_recovery_index_migration_state(text: str, before: str,
+                                           after: str, steps: list) -> tuple:
+    """Validate a previous :func:`execute_recovery_index_migration` state.
+
+    ``before`` and ``after`` are the canonical index documents and
+    ``steps`` the plan's full ``(kind, batch_id, status)`` step list. The
+    state must be canonical, its ``steps`` must equal the first
+    ``confirmed`` of the plan's steps, its ``index`` must embed ``before``
+    while unfinished and ``after`` once complete, and its ``status`` and
+    ``complete`` fields must agree with that prefix. Returns
+    ``(status, confirmed)``.
+
+    :raises ValueError: the state is malformed or not its canonical
+        encoding, is not a confirmed prefix of the plan's steps, or
+        embeds the wrong index for its completion state.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"state is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("state has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "status", "confirmed", "steps", "index", "complete"]:
+        raise ValueError("state must be a JSON object with exactly the keys "
+                         '"status", "confirmed", "steps", "index" and '
+                         '"complete"')
+    status = top["status"][0]
+    if status not in ("pending", "applied", "unchanged"):
+        raise ValueError('state "status" must be "pending", "applied" or '
+                         '"unchanged"')
+    confirmed = top["confirmed"][0]
+    if isinstance(confirmed, bool) or not isinstance(confirmed, int) \
+            or confirmed < 0 or confirmed > len(steps):
+        raise ValueError('state "confirmed" must be between zero and the '
+                         "number of migration steps")
+    step_nodes = top["steps"][0]
+    if not isinstance(step_nodes, list) or len(step_nodes) != confirmed:
+        raise ValueError('state "steps" must hold one entry per confirmed '
+                         "migration step")
+    state_steps = []
+    for step_node in step_nodes:
+        row = step_node[0]
+        if not isinstance(row, list) or len(row) != 3:
+            raise ValueError("each state step must be a three-item array "
+                             "[kind, id, status]")
+        kind = row[0][0]
+        batch_id = row[1][0]
+        row_status = row[2][0]
+        if kind not in ("rollback", "pending"):
+            raise ValueError('state step kind must be "rollback" or '
+                             '"pending"')
+        if not isinstance(batch_id, str) or not isinstance(row_status, str):
+            raise ValueError("state step id and status must be str")
+        state_steps.append((kind, batch_id, row_status))
+    if tuple(state_steps) != tuple(steps[:confirmed]):
+        raise ValueError('state "steps" must be a confirmed prefix of the '
+                         "plan's migration steps")
+    index_node = top["index"]
+    if not isinstance(index_node[0], dict):
+        raise ValueError('state "index" must be a JSON object')
+    index = text[index_node[1]:index_node[2]]
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('state "complete" must be a boolean')
+    if complete != (confirmed == len(steps)):
+        raise ValueError('state "complete" does not match the confirmed '
+                         "prefix")
+    if complete:
+        if index != after:
+            raise ValueError("a completed state must embed the after index")
+        if status == "pending":
+            raise ValueError('a completed state may not be "pending"')
+    else:
+        if index != before:
+            raise ValueError("an unfinished state must embed the before "
+                             "index")
+        if status != "pending":
+            raise ValueError('an unfinished state must be "pending"')
+    canonical = _format_recovery_index_migration_state(
+        status, state_steps, index, complete)
+    if canonical != text:
+        raise ValueError("state is not its canonical encoding")
+    return status, confirmed
+
+
+def execute_recovery_index_migration(before, after, plan, current,
+                                     state=None, max_steps=None) -> str:
+    """Confirm migration steps of a planned recovery index migration.
+
+    ``before``, ``after`` and ``current`` must each be a ``str``
+    byte-for-byte matching the canonical output of
+    :func:`merge_recovery_indexes`; their derived ``audit``,
+    ``snapshot``, ``resume`` and ``complete`` fields are recomputed from
+    the embedded entries and must agree. ``plan`` must be a ``str``
+    byte-for-byte equal to ``plan_recovery_index_migration(before,
+    after)``. ``state`` must be either ``None`` (no step confirmed yet)
+    or a ``str`` byte-for-byte matching a previous output of this
+    function for the same ``before``, ``after`` and ``plan``; its
+    ``steps`` must be a confirmation prefix of the plan's migration
+    steps. ``max_steps`` must be either ``None`` (confirm every
+    remaining step) or a non-bool non-negative ``int`` bounding the
+    number of steps newly confirmed by this call.
+
+    The migration steps are the plan's ``rollback`` rows mapped to
+    ``["rollback", id, status]`` in their plan order followed by its
+    ``pending`` rows mapped to ``["pending", id, status]`` in their plan
+    order. Confirmation starts after the state's confirmed prefix and
+    adds up to ``max_steps`` steps (when given). While the migration is
+    unfinished ``current`` must equal ``before``; once every step is
+    confirmed ``current`` must equal ``after``.
+
+    Returns the canonical compact JSON document with exactly the five
+    top-level keys ``status``, ``confirmed``, ``steps``, ``index`` and
+    ``complete`` in that order. ``steps`` is the cumulative confirmed
+    prefix and ``confirmed`` its length. ``status`` is ``"pending"``
+    while steps remain unconfirmed (``index`` embeds ``before``),
+    ``"applied"`` when this call confirms the final step (``index``
+    embeds ``after``), and ``"unchanged"`` when ``current`` already
+    equals ``after`` with no state supplied (``index`` embeds ``after``
+    and every step counts as confirmed). ``complete`` is true exactly
+    when every step is confirmed. The output uses
+    ``ensure_ascii=False``, no whitespace and no trailing newline; the
+    inputs are never modified and feeding a completed state back in
+    returns a byte-identical document.
+
+    :raises TypeError: ``before``, ``after``, ``plan`` or ``current`` is
+        not a ``str``, ``state`` is neither ``None`` nor a ``str``, or
+        ``max_steps`` is neither ``None`` nor a non-bool ``int``.
+    :raises ValueError: an index is malformed or not its canonical
+        encoding (including a wrong derived field), ``plan`` does not
+        match :func:`plan_recovery_index_migration` for ``before`` and
+        ``after``, ``max_steps`` is negative, the state is malformed,
+        not its canonical encoding, not a confirmation prefix of the
+        plan's steps or does not match ``before``/``after``, the
+        migration is unfinished but ``current`` does not equal
+        ``before``, or the migration is complete but ``current`` does
+        not equal ``after``. No partial state is produced.
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(current, str):
+        raise TypeError("current must be a str")
+    if state is not None and not isinstance(state, str):
+        raise TypeError("state must be None or a str")
+    if max_steps is not None:
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+            raise TypeError("max_steps must be None or a non-bool int")
+        if max_steps < 0:
+            raise ValueError("max_steps must be non-negative")
+
+    expected = plan_recovery_index_migration(before, after)
+    if plan != expected:
+        raise ValueError("plan does not match "
+                         "plan_recovery_index_migration(before, after)")
+    _decode_merged_recovery_index(current)
+
+    document = json.loads(plan)
+    steps = [("rollback", batch_id, row_status)
+             for batch_id, row_status in document["rollback"]] + \
+        [("pending", batch_id, row_status)
+         for batch_id, row_status in document["pending"]]
+
+    if state is None:
+        if current == after:
+            return _format_recovery_index_migration_state(
+                "unchanged", steps, after, True)
+        if current != before:
+            raise ValueError("current must equal before or after")
+        confirmed = 0
+    else:
+        status, confirmed = _decode_recovery_index_migration_state(
+            state, before, after, steps)
+        if confirmed == len(steps):
+            if current != after:
+                raise ValueError("the migration is complete: current must "
+                                 "equal after")
+            return _format_recovery_index_migration_state(
+                status, steps, after, True)
+        if current != before:
+            raise ValueError("the migration is unfinished: current must "
+                             "equal before")
+
+    if max_steps is None:
+        target = len(steps)
+    else:
+        target = min(len(steps), confirmed + max_steps)
+    if target == len(steps):
+        return _format_recovery_index_migration_state(
+            "applied", steps, after, True)
+    return _format_recovery_index_migration_state(
+        "pending", steps[:target], before, False)
+
