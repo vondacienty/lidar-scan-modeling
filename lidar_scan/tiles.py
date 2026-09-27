@@ -15653,3 +15653,73 @@ def load_migration_journal(path, before, after) -> str:
     return journal
 
 
+def resume_migration_journal(path, before, after, max_steps=None) -> str:
+    """Resume a persisted migration journal and advance it in place.
+
+    ``path`` must be a non-empty ``str`` giving the journal file.
+    ``before`` and ``after`` must each be a ``str`` byte-for-byte matching
+    the canonical output of :func:`merge_recovery_indexes`; their derived
+    ``audit``, ``snapshot``, ``resume`` and ``complete`` fields are
+    recomputed from the embedded entries and must agree. ``max_steps``
+    must be either ``None`` (confirm every remaining step) or a non-bool
+    non-negative ``int`` bounding the number of steps newly confirmed by
+    this call.
+
+    A missing file is treated as having no journal yet; otherwise the
+    file is read and decoded as strict UTF-8 and the decoded document
+    must be a canonical :func:`advance_migration_journal` output bound
+    to ``before`` and ``after``. The migration is then advanced from
+    that prefix by at most ``max_steps`` newly confirmed steps (``None``
+    confirms all of them); a zero-step advance or a re-entered completed
+    journal keeps the loaded document byte for byte. The resulting
+    document is encoded as UTF-8 (with no byte order mark and no
+    trailing newline) and written byte for byte to a temporary file in
+    the same directory as ``path``; the temporary file is flushed and
+    fsynced and then atomically moved over ``path``. On any failure the
+    previous content of ``path`` is left unchanged and the temporary
+    file is removed. Returns the same canonical document that was
+    written; the inputs are never modified and repeated calls on an
+    unchanged file return an equal document.
+
+    :raises TypeError: ``path``, ``before`` or ``after`` is not a
+        ``str``, or ``max_steps`` is neither ``None`` nor a non-bool
+        ``int``.
+    :raises ValueError: ``path`` is empty, ``max_steps`` is negative, an
+        index is malformed or not its canonical encoding (including a
+        wrong derived field), the file content is not valid UTF-8, or
+        the decoded journal is malformed, not its canonical encoding,
+        does not match the recomputed plan or contradicts its own
+        states.
+    :raises OSError: the file cannot be read (other than not existing)
+        or cannot be written or replaced.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if max_steps is not None:
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+            raise TypeError("max_steps must be None or a non-bool int")
+        if max_steps < 0:
+            raise ValueError("max_steps must be non-negative")
+    if not path:
+        raise ValueError("path must not be empty")
+
+    try:
+        with open(path, "rb") as stream:
+            data = stream.read()
+    except FileNotFoundError:
+        journal = None
+    else:
+        try:
+            journal = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("the journal file is not valid UTF-8") from exc
+
+    result = advance_migration_journal(before, after, journal, max_steps)
+    save_migration_journal(path, before, after, result)
+    return result
+
+
