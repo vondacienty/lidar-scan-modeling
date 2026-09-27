@@ -14978,3 +14978,190 @@ def execute_recovery_index_migration(before, after, plan, current,
     return _format_recovery_index_migration_state(
         "pending", steps[:target], before, False)
 
+
+def _format_migration_checkpoint(plan: str, states: list, index: str,
+                                 complete: bool) -> str:
+    """Serialize an :func:`update_migration_checkpoint` document."""
+    parts = ['{"plan":', plan, ',"states":[']
+    parts.append(",".join(states))
+    parts.append('],"index":')
+    parts.append(index)
+    parts.append(',"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
+
+
+def _decode_migration_checkpoint(text: str, before: str, after: str,
+                                 plan: str, steps: list) -> tuple:
+    """Validate a previous :func:`update_migration_checkpoint` output.
+
+    ``before`` and ``after`` are the canonical index documents, ``plan``
+    the canonical :func:`plan_recovery_index_migration` document for
+    them and ``steps`` the plan's full ``(kind, batch_id, status)`` step
+    list. The checkpoint must be canonical, embed ``plan`` byte for
+    byte, hold a non-empty ``states`` array whose every entry is a
+    canonical :func:`execute_recovery_index_migration` state for the
+    plan with a strictly increasing confirmed prefix, and its ``index``
+    and ``complete`` fields must agree with the last state. Returns
+    ``(states, confirmed, complete)`` with ``states`` the embedded state
+    documents as a list of raw texts, ``confirmed`` the last state's
+    confirmed prefix length and ``complete`` the checkpoint's flag.
+
+    :raises ValueError: the checkpoint is malformed or not its canonical
+        encoding, its plan does not match, a state is invalid for the
+        plan, the confirmed prefixes do not strictly increase, or the
+        embedded index or completion flag contradicts the last state.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"checkpoint is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("checkpoint has trailing data after the JSON "
+                         "document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "plan", "states", "index", "complete"]:
+        raise ValueError("checkpoint must be a JSON object with exactly the "
+                         'keys "plan", "states", "index" and "complete"')
+    plan_node = top["plan"]
+    if not isinstance(plan_node[0], dict):
+        raise ValueError('checkpoint "plan" must be a JSON object')
+    if text[plan_node[1]:plan_node[2]] != plan:
+        raise ValueError('checkpoint "plan" does not match the migration '
+                         "plan")
+    state_nodes = top["states"][0]
+    if not isinstance(state_nodes, list) or not state_nodes:
+        raise ValueError('checkpoint "states" must be a non-empty array')
+    states = []
+    confirmed_values = []
+    for state_node in state_nodes:
+        if not isinstance(state_node[0], dict):
+            raise ValueError("each checkpoint state must be a JSON object")
+        state_text = text[state_node[1]:state_node[2]]
+        _status, confirmed = _decode_recovery_index_migration_state(
+            state_text, before, after, steps)
+        if confirmed_values and confirmed <= confirmed_values[-1]:
+            raise ValueError("checkpoint states must confirm strictly "
+                             "increasing prefixes")
+        confirmed_values.append(confirmed)
+        states.append(state_text)
+    index_node = top["index"]
+    if not isinstance(index_node[0], dict):
+        raise ValueError('checkpoint "index" must be a JSON object')
+    index = text[index_node[1]:index_node[2]]
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('checkpoint "complete" must be a boolean')
+    if complete != (confirmed_values[-1] == len(steps)):
+        raise ValueError('checkpoint "complete" does not match the '
+                         "confirmed prefix")
+    expected_index = after if complete else before
+    if index != expected_index:
+        raise ValueError('checkpoint "index" does not match the last '
+                         "state")
+    canonical = _format_migration_checkpoint(plan, states, index, complete)
+    if canonical != text:
+        raise ValueError("checkpoint is not its canonical encoding")
+    return states, confirmed_values[-1], complete
+
+
+def update_migration_checkpoint(before, after, plan, checkpoint,
+                                state) -> str:
+    """Fold an :func:`execute_recovery_index_migration` state into a checkpoint.
+
+    ``before`` and ``after`` must each be a ``str`` byte-for-byte matching
+    the canonical output of :func:`merge_recovery_indexes`; their derived
+    ``audit``, ``snapshot``, ``resume`` and ``complete`` fields are
+    recomputed from the embedded entries and must agree. ``plan`` must be
+    a ``str`` byte-for-byte equal to
+    ``plan_recovery_index_migration(before, after)``. ``state`` must be a
+    ``str`` byte-for-byte matching a canonical
+    :func:`execute_recovery_index_migration` output for that plan: its
+    ``steps`` must be a confirmation prefix of the plan's migration steps
+    and its embedded ``index`` and ``complete`` flag must agree with that
+    prefix. ``checkpoint`` is either ``None`` (no accumulated state yet)
+    or a ``str`` byte-for-byte matching a previous output of this
+    function for the same ``before``, ``after`` and ``plan``.
+
+    With no checkpoint the accumulation starts from any valid ``state``.
+    Otherwise the new ``state`` continues the checkpoint's last state:
+    re-entering the checkpoint's last state is byte-for-byte idempotent;
+    any other state must confirm a strictly longer prefix of the plan's
+    steps (its ``steps`` then necessarily extend the checkpoint's last
+    ``steps`` as a proper prefix), and appending to a checkpoint whose
+    migration is already complete is rejected.
+
+    Returns the canonical compact JSON document with exactly the four
+    top-level keys ``plan``, ``states``, ``index`` and ``complete`` in
+    that order. ``plan`` is the migration plan embedded byte for byte.
+    ``states`` is the order preserving array of every accumulated state
+    document, with the new ``state`` appended unless it equals the last
+    accumulated one. ``index`` and ``complete`` are taken from the last
+    state: ``index`` embeds ``before`` while the migration is unfinished
+    and ``after`` once it completes, and ``complete`` is true exactly
+    when the last state's confirmed prefix reaches the plan's total step
+    count. The output uses ``ensure_ascii=False``, no whitespace and no
+    trailing newline; the inputs are never modified and repeated calls
+    with the checkpoint's last state return a byte-identical document.
+
+    :raises TypeError: ``before``, ``after``, ``plan`` or ``state`` is
+        not a ``str``, or ``checkpoint`` is neither ``None`` nor a
+        ``str``.
+    :raises ValueError: an index is malformed or not its canonical
+        encoding (including a wrong derived field), ``plan`` does not
+        match :func:`plan_recovery_index_migration` for ``before`` and
+        ``after``, ``state`` is malformed, not its canonical encoding,
+        not a confirmation prefix of the plan's steps or contradicts its
+        embedded index or completion flag, ``checkpoint`` is malformed,
+        not its canonical encoding, does not match ``plan`` or
+        contradicts its own states, or ``state`` does not continue the
+        checkpoint (a non-increasing confirmed prefix, or any new state
+        after completion).
+    """
+    if not isinstance(before, str):
+        raise TypeError("before must be a str")
+    if not isinstance(after, str):
+        raise TypeError("after must be a str")
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(state, str):
+        raise TypeError("state must be a str")
+    if checkpoint is not None and not isinstance(checkpoint, str):
+        raise TypeError("checkpoint must be None or a str")
+
+    expected = plan_recovery_index_migration(before, after)
+    if plan != expected:
+        raise ValueError("plan does not match "
+                         "plan_recovery_index_migration(before, after)")
+
+    document = json.loads(plan)
+    steps = [("rollback", batch_id, row_status)
+             for batch_id, row_status in document["rollback"]] + \
+        [("pending", batch_id, row_status)
+         for batch_id, row_status in document["pending"]]
+
+    _status, confirmed = _decode_recovery_index_migration_state(
+        state, before, after, steps)
+    complete = confirmed == len(steps)
+    index = after if complete else before
+
+    if checkpoint is None:
+        return _format_migration_checkpoint(plan, [state], index, complete)
+
+    states, last_confirmed, last_complete = _decode_migration_checkpoint(
+        checkpoint, before, after, plan, steps)
+    if state == states[-1]:
+        return checkpoint
+    if last_complete:
+        raise ValueError("the migration is complete: no further state may "
+                         "be appended")
+    if confirmed <= last_confirmed:
+        raise ValueError("the state must confirm a strictly longer prefix "
+                         "than the checkpoint's last state")
+    return _format_migration_checkpoint(plan, states + [state], index,
+                                        complete)
+
+
