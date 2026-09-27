@@ -9,6 +9,7 @@ from .e57 import iter_e57
 from .las import iter_las
 from .ply import iter_ply
 from .tiles import (accumulate_reconciliation,
+                    advance_migration_journal,
                     aggregate_tile_pyramid_delta_windows,
                     aggregate_tile_region_stats, aggregate_tile_window_stats,
                     apply_delivery_checkout,
@@ -119,6 +120,7 @@ from .voxel import fuse_voxels
 
 __all__ = ["__version__", "chm", "dem", "e57", "las", "ply", "tiles", "voxel",
            "accumulate_reconciliation",
+           "advance_migration_journal",
            "aggregate_tile_pyramid_delta_windows",
            "aggregate_tile_region_stats", "aggregate_tile_window_stats",
            "apply_delivery_checkout",
