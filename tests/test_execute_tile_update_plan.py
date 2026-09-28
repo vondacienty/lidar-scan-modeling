@@ -187,6 +187,19 @@ def test_completed_plan_with_empty_tasks(scene, paths):
     assert document["complete"] is True
 
 
+@pytest.mark.parametrize("tampered", [
+    '{"tasks":[[0,0,0,255,255,[["b0",1,1,null]]]],"complete":true}',
+    '{"tasks":[[0,0,0,255,255,[["b0",1,1,null]]],'
+    '[1,0,0,511,511,[["b0",1,1,null]]]],"complete":true}',
+])
+def test_plan_with_tasks_must_not_be_complete(tampered):
+    pyramid = build_tile_pyramid(((10.0, 10.0, 5.0, 0, 1.0),), levels=3)
+    with pytest.raises(ValueError):
+        execute_tile_update_plan(tampered, (("b0", pyramid),))
+    with pytest.raises(ValueError):
+        execute_tile_update_plan(tampered, (("b0", pyramid),), max_tasks=0)
+
+
 # ---------------------------------------------------------------------------
 # max_tasks and re-entry
 # ---------------------------------------------------------------------------
