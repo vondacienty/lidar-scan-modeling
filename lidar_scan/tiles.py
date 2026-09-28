@@ -16471,6 +16471,72 @@ def build_tile_update_audit(state, batches,
         violate the :func:`build_tile_pyramid` value contract, or a
         point violates its value contract.
     """
+    return tuple(
+        (record["id"], record["confirmed"], record["total"],
+         record["published"], record["receipt"], pyramid)
+        for record, pyramid in _tile_update_audit_rows(
+            state, batches, cell_size, tile_cells, levels))
+
+
+def plan_tile_update_windows(state, batches,
+                             cell_size: int | float = 1.0,
+                             tile_cells: int = 256,
+                             levels: int = 3) -> tuple:
+    """Plan the tile windows touched by published update batches.
+
+    ``state`` and ``batches`` follow exactly the
+    :func:`build_tile_update_audit` contract: ``state`` must be a ``str``
+    byte-for-byte matching a canonical :func:`publish_updates` output
+    document and ``batches`` a ``tuple`` of ``(id, points)`` pairs whose
+    ids match the state's batches one for one, in the state's order.
+    Each ``points`` iterable is walked exactly once, and point
+    validation, error reporting, level aggregation and quantization are
+    exactly those of :func:`build_tile_pyramid` (with ``cell_size``,
+    ``tile_cells`` and ``levels`` forwarded to it).
+
+    Returns a tuple in state order, one seven-item
+    ``(id, confirmed, total, published, receipt, pyramid, windows)``
+    tuple per state batch. The first six values are exactly the
+    corresponding :func:`build_tile_update_audit` row. ``windows`` is a
+    tuple of ``(level, ix0, iy0, ix1, iy1)`` tuples, one per tile in
+    ``pyramid``, holding the tile's level and inclusive cell-index
+    bounds, sorted ascending by ``(level, tx, ty)``; a batch whose
+    points are empty gets an empty ``windows`` tuple. A completed state
+    without batches paired with an empty ``batches`` tuple returns
+    ``()``. The function is pure: repeated calls with the same
+    arguments return equal results.
+
+    :raises TypeError: ``state`` is not a ``str``, ``batches`` is not a
+        ``tuple``, a batch is not an ``(id, points)`` pair, an ``id`` is
+        not a ``str``, ``cell_size``/``tile_cells``/``levels`` have the
+        wrong type, or a point violates the
+        :func:`build_tile_pyramid` point type contract.
+    :raises ValueError: ``state`` is not a canonical
+        :func:`publish_updates` document, the batches do not match the
+        state batches in number, id or order, the pyramid parameters
+        violate the :func:`build_tile_pyramid` value contract, or a
+        point violates its value contract.
+    """
+    result = []
+    for record, pyramid in _tile_update_audit_rows(
+            state, batches, cell_size, tile_cells, levels):
+        windows = tuple(
+            (level, tile[2], tile[3], tile[4], tile[5])
+            for level, level_tiles in enumerate(pyramid)
+            for tile in level_tiles)
+        result.append((record["id"], record["confirmed"], record["total"],
+                       record["published"], record["receipt"], pyramid,
+                       windows))
+    return tuple(result)
+
+
+def _tile_update_audit_rows(state, batches, cell_size, tile_cells, levels):
+    """Validate the update-audit inputs and build the per-batch pyramids.
+
+    Returns a tuple of ``(record, pyramid)`` pairs in state order, where
+    ``record`` is the decoded state batch and ``pyramid`` the
+    :func:`build_tile_pyramid` layering tuple of the matching points.
+    """
     if not isinstance(state, str):
         raise TypeError("state must be a str")
     if not isinstance(batches, tuple):
@@ -16494,6 +16560,11 @@ def build_tile_update_audit(state, batches,
         _decode_recovery_index(embedded_index)
 
     if not records:
+        # A batch-less state builds no pyramids, but the pyramid
+        # parameters are still validated exactly as
+        # :func:`build_tile_pyramid` validates them.
+        build_tile_pyramid((), cell_size=cell_size,
+                           tile_cells=tile_cells, levels=levels)
         if batches:
             raise ValueError("batches do not match the state: the state "
                              "records no batches")
@@ -16508,13 +16579,12 @@ def build_tile_update_audit(state, batches,
                 f"batch id {entry[0]!r} does not match state batch id "
                 f"{record['id']!r}")
 
-    result = []
+    rows = []
     for entry, record in zip(batches, records):
         pyramid = build_tile_pyramid(
             entry[1], cell_size=cell_size,
             tile_cells=tile_cells, levels=levels)
-        result.append((record["id"], record["confirmed"], record["total"],
-                       record["published"], record["receipt"], pyramid))
-    return tuple(result)
+        rows.append((record, pyramid))
+    return tuple(rows)
 
 
