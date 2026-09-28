@@ -415,8 +415,69 @@ def test_empty_paths_and_equal_paths_rejected(scene, paths):
                         scene["two_batches"])
 
 
-def test_empty_batches_rejected(scene, paths):
+def test_empty_batches_fresh_publish_writes_completed_empty_state(
+        scene, paths):
     _write(paths["index"], scene["empty"])
+    text = publish_updates(paths["state"], paths["index"], ())
+    document = json.loads(text)
+    assert document == {"batches": [], "index": json.loads(scene["empty"]),
+                        "complete": True}
+    assert list(document) == ["batches", "index", "complete"]
+    assert _canonical(document) == text
+    assert " " not in text and not text.endswith("\n")
+    assert _read(paths["state"]) == text
+    assert _read(paths["index"]) == scene["empty"]
+
+
+def test_empty_batches_verify_index_before_writing_state(paths, scene):
+    _write(paths["index"], "{not json")
+    with pytest.raises(ValueError):
+        publish_updates(paths["state"], paths["index"], ())
+    assert not os.path.exists(paths["state"])
+
+
+def test_empty_batches_reentry_is_byte_identical(scene, paths):
+    _write(paths["index"], scene["empty"])
+    first = publish_updates(paths["state"], paths["index"], ())
+    second = publish_updates(paths["state"], paths["index"], ())
+    third = publish_updates(paths["state"], paths["index"], (), limit=0)
+    assert second == first
+    assert third == first
+    assert _read(paths["state"]) == first
+    assert _read(paths["index"]) == scene["empty"]
+
+
+def test_empty_state_then_append_batches_publishes(scene, paths):
+    _write(paths["index"], scene["empty"])
+    publish_updates(paths["state"], paths["index"], ())
+    text = publish_updates(paths["state"], paths["index"],
+                           scene["two_batches"])
+    document = json.loads(text)
+    assert document["complete"] is True
+    assert [record[0] for record in document["batches"]] == ["b0", "b1"]
+    assert _read(paths["index"]) == scene["after_all"]
+    assert publish_updates(paths["state"], paths["index"],
+                           scene["two_batches"]) == text
+
+
+def test_empty_state_reentry_with_divergent_index_rejected(scene, paths):
+    _write(paths["index"], scene["empty"])
+    publish_updates(paths["state"], paths["index"], ())
+    _write(paths["index"], scene["after_zero"])
+    with pytest.raises(ValueError):
+        publish_updates(paths["state"], paths["index"], ())
+    with pytest.raises(ValueError):
+        publish_updates(paths["state"], paths["index"],
+                        scene["two_batches"])
+
+
+def test_empty_batches_rejected_once_state_records_batches(scene, paths):
+    _write(paths["index"], scene["empty"])
+    publish_updates(paths["state"], paths["index"],
+                    scene["two_batches"], limit=0)
+    with pytest.raises(ValueError):
+        publish_updates(paths["state"], paths["index"], ())
+    publish_updates(paths["state"], paths["index"], scene["two_batches"])
     with pytest.raises(ValueError):
         publish_updates(paths["state"], paths["index"], ())
 
