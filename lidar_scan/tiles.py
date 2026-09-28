@@ -16530,6 +16530,125 @@ def plan_tile_update_windows(state, batches,
     return tuple(result)
 
 
+def build_tile_update_plan(state, batches,
+                           cell_size: int | float = 1.0,
+                           tile_cells: int = 256,
+                           levels: int = 3) -> str:
+    """Plan tile update tasks for the unpublished update batches.
+
+    ``state``, ``batches`` and the pyramid parameters follow exactly the
+    :func:`plan_tile_update_windows` contract: ``state`` must be a ``str``
+    byte-for-byte matching a canonical :func:`publish_updates` output
+    document and ``batches`` a ``tuple`` of ``(id, points)`` pairs whose
+    ids match the state's batches one for one, in the state's order.
+    Each ``points`` iterable is walked exactly once, and point
+    validation, error reporting, level aggregation and quantization are
+    exactly those of :func:`build_tile_pyramid` (with ``cell_size``,
+    ``tile_cells`` and ``levels`` forwarded to it).
+
+    Only the state batches whose ``published`` flag is false contribute
+    windows. Within each level, the closed ``(ix0, iy0, ix1, iy1)``
+    windows are grouped into connected components: two windows are
+    connected when they intersect as rectangles, or when their edges are
+    one cell apart horizontally or vertically while their intervals on
+    the other axis intersect; the grouping is the transitive closure of
+    that relation. Each component becomes one task whose bounds are the
+    component's endpoint extrema.
+
+    Returns the plan as a JSON document with the keys ``tasks`` and
+    ``complete``, in that order. ``tasks`` is an array sorted by
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` whose items are
+    ``[level, ix_min, iy_min, ix_max, iy_max, sources]``; ``sources``
+    lists the contributing batches in state order without duplicates,
+    each as ``[id, confirmed, total, receipt]`` with ``receipt`` either
+    null or an array of three decimal integers. ``complete`` echoes the
+    state's boolean. A plan without tasks carries an empty ``tasks``
+    array. The document is encoded with ``ensure_ascii=False`` and no
+    whitespace or trailing newline, so repeated calls with one for one
+    identical results.
+
+    :raises TypeError: ``state`` is not a ``str``, ``batches`` is not a
+        ``tuple``, a batch is not an ``(id, points)`` pair, an ``id`` is
+        not a ``str``, ``cell_size``/``tile_cells``/``levels`` have the
+        wrong type, or a point violates the
+        :func:`build_tile_pyramid` point type contract.
+    :raises ValueError: ``state`` is not a canonical
+        :func:`publish_updates` document, the batches do not match the
+        state batches in number, id or order, the pyramid parameters
+        violate the :func:`build_tile_pyramid` value contract, or a
+        point violates its value contract.
+    """
+    rows = plan_tile_update_windows(state, batches, cell_size,
+                                    tile_cells, levels)
+
+    # Collect the windows of the unpublished batches per level, keeping
+    # each window's contributing batch (its row index, in state order).
+    windows_per_level: list[list] = [[] for _ in range(levels)]
+    for position, row in enumerate(rows):
+        if row[3]:
+            continue
+        for window in row[6]:
+            windows_per_level[window[0]].append(
+                (window[1], window[2], window[3], window[4], position))
+
+    tasks = []
+    for level, level_windows in enumerate(windows_per_level):
+        if not level_windows:
+            continue
+        # Union-find over the level's windows; two windows union when
+        # they intersect or touch edge-to-edge (see the docstring).
+        parents = list(range(len(level_windows)))
+
+        def find(index, parents=parents):
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        for first in range(len(level_windows)):
+            a = level_windows[first]
+            for second in range(first + 1, len(level_windows)):
+                b = level_windows[second]
+                x_overlap = a[0] <= b[2] and b[0] <= a[2]
+                y_overlap = a[1] <= b[3] and b[1] <= a[3]
+                x_adjacent = a[2] + 1 == b[0] or b[2] + 1 == a[0]
+                y_adjacent = a[3] + 1 == b[1] or b[3] + 1 == a[1]
+                if (x_overlap and y_overlap) \
+                        or (x_adjacent and y_overlap) \
+                        or (x_overlap and y_adjacent):
+                    root_a, root_b = find(first), find(second)
+                    if root_a != root_b:
+                        parents[root_a] = root_b
+
+        components: dict[int, list] = {}
+        for index, window in enumerate(level_windows):
+            components.setdefault(find(index), []).append(window)
+        for component in components.values():
+            ix_min = min(window[0] for window in component)
+            iy_min = min(window[1] for window in component)
+            ix_max = max(window[2] for window in component)
+            iy_max = max(window[3] for window in component)
+            sources = []
+            seen = set()
+            for window in component:
+                position = window[4]
+                if position in seen:
+                    continue
+                seen.add(position)
+                row = rows[position]
+                receipt = row[4]
+                sources.append([
+                    row[0], row[1], row[2],
+                    None if receipt is None else list(receipt)])
+            tasks.append([level, ix_min, iy_min, ix_max, iy_max, sources])
+
+    tasks.sort(key=lambda task: (task[0], task[1], task[2],
+                                 task[3], task[4]))
+    complete = not rows or rows[-1][3]
+    return json.dumps({"tasks": tasks, "complete": complete},
+                      ensure_ascii=False, separators=(",", ":"))
+
+
 def _tile_update_audit_rows(state, batches, cell_size, tile_cells, levels):
     """Validate the update-audit inputs and build the per-batch pyramids.
 
