@@ -16655,6 +16655,541 @@ def build_tile_update_plan(state, batches,
                       ensure_ascii=False, separators=(",", ":"))
 
 
+def execute_tile_update_plan(plan, updates, state=None,
+                             max_tasks=None) -> str:
+    """Confirm tile update tasks of a :func:`build_tile_update_plan` plan.
+
+    ``plan`` must be a ``str`` byte-for-byte matching a canonical output
+    of :func:`build_tile_update_plan`. ``updates`` must be a ``tuple``
+    whose items are each an ``(id, pyramid)`` pair; the ids must cover
+    the plan's sources exactly (every source id present once, no id
+    missing or repeated anywhere in the tuple) and each ``pyramid`` must
+    be an outer pyramid tuple as produced by :func:`build_tile_pyramid`,
+    with all pyramids using the same number of levels. ``state`` must be
+    either ``None`` (no task confirmed yet) or a ``str`` byte-for-byte
+    matching a previous output of this function for the same plan; its
+    ``results`` must be the confirmed prefix of the plan's tasks.
+    ``max_tasks`` must be either ``None`` (confirm every remaining task)
+    or a non-bool non-negative ``int`` bounding the number of tasks
+    newly confirmed by this call.
+
+    Tasks are confirmed in plan order and at most ``max_tasks`` are
+    added (``None`` adds every remaining task). For each task the tiles
+    of every source's pyramid at the task's level whose closed
+    cell-index intervals intersect the task window are merged by
+    ``(tx, ty)``: same-coordinate tiles from different sources must
+    agree on their ``(ix0, iy0, ix1, iy1)`` bounds, the merged tile
+    keeps those bounds, takes the minimum ``zmin`` and maximum ``zmax``
+    and sums ``count``; the merged tiles are sorted by ``(tx, ty)``.
+
+    Returns the canonical compact JSON document with exactly the four
+    top-level keys ``plan``, ``confirmed``, ``results`` and
+    ``complete`` in that order. ``plan`` embeds the plan object
+    byte-for-byte and ``confirmed`` is the cumulative number of
+    confirmed tasks. ``results`` is the confirmed prefix; each result
+    is ``[level, ix_min, iy_min, ix_max, iy_max, sources, tiles]`` with
+    ``sources`` the plan task's sources in their stored order and
+    ``tiles`` an array of nine-item tiles
+    ``[tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count]`` sorted by
+    ``(tx, ty)``. ``complete`` is true exactly when every plan task is
+    confirmed. Integers are decimal, ``zmin``/``zmax`` use exactly six
+    decimal places (negative zero written as ``0.000000``), the output
+    uses ``ensure_ascii=False``, no whitespace and no trailing newline;
+    a zero-step call or feeding a completed state back in returns the
+    state document byte-for-byte unchanged.
+
+    :raises TypeError: ``plan`` is not a ``str``, ``updates`` is not a
+        ``tuple``, an update is not an ``(id, pyramid)`` pair, an id is
+        not a ``str``, a pyramid/level/tile has the wrong container
+        shape or a tile field has the wrong type, ``state`` is neither
+        ``None`` nor a ``str``, or ``max_tasks`` is neither ``None`` nor
+        a non-bool ``int``.
+    :raises ValueError: the plan is malformed or not its canonical
+        encoding, an update id is missing, extra or repeated, a
+        pyramid's structure, ordering, fields or cell bounds are bad,
+        the pyramid level counts differ or do not cover a task's level,
+        same-coordinate tiles disagree on their cell bounds,
+        ``max_tasks`` is negative, or the state is malformed, not its
+        canonical encoding or not the confirmed prefix of the plan.
+    """
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if not isinstance(updates, tuple):
+        raise TypeError("updates must be a tuple")
+    for entry in updates:
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise TypeError("each update must be an (id, pyramid) tuple")
+        update_id, pyramid = entry
+        if not isinstance(update_id, str):
+            raise TypeError("each update id must be a str")
+        if not isinstance(pyramid, tuple):
+            raise TypeError("each update pyramid must be a tuple")
+        for level_tiles in pyramid:
+            if not isinstance(level_tiles, tuple):
+                raise TypeError("each pyramid level must be a tuple")
+            for tile in level_tiles:
+                if not isinstance(tile, tuple) or len(tile) != 9:
+                    raise TypeError(
+                        "each tile must be a 9-tuple "
+                        "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)")
+                for value in tile[0:6] + (tile[8],):
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        raise TypeError(
+                            "tx, ty, ix0, iy0, ix1, iy1 and count must be "
+                            "non-bool ints")
+                for value in tile[6:8]:
+                    if not isinstance(value, float):
+                        raise TypeError("zmin and zmax must be floats")
+    if state is not None and not isinstance(state, str):
+        raise TypeError("state must be None or a str")
+    if max_tasks is not None:
+        if isinstance(max_tasks, bool) or not isinstance(max_tasks, int):
+            raise TypeError("max_tasks must be None or a non-bool int")
+        if max_tasks < 0:
+            raise ValueError("max_tasks must be non-negative")
+
+    tasks, _plan_complete = _decode_tile_update_plan(plan)
+
+    # Value-level pyramid validation (finiteness, bounds, ordering).
+    for _id, pyramid in updates:
+        _validate_pyramid(pyramid)
+        for level_tiles in pyramid:
+            for tile in level_tiles:
+                if tile[4] < tile[2] or tile[5] < tile[3]:
+                    raise ValueError("tile bounds must satisfy ix0 <= ix1 "
+                                     "and iy0 <= iy1")
+        if len(pyramid) == 0:
+            raise ValueError("each pyramid must have at least one level")
+
+    seen_ids = set()
+    for update_id, _pyramid in updates:
+        if update_id in seen_ids:
+            raise ValueError(f"duplicate update id {update_id!r}")
+        seen_ids.add(update_id)
+    source_ids = {source[0]
+                  for task in tasks for source in task[5]}
+    if seen_ids != source_ids:
+        raise ValueError("the update ids must cover the plan's source ids "
+                         "exactly, with none missing or repeated")
+
+    level_counts = {len(pyramid) for _id, pyramid in updates}
+    if len(level_counts) > 1:
+        raise ValueError("all pyramids must have the same number of levels")
+    level_count = next(iter(level_counts), 0)
+    for task in tasks:
+        if task[0] >= level_count:
+            raise ValueError("a plan task level is not covered by the "
+                             "pyramids")
+
+    if state is None:
+        confirmed = 0
+    else:
+        confirmed, prefix = _decode_tile_update_execution_state(
+            state, plan, len(tasks))
+
+    if max_tasks is None:
+        target = len(tasks)
+    else:
+        target = min(len(tasks), confirmed + max_tasks)
+
+    pyramids_by_id = {update_id: pyramid for update_id, pyramid in updates}
+
+    def _compute_result(task):
+        level, ix_min, iy_min, ix_max, iy_max, sources = task
+        combined = {}
+        for source in sources:
+            source_id = source[0]
+            for tile in pyramids_by_id[source_id][level]:
+                tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count = tile
+                if not (iy1 >= iy_min and iy0 <= iy_max
+                        and ix1 >= ix_min and ix0 <= ix_max):
+                    continue
+                key = (tx, ty)
+                bounds = (ix0, iy0, ix1, iy1)
+                entry = combined.get(key)
+                if entry is None:
+                    combined[key] = [bounds, zmin, zmax, count]
+                else:
+                    if entry[0] != bounds:
+                        raise ValueError(
+                            "tiles with the same (tx, ty) must agree on "
+                            "(ix0, iy0, ix1, iy1)")
+                    if zmin < entry[1]:
+                        entry[1] = zmin
+                    if zmax > entry[2]:
+                        entry[2] = zmax
+                    entry[3] += count
+        tiles = []
+        for (tx, ty), (bounds, zmin, zmax, count) in sorted(
+                combined.items()):
+            ix0, iy0, ix1, iy1 = bounds
+            tiles.append((tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count))
+        return (level, ix_min, iy_min, ix_max, iy_max,
+                tuple(sources), tuple(tiles))
+
+    # Only tasks up to the target are merged: the confirmed prefix must
+    # agree with the supplied pyramids, and tasks beyond this call's
+    # budget are never touched (a zero-step call computes nothing).
+    results = tuple(_compute_result(task) for task in tasks[:target])
+    if state is not None:
+        for position in range(confirmed):
+            if prefix[position] != results[position]:
+                raise ValueError("the state results must be the confirmed "
+                                 "prefix of the plan's tasks")
+
+    complete = target == len(tasks)
+    return _format_tile_update_execution_text(plan, results, complete)
+
+
+def _format_tile_update_source(source) -> str:
+    """Serialize one plan source ``[id, confirmed, total, receipt]``."""
+    source_id, confirmed, total, receipt = source
+    parts = ["[", _json_string(source_id), ",", str(confirmed), ",",
+             str(total), ","]
+    if receipt is None:
+        parts.append("null")
+    else:
+        parts.append("[" + ",".join(str(value) for value in receipt) + "]")
+    parts.append("]")
+    return "".join(parts)
+
+
+def _format_tile_update_plan_text(tasks, complete: bool) -> str:
+    """Serialize the canonical :func:`build_tile_update_plan` document."""
+    parts = ['{"tasks":[']
+    for position, task in enumerate(tasks):
+        if position:
+            parts.append(",")
+        level, ix_min, iy_min, ix_max, iy_max, sources = task
+        parts.append("[")
+        parts.append(",".join(str(value) for value in
+                              (level, ix_min, iy_min, ix_max, iy_max)))
+        parts.append(",[")
+        parts.append(",".join(_format_tile_update_source(source)
+                              for source in sources))
+        parts.append("]]")
+    parts.append('],"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
+
+
+def _decode_tile_update_plan(plan: str) -> tuple:
+    """Validate a canonical :func:`build_tile_update_plan` document.
+
+    Returns ``(tasks, complete)`` where each task is the six-item tuple
+    ``(level, ix_min, iy_min, ix_max, iy_max, sources)`` with ``sources``
+    a tuple of ``(id, confirmed, total, receipt)`` tuples and ``receipt``
+    either ``None`` or a three-int tuple. Tasks are strictly sorted by
+    their five bounds and the present levels are contiguous from zero.
+
+    :raises ValueError: the plan is not a single canonical JSON object
+        document with exactly the keys ``tasks`` and ``complete``, a
+        task or source has the wrong shape, a field has a bad value, the
+        tasks are not sorted, or the spelling is not canonical.
+    """
+    try:
+        node = _parse_json_node(plan, _skip_json_ws(plan, 0))
+    except ValueError as exc:
+        raise ValueError(f"plan is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(plan, node[2]) != len(plan):
+        raise ValueError("plan has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != ["tasks", "complete"]:
+        raise ValueError('plan must be a JSON object with exactly the keys '
+                         '"tasks" and "complete"')
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('plan "complete" must be a boolean')
+    task_nodes = top["tasks"][0]
+    if not isinstance(task_nodes, list):
+        raise ValueError('plan "tasks" must be an array')
+
+    tasks = []
+    previous_key = None
+    present_levels = set()
+    source_facts = {}
+    for task_node in task_nodes:
+        children = task_node[0]
+        if not isinstance(children, list) or len(children) != 6:
+            raise ValueError("each plan task must be a six-item array "
+                             "[level, ix_min, iy_min, ix_max, iy_max, "
+                             "sources]")
+        for index in range(5):
+            value = children[index][0]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("the five task bounds must be non-bool ints")
+        level, ix_min, iy_min, ix_max, iy_max = (
+            children[index][0] for index in range(5))
+        if level < 0:
+            raise ValueError("task level must be >= 0")
+        if ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("task bounds must satisfy ix_min <= ix_max and "
+                             "iy_min <= iy_max")
+        key = (level, ix_min, iy_min, ix_max, iy_max)
+        if previous_key is not None and key <= previous_key:
+            raise ValueError("plan tasks must be strictly sorted by their "
+                             "five bounds")
+        previous_key = key
+        present_levels.add(level)
+
+        source_nodes = children[5][0]
+        if not isinstance(source_nodes, list) or not source_nodes:
+            raise ValueError("each plan task must list at least one source")
+        sources = []
+        seen_sources = set()
+        for source_node in source_nodes:
+            source_children = source_node[0]
+            if not isinstance(source_children, list) \
+                    or len(source_children) != 4:
+                raise ValueError("each plan source must be a four-item array "
+                                 "[id, confirmed, total, receipt]")
+            source_id = source_children[0][0]
+            if not isinstance(source_id, str):
+                raise ValueError("each plan source id must be a str")
+            if _COMMIT_ID_RE.fullmatch(source_id) is None:
+                raise ValueError(f"invalid source id {source_id!r}")
+            if source_id in seen_sources:
+                raise ValueError(
+                    f"duplicate source id {source_id!r} in a plan task")
+            seen_sources.add(source_id)
+            confirmed = source_children[1][0]
+            total = source_children[2][0]
+            if isinstance(confirmed, bool) or not isinstance(confirmed, int) \
+                    or isinstance(total, bool) or not isinstance(total, int):
+                raise ValueError("source confirmed and total must be "
+                                 "non-bool ints")
+            if confirmed < 0 or total < 0 or confirmed > total:
+                raise ValueError("source confirmed and total must satisfy "
+                                 "0 <= confirmed <= total")
+            receipt_node = source_children[3]
+            if receipt_node[0] is None:
+                receipt = None
+            elif isinstance(receipt_node[0], list):
+                receipt_values = receipt_node[0]
+                if len(receipt_values) != 3 or any(
+                        isinstance(item[0], bool)
+                        or not isinstance(item[0], int)
+                        for item in receipt_values):
+                    raise ValueError("a source receipt must be null or a "
+                                     "three-item array of integers")
+                receipt = tuple(item[0] for item in receipt_values)
+                if any(value < 0 for value in receipt) \
+                        or receipt[0] + receipt[1] != receipt[2]:
+                    raise ValueError("a source receipt must be [rollback, "
+                                     "pending, rollback + pending] of "
+                                     "non-negative integers")
+            else:
+                raise ValueError("a source receipt must be null or a "
+                                 "three-item array")
+            fact = (confirmed, total, receipt)
+            prior_fact = source_facts.get(source_id)
+            if prior_fact is not None and prior_fact != fact:
+                raise ValueError("a plan source must carry identical "
+                                 "confirmed, total and receipt values in "
+                                 "every task")
+            source_facts[source_id] = fact
+            sources.append((source_id, confirmed, total, receipt))
+        tasks.append((level, ix_min, iy_min, ix_max, iy_max, tuple(sources)))
+
+    if present_levels:
+        expected_levels = set(range(max(present_levels) + 1))
+        if present_levels != expected_levels:
+            raise ValueError("plan task levels must be contiguous from zero")
+
+    canonical = _format_tile_update_plan_text(tasks, complete)
+    if canonical != plan:
+        raise ValueError("plan is not its canonical encoding")
+    return tasks, complete
+
+
+def _format_tile_update_execution_text(plan: str, results,
+                                       complete: bool) -> str:
+    """Serialize an :func:`execute_tile_update_plan` state document."""
+    parts = ['{"plan":', plan, ',"confirmed":', str(len(results)),
+             ',"results":[']
+    for position, result in enumerate(results):
+        if position:
+            parts.append(",")
+        level, ix_min, iy_min, ix_max, iy_max, sources, tiles = result
+        parts.append("[")
+        parts.append(",".join(str(value) for value in
+                              (level, ix_min, iy_min, ix_max, iy_max)))
+        parts.append(",[")
+        parts.append(",".join(_format_tile_update_source(source)
+                              for source in sources))
+        parts.append("],[")
+        for tile_position, tile in enumerate(tiles):
+            if tile_position:
+                parts.append(",")
+            tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count = tile
+            parts.append("[")
+            parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
+                                   str(ix1), str(iy1), _format_z(zmin),
+                                   _format_z(zmax), str(count))))
+            parts.append("]")
+        parts.append("]]")
+    parts.append('],"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
+
+
+def _decode_tile_update_execution_state(text: str, plan: str,
+                                        task_count: int) -> tuple:
+    """Validate a previous :func:`execute_tile_update_plan` state.
+
+    The state must be canonical, embed ``plan`` byte-for-byte, hold
+    exactly ``confirmed`` results (``0 <= confirmed <= task_count``),
+    each well formed with its tiles sorted and intersecting its window,
+    and its ``complete`` flag must agree with the confirmed prefix
+    length. Returns ``(confirmed, results)`` with ``results`` a tuple of
+    nested tuples ready for comparison with the recomputed tasks.
+
+    :raises ValueError: the state is malformed or not its canonical
+        encoding, embeds another plan, has a bad confirmed count, an
+        ill-formed result or tile, or a completion mismatch.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"state is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("state has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "plan", "confirmed", "results", "complete"]:
+        raise ValueError("state must be a JSON object with exactly the keys "
+                         '"plan", "confirmed", "results" and "complete"')
+    plan_node = top["plan"]
+    if not isinstance(plan_node[0], dict):
+        raise ValueError('state "plan" must be a JSON object')
+    if text[plan_node[1]:plan_node[2]] != plan:
+        raise ValueError('state "plan" does not match the plan argument')
+    confirmed = top["confirmed"][0]
+    if isinstance(confirmed, bool) or not isinstance(confirmed, int) \
+            or confirmed < 0 or confirmed > task_count:
+        raise ValueError('state "confirmed" must be between zero and the '
+                         "number of plan tasks")
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('state "complete" must be a boolean')
+    if complete != (confirmed == task_count):
+        raise ValueError('state "complete" does not match the confirmed '
+                         "prefix")
+    result_nodes = top["results"][0]
+    if not isinstance(result_nodes, list) or len(result_nodes) != confirmed:
+        raise ValueError('state "results" must hold one entry per confirmed '
+                         "task")
+
+    results = []
+    for result_node in result_nodes:
+        children = result_node[0]
+        if not isinstance(children, list) or len(children) != 7:
+            raise ValueError("each result must be a seven-item array "
+                             "[level, ix_min, iy_min, ix_max, iy_max, "
+                             "sources, tiles]")
+        for index in range(5):
+            value = children[index][0]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("the five result bounds must be non-bool "
+                                 "ints")
+        level, ix_min, iy_min, ix_max, iy_max = (
+            children[index][0] for index in range(5))
+        if level < 0 or ix_min > ix_max or iy_min > iy_max:
+            raise ValueError("result window bounds are invalid")
+
+        source_nodes = children[5][0]
+        if not isinstance(source_nodes, list) or not source_nodes:
+            raise ValueError("each result must list at least one source")
+        sources = []
+        seen_sources = set()
+        for source_node in source_nodes:
+            source_children = source_node[0]
+            if not isinstance(source_children, list) \
+                    or len(source_children) != 4:
+                raise ValueError("each result source must be a four-item "
+                                 "array [id, confirmed, total, receipt]")
+            source_id = source_children[0][0]
+            if not isinstance(source_id, str):
+                raise ValueError("each result source id must be a str")
+            if source_id in seen_sources:
+                raise ValueError("duplicate source id in a result")
+            seen_sources.add(source_id)
+            source_confirmed = source_children[1][0]
+            source_total = source_children[2][0]
+            if isinstance(source_confirmed, bool) \
+                    or not isinstance(source_confirmed, int) \
+                    or isinstance(source_total, bool) \
+                    or not isinstance(source_total, int):
+                raise ValueError("result source confirmed and total must be "
+                                 "non-bool ints")
+            receipt_node = source_children[3]
+            if receipt_node[0] is None:
+                receipt = None
+            elif isinstance(receipt_node[0], list):
+                receipt_values = receipt_node[0]
+                if len(receipt_values) != 3 or any(
+                        isinstance(item[0], bool)
+                        or not isinstance(item[0], int)
+                        for item in receipt_values):
+                    raise ValueError("a result receipt must be null or a "
+                                     "three-item array of integers")
+                receipt = tuple(item[0] for item in receipt_values)
+            else:
+                raise ValueError("a result receipt must be null or a "
+                                 "three-item array")
+            sources.append((source_id, source_confirmed, source_total,
+                            receipt))
+
+        tile_nodes = children[6][0]
+        if not isinstance(tile_nodes, list):
+            raise ValueError('each result "tiles" must be an array')
+        tiles = []
+        previous_tile_key = None
+        for tile_node in tile_nodes:
+            tile_children = tile_node[0]
+            if not isinstance(tile_children, list) \
+                    or len(tile_children) != 9:
+                raise ValueError("each result tile must be a nine-item array")
+            values = [item[0] for item in tile_children]
+            tx, ty, ix0, iy0, ix1, iy1 = values[:6]
+            zmin, zmax = values[6], values[7]
+            count = values[8]
+            for value in (tx, ty, ix0, iy0, ix1, iy1, count):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("tile integer fields must be non-bool "
+                                     "ints")
+            if not isinstance(zmin, float) or not isinstance(zmax, float) \
+                    or not math.isfinite(zmin) or not math.isfinite(zmax):
+                raise ValueError("tile zmin and zmax must be finite floats")
+            if ix0 > ix1 or iy0 > iy1:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+            tile_key = (tx, ty)
+            if previous_tile_key is not None and tile_key <= previous_tile_key:
+                raise ValueError("result tiles must be strictly sorted by "
+                                 "(tx, ty)")
+            previous_tile_key = tile_key
+            if not (iy1 >= iy_min and iy0 <= iy_max
+                    and ix1 >= ix_min and ix0 <= ix_max):
+                raise ValueError("each result tile must intersect its "
+                                 "window's closed cell-index interval")
+            tiles.append((tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count))
+
+        results.append((level, ix_min, iy_min, ix_max, iy_max,
+                        tuple(sources), tuple(tiles)))
+
+    results = tuple(results)
+    canonical = _format_tile_update_execution_text(
+        plan, results, complete)
+    if canonical != text:
+        raise ValueError("state is not its canonical encoding")
+    return confirmed, results
+
+
 def _tile_update_audit_rows_complete(state, batches, cell_size, tile_cells,
                                      levels):
     """Like :func:`_tile_update_audit_rows`, plus the state's ``complete``.
