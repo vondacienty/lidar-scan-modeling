@@ -187,6 +187,17 @@ def test_completed_plan_with_empty_tasks(scene, paths):
     assert document["complete"] is True
 
 
+@pytest.mark.parametrize("tampered", [
+    # tasks listed yet the plan claims the publishing state is complete
+    '{"tasks":[[0,0,0,255,255,[["b0",1,1,null]]]],"complete":true}',
+    # empty task list yet the plan claims the state is unfinished
+    '{"tasks":[],"complete":false}',
+])
+def test_plan_complete_flag_must_agree_with_task_list(tampered):
+    with pytest.raises(ValueError):
+        execute_tile_update_plan(tampered, ())
+
+
 # ---------------------------------------------------------------------------
 # max_tasks and re-entry
 # ---------------------------------------------------------------------------

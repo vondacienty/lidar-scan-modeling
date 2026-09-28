@@ -16998,6 +16998,15 @@ def _decode_tile_update_plan(plan: str) -> tuple:
         if present_levels != expected_levels:
             raise ValueError("plan task levels must be contiguous from zero")
 
+    # A canonical :func:`build_tile_update_plan` document lists tasks
+    # exactly while its publishing state is unfinished: ``complete`` is
+    # false with tasks and true only when the task list is empty. The
+    # canonical re-encoding preserves either flag, so this contradiction
+    # has to be rejected explicitly.
+    if complete != (not tasks):
+        raise ValueError('plan "complete" must be false when tasks are '
+                         "listed and true only when the task list is empty")
+
     canonical = _format_tile_update_plan_text(tasks, complete)
     if canonical != plan:
         raise ValueError("plan is not its canonical encoding")
@@ -17188,6 +17197,365 @@ def _decode_tile_update_execution_state(text: str, plan: str,
     if canonical != text:
         raise ValueError("state is not its canonical encoding")
     return confirmed, results
+
+
+def commit_tile_update_plan(base, execution: str, state=None,
+                            max_tasks=None) -> str:
+    """Commit confirmed :func:`execute_tile_update_plan` results to a pyramid.
+
+    ``base`` must be an outer pyramid tuple as produced by
+    :func:`build_tile_pyramid`: each level is a tuple of nine-item
+    ``(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)`` tiles with the
+    first six fields and ``count`` non-bool ints, ``zmin``/``zmax`` finite
+    floats, and the tiles strictly sorted by ``(tx, ty)`` with no
+    duplicate coordinates. ``execution`` must be a ``str`` byte-for-byte
+    matching a canonical output of :func:`execute_tile_update_plan`; the
+    plan it embeds is the plan being committed and its ``results`` the
+    confirmed prefix of that plan's tasks, each restating the plan task's
+    window and sources. ``state`` must be either ``None`` (nothing
+    committed yet) or a ``str`` byte-for-byte matching a previous output
+    of this function for the same ``base`` and execution; its committed
+    tasks must be a prefix of the execution's confirmed results.
+    ``max_tasks`` must be either ``None`` (commit every confirmed but
+    uncommitted result) or a non-bool non-negative ``int`` bounding the
+    number of results newly committed by this call.
+
+    Results are committed in the execution's order and at most
+    ``max_tasks`` are added (``None`` adds every confirmed but uncommitted
+    result). For each result, the tiles of its level whose closed
+    cell-index intervals intersect the result window
+    ``(iy1 >= iy_min and iy0 <= iy_max and ix1 >= ix_min and
+    ix0 <= ix_max)`` are deleted from the working pyramid; the result's
+    tiles are then inserted, and the level is sorted by ``(tx, ty)``.
+    Every affected level must exist in ``base``; a level the results do
+    not touch is preserved byte-for-byte. Inserting a tile that collides
+    with a surviving coordinate (possible only for malformed geometry)
+    raises :class:`ValueError`.
+
+    Returns the canonical compact JSON document with exactly the six
+    top-level keys ``plan``, ``base``, ``committed``, ``receipts``,
+    ``pyramid`` and ``complete`` in that order. ``plan`` embeds the
+    execution's plan byte-for-byte. ``base`` and ``pyramid`` are the
+    original base pyramid and the resulting pyramid, each a bare array of
+    level arrays of nine-item tile arrays. ``committed`` is the
+    cumulative number of committed results and ``receipts`` their prefix,
+    one six-item ``[level, ix_min, iy_min, ix_max, iy_max, sources]``
+    receipt per committed result in result order, with ``sources`` copied
+    from the matching plan task. ``complete`` is true exactly when every
+    plan task is committed. Integers are decimal, ``zmin``/``zmax`` use
+    exactly six decimal places (negative zero written as ``0.000000``),
+    the output uses ``ensure_ascii=False``, no whitespace, no non-finite
+    values and no trailing newline; a zero-step call or feeding a
+    completed state back in returns the state document byte-for-byte
+    unchanged. The inputs are never modified and repeated calls with the
+    same arguments return byte-for-byte equal documents.
+
+    :raises TypeError: ``base`` is not a tuple or has the wrong container
+        or field types, ``execution`` is not a ``str``, ``state`` is
+        neither ``None`` nor a ``str``, or ``max_tasks`` is neither
+        ``None`` nor a non-bool ``int``.
+    :raises ValueError: the base pyramid is empty, non-finite, unsorted,
+        duplicated or has inverted tile bounds, the execution document or
+        its embedded plan is malformed or not its canonical encoding
+        (including a non-empty task list marked complete), an execution
+        result does not restate its plan task's window and sources, a
+        result level is not covered by the base pyramid, an inserted tile
+        collides with a surviving tile, ``max_tasks`` is negative, or the
+        state is malformed, not its canonical encoding, embeds another
+        plan or base, does not reproduce from the execution's confirmed
+        results, commits more results than the execution confirms, or
+        disagrees with its completion flag.
+    """
+    if not isinstance(base, tuple):
+        raise TypeError("base must be a tuple")
+    if not isinstance(execution, str):
+        raise TypeError("execution must be a str")
+    if state is not None and not isinstance(state, str):
+        raise TypeError("state must be None or a str")
+    if max_tasks is not None:
+        if isinstance(max_tasks, bool) or not isinstance(max_tasks, int):
+            raise TypeError("max_tasks must be None or a non-bool int")
+        if max_tasks < 0:
+            raise ValueError("max_tasks must be non-negative")
+
+    # Container-level shape of the base pyramid: wrong container or field
+    # types are TypeErrors, exactly as in execute_tile_update_plan.
+    for level_tiles in base:
+        if not isinstance(level_tiles, tuple):
+            raise TypeError("each base pyramid level must be a tuple")
+        for tile in level_tiles:
+            if not isinstance(tile, tuple) or len(tile) != 9:
+                raise TypeError(
+                    "each tile must be a 9-tuple "
+                    "(tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count)")
+            for value in tile[0:6] + (tile[8],):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise TypeError(
+                        "tx, ty, ix0, iy0, ix1, iy1 and count must be "
+                        "non-bool ints")
+            for value in tile[6:8]:
+                if not isinstance(value, float):
+                    raise TypeError("zmin and zmax must be floats")
+
+    # Value-level pyramid validation: finiteness and (tx, ty) ordering.
+    _validate_pyramid(base)
+    if not base:
+        raise ValueError("the base pyramid must have at least one level")
+    for level_tiles in base:
+        for tile in level_tiles:
+            if tile[4] < tile[2] or tile[5] < tile[3]:
+                raise ValueError("tile bounds must satisfy ix0 <= ix1 and "
+                                 "iy0 <= iy1")
+
+    plan, tasks, results = _decode_tile_update_execution_document(execution)
+    for position, result in enumerate(results):
+        task = tasks[position]
+        if result[:5] != tuple(task[:5]) or result[5] != tuple(task[5]):
+            raise ValueError("each execution result must restate the window "
+                             "and sources of the corresponding plan task")
+
+    base_text = _format_tile_update_pyramid_array(base)
+    if state is None:
+        committed = 0
+        pyramid = base
+    else:
+        committed, pyramid = _decode_tile_update_commit_state(
+            state, plan, tasks, results, base, base_text)
+
+    if max_tasks is None:
+        target = len(results)
+    else:
+        target = min(len(results), committed + max_tasks)
+
+    # A zero-step call (including re-entering a completed state) returns
+    # the previous document byte-for-byte; with state=None there is no
+    # previous document, so the fresh canonical one is formatted below.
+    if state is not None and target == committed:
+        return state
+
+    pyramid = _commit_tile_update_results(
+        pyramid, tasks, results, committed, target, len(base))
+    receipts = tuple(
+        (task[0], task[1], task[2], task[3], task[4], tuple(task[5]))
+        for task in tasks[:target])
+    complete = target == len(tasks)
+    return _format_tile_update_commit_text(
+        plan, base_text, receipts, pyramid, complete)
+
+
+def _decode_tile_update_execution_document(execution: str) -> tuple:
+    """Split a canonical :func:`execute_tile_update_plan` document.
+
+    Returns ``(plan_text, tasks, results)`` with ``tasks`` the decoded
+    plan tasks and ``results`` the document's confirmed result prefix as
+    nested tuples. The document's ``complete`` flag must agree with the
+    confirmed prefix length.
+
+    :raises ValueError: the document or its embedded plan is malformed or
+        not its canonical encoding, or the completion flag disagrees with
+        the confirmed count.
+    """
+    try:
+        node = _parse_json_node(execution, _skip_json_ws(execution, 0))
+    except ValueError as exc:
+        raise ValueError(
+            f"execution is not a valid JSON document ({exc})") from exc
+    if _skip_json_ws(execution, node[2]) != len(execution):
+        raise ValueError("execution has trailing data after the JSON "
+                         "document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "plan", "confirmed", "results", "complete"]:
+        raise ValueError("execution must be a JSON object with exactly the "
+                         'keys "plan", "confirmed", "results" and '
+                         '"complete"')
+    plan_node = top["plan"]
+    if not isinstance(plan_node[0], dict):
+        raise ValueError('execution "plan" must be a JSON object')
+    plan = execution[plan_node[1]:plan_node[2]]
+    tasks, _plan_complete = _decode_tile_update_plan(plan)
+    confirmed, results = _decode_tile_update_execution_state(
+        execution, plan, len(tasks))
+    return plan, tasks, results
+
+
+def _commit_tile_update_results(pyramid, tasks, results, committed, target,
+                                level_count):
+    """Apply results ``[committed, target)`` to a working pyramid copy.
+
+    Returns the resulting pyramid as a tuple of tuples of nine-item tile
+    tuples. For each result the level's tiles intersecting the result's
+    closed window are deleted, the result tiles inserted and the level
+    re-sorted by ``(tx, ty)``; a duplicate coordinate after the
+    replacement is rejected.
+    """
+    level_tiles = [list(level) for level in pyramid]
+    for position in range(committed, target):
+        level, ix_min, iy_min, ix_max, iy_max, _sources, tiles = \
+            results[position]
+        if level < 0 or level >= level_count:
+            raise ValueError("an execution result level is not covered by "
+                             "the base pyramid")
+        current = level_tiles[level]
+        kept = [
+            tile for tile in current
+            if not (tile[4] >= ix_min and tile[2] <= ix_max
+                    and tile[5] >= iy_min and tile[3] <= iy_max)
+        ]
+        merged = sorted(kept + list(tiles), key=lambda tile: (tile[0],
+                                                              tile[1]))
+        previous_key = None
+        for tile in merged:
+            key = (tile[0], tile[1])
+            if previous_key is not None and key == previous_key:
+                raise ValueError("a committed result tile collides with a "
+                                 "surviving tile of the same (tx, ty)")
+            previous_key = key
+        level_tiles[level] = merged
+    return tuple(tuple(level) for level in level_tiles)
+
+
+def _format_tile_update_pyramid_array(pyramid) -> str:
+    """Serialize a pyramid as a bare array of level tile arrays."""
+    parts = ["["]
+    for level_index, level_tiles in enumerate(pyramid):
+        if level_index:
+            parts.append(",")
+        parts.append("[")
+        for tile_index, tile in enumerate(level_tiles):
+            if tile_index:
+                parts.append(",")
+            tx, ty, ix0, iy0, ix1, iy1, zmin, zmax, count = tile
+            parts.append("[")
+            parts.append(",".join((str(tx), str(ty), str(ix0), str(iy0),
+                                   str(ix1), str(iy1), _format_z(zmin),
+                                   _format_z(zmax), str(count))))
+            parts.append("]")
+        parts.append("]")
+    parts.append("]")
+    return "".join(parts)
+
+
+def _format_tile_update_commit_receipt(task) -> str:
+    """Serialize one six-item commit receipt from a plan task."""
+    level, ix_min, iy_min, ix_max, iy_max, sources = task
+    parts = ["[", ",".join(str(value) for value in
+                           (level, ix_min, iy_min, ix_max, iy_max)), ",["]
+    parts.append(",".join(_format_tile_update_source(source)
+                          for source in sources))
+    parts.append("]]")
+    return "".join(parts)
+
+
+def _format_tile_update_commit_text(plan: str, base_text: str, receipts,
+                                    pyramid, complete: bool) -> str:
+    """Serialize a :func:`commit_tile_update_plan` document."""
+    parts = ['{"plan":', plan, ',"base":', base_text,
+             ',"committed":', str(len(receipts)), ',"receipts":[']
+    for position, receipt in enumerate(receipts):
+        if position:
+            parts.append(",")
+        parts.append(_format_tile_update_commit_receipt(receipt))
+    parts.append('],"pyramid":')
+    parts.append(_format_tile_update_pyramid_array(pyramid))
+    parts.append(',"complete":')
+    parts.append("true" if complete else "false")
+    parts.append("}")
+    return "".join(parts)
+
+
+def _decode_tile_update_commit_state(text: str, plan: str, tasks, results,
+                                     base, base_text: str) -> tuple:
+    """Validate a previous :func:`commit_tile_update_plan` state.
+
+    The state must be canonical, embed ``plan`` and ``base`` byte-for-byte,
+    hold one six-item receipt per committed result matching the plan task
+    prefix, carry a pyramid that reproduces exactly by replaying the
+    execution's confirmed results onto ``base``, and a ``complete`` flag
+    agreeing with the committed prefix length. The state may not commit
+    more results than the execution confirms.
+
+    Returns ``(committed, pyramid)`` with ``pyramid`` the replayed nested
+    tuple pyramid.
+
+    :raises ValueError: the state is malformed or not its canonical
+        encoding, embeds another plan or base, holds bad receipts or a
+        bad pyramid, commits beyond the execution's confirmed prefix, or
+        disagrees with its completion flag.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(f"state is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("state has trailing data after the JSON document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != [
+            "plan", "base", "committed", "receipts", "pyramid",
+            "complete"]:
+        raise ValueError("state must be a JSON object with exactly the keys "
+                         '"plan", "base", "committed", "receipts", '
+                         '"pyramid" and "complete"')
+    plan_node = top["plan"]
+    if not isinstance(plan_node[0], dict):
+        raise ValueError('state "plan" must be a JSON object')
+    if text[plan_node[1]:plan_node[2]] != plan:
+        raise ValueError('state "plan" does not match the execution plan')
+    base_node = top["base"]
+    if not isinstance(base_node[0], list):
+        raise ValueError('state "base" must be an array of level arrays')
+    if text[base_node[1]:base_node[2]] != base_text:
+        raise ValueError('state "base" does not match the base argument')
+
+    task_count = len(tasks)
+    committed = top["committed"][0]
+    if isinstance(committed, bool) or not isinstance(committed, int) \
+            or committed < 0 or committed > task_count:
+        raise ValueError('state "committed" must be between zero and the '
+                         "number of plan tasks")
+    if committed > len(results):
+        raise ValueError("the state commits more results than the "
+                         "execution confirms")
+    complete = top["complete"][0]
+    if not isinstance(complete, bool):
+        raise ValueError('state "complete" must be a boolean')
+    if complete != (committed == task_count):
+        raise ValueError('state "complete" does not match the committed '
+                         "prefix")
+
+    receipt_nodes = top["receipts"][0]
+    if not isinstance(receipt_nodes, list) or len(receipt_nodes) != committed:
+        raise ValueError('state "receipts" must hold one entry per '
+                         "committed result")
+    for position, receipt_node in enumerate(receipt_nodes):
+        if not isinstance(receipt_node[0], list):
+            raise ValueError("each receipt must be an array")
+        expected = _format_tile_update_commit_receipt(tasks[position])
+        if text[receipt_node[1]:receipt_node[2]] != expected:
+            raise ValueError("each receipt must match the corresponding "
+                             "plan task prefix and its canonical encoding")
+
+    # The committed pyramid must reproduce exactly from the base and the
+    # execution's confirmed results, replayed in order.
+    replayed = _commit_tile_update_results(
+        base, tasks, results, 0, committed, len(base))
+    pyramid_node = top["pyramid"]
+    if not isinstance(pyramid_node[0], list):
+        raise ValueError('state "pyramid" must be an array of level arrays')
+    pyramid_text = _format_tile_update_pyramid_array(replayed)
+    if text[pyramid_node[1]:pyramid_node[2]] != pyramid_text:
+        raise ValueError('state "pyramid" does not reproduce from the base '
+                         "and the execution's confirmed results")
+
+    receipts = tuple(
+        (task[0], task[1], task[2], task[3], task[4], tuple(task[5]))
+        for task in tasks[:committed])
+    canonical = _format_tile_update_commit_text(
+        plan, base_text, receipts, replayed, complete)
+    if canonical != text:
+        raise ValueError("state is not its canonical encoding")
+    return committed, replayed
 
 
 def _tile_update_audit_rows_complete(state, batches, cell_size, tile_cells,
