@@ -16530,6 +16530,145 @@ def plan_tile_update_windows(state, batches,
     return tuple(result)
 
 
+def build_tile_update_plan(state, batches,
+                           cell_size: int | float = 1.0,
+                           tile_cells: int = 256,
+                           levels: int = 3) -> str:
+    """Plan the connected tile update tasks of unpublished update batches.
+
+    ``state`` and ``batches`` follow exactly the
+    :func:`plan_tile_update_windows` contract: ``state`` must be a ``str``
+    byte-for-byte matching a canonical :func:`publish_updates` output
+    document and ``batches`` a ``tuple`` of ``(id, points)`` pairs whose
+    ids match the state's batches one for one, in the state's order.
+    Each ``points`` iterable is walked exactly once, and point
+    validation, error reporting, level aggregation and quantization are
+    exactly those of :func:`build_tile_pyramid` (with ``cell_size``,
+    ``tile_cells`` and ``levels`` forwarded to it).
+
+    Only the state batches whose seven-item record carries
+    ``published`` false contribute windows. Their
+    :func:`plan_tile_update_windows` windows are grouped per level into
+    connected components: two windows connect when their closed
+    rectangles intersect, or when their horizontal or vertical edges are
+    one cell apart (``ix_max + 1 == ix_min`` and the y intervals
+    intersect, or the mirrored x-axis case) and the connection is taken
+    through its transitive closure. Each component spans the endpoint
+    extremes of its windows: the minimum ``ix_min``/``iy_min`` and the
+    maximum ``ix_max``/``iy_max``.
+
+    Returns a JSON document with the keys in the order ``tasks`` and
+    ``complete``. ``tasks`` is sorted ascending by
+    ``(level, ix_min, iy_min, ix_max, iy_max)`` and each task is
+    ``[level, ix_min, iy_min, ix_max, iy_max, sources]``. ``sources``
+    lists the contributing batches in state order without duplicates,
+    each as ``[id, confirmed, total, receipt]`` with ``receipt`` either
+    ``null`` or an array of three decimal integers. ``complete`` echoes
+    the state's boolean. With no unpublished windows ``tasks`` is
+    ``[]``. The output uses ``ensure_ascii=False``, no whitespace and no
+    trailing newline; repeated calls with the same arguments return
+    byte-for-byte equal documents.
+
+    :raises TypeError: ``state`` is not a ``str``, ``batches`` is not a
+        ``tuple``, a batch is not an ``(id, points)`` pair, an ``id`` is
+        not a ``str``, ``cell_size``/``tile_cells``/``levels`` have the
+        wrong type, or a point violates the
+        :func:`build_tile_pyramid` point type contract.
+    :raises ValueError: ``state`` is not a canonical
+        :func:`publish_updates` document, the batches do not match the
+        state batches in number, id or order, the pyramid parameters
+        violate the :func:`build_tile_pyramid` value contract, or a
+        point violates its value contract.
+    """
+    rows, complete = _tile_update_audit_rows_complete(
+        state, batches, cell_size, tile_cells, levels)
+
+    # Only ``published`` false records contribute. For a canonical state
+    # at most the last record is unfinished, but the filter is general.
+    pending = [position for position, (record, _pyramid) in enumerate(rows)
+               if not record["published"]]
+
+    # Each window is (level, ix0, iy0, ix1, iy1, source position).
+    tasks = []
+    for level in range(levels):
+        windows = []
+        for position in pending:
+            for tile in rows[position][1][level]:
+                windows.append((tile[2], tile[3], tile[4], tile[5],
+                                position))
+
+        parents = list(range(len(windows)))
+
+        def find(index):
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        for index, window in enumerate(windows):
+            ax0, ay0, ax1, ay1, _source = window
+            for other in range(index + 1, len(windows)):
+                bx0, by0, bx1, by1, _other_source = windows[other]
+                intersects = (
+                    ax1 >= bx0 and ax0 <= bx1
+                    and ay1 >= by0 and ay0 <= by1)
+                edge_x = ((ax1 + 1 == bx0 or bx1 + 1 == ax0)
+                          and max(ay0, by0) <= min(ay1, by1))
+                edge_y = ((ay1 + 1 == by0 or by1 + 1 == ay0)
+                          and max(ax0, bx0) <= min(ax1, bx1))
+                if intersects or edge_x or edge_y:
+                    left, right = find(index), find(other)
+                    if left != right:
+                        parents[right] = left
+
+        groups = {}
+        for index, (ix0, iy0, ix1, iy1, position) in enumerate(windows):
+            root = find(index)
+            bounds = groups.get(root)
+            if bounds is None:
+                groups[root] = [ix0, iy0, ix1, iy1, [position]]
+            else:
+                if ix0 < bounds[0]:
+                    bounds[0] = ix0
+                if iy0 < bounds[1]:
+                    bounds[1] = iy0
+                if ix1 > bounds[2]:
+                    bounds[2] = ix1
+                if iy1 > bounds[3]:
+                    bounds[3] = iy1
+                if position not in bounds[4]:
+                    bounds[4].append(position)
+
+        for ix0, iy0, ix1, iy1, positions in groups.values():
+            sources = []
+            for position in sorted(positions):
+                record = rows[position][0]
+                receipt = record["receipt"]
+                sources.append([
+                    record["id"], record["confirmed"], record["total"],
+                    None if receipt is None else list(receipt),
+                ])
+            tasks.append([level, ix0, iy0, ix1, iy1, sources])
+
+    tasks.sort(key=lambda task: tuple(task[:5]))
+    return json.dumps({"tasks": tasks, "complete": complete},
+                      ensure_ascii=False, separators=(",", ":"))
+
+
+def _tile_update_audit_rows_complete(state, batches, cell_size, tile_cells,
+                                     levels):
+    """Like :func:`_tile_update_audit_rows`, plus the state's ``complete``.
+
+    The canonical-state decoder enforces ``complete`` exactly when every
+    record is published (a record-less state is necessarily complete), so
+    the flag is derived from the decoded records rather than re-parsed.
+    """
+    rows = _tile_update_audit_rows(
+        state, batches, cell_size, tile_cells, levels)
+    complete = all(record["published"] for record, _pyramid in rows)
+    return rows, complete
+
+
 def _tile_update_audit_rows(state, batches, cell_size, tile_cells, levels):
     """Validate the update-audit inputs and build the per-batch pyramids.
 
