@@ -391,19 +391,20 @@ def test_base_wrong_type(bad):
         commit_tile_update_plan(bad, _execution())
 
 
-def test_base_container_and_field_types():
+def test_base_internal_structure_raises_value_error():
+    # Once ``base`` is a tuple, its internal container kinds, field types
+    # and values are all ValueErrors (a non-tuple base itself, e.g. [],
+    # stays a TypeError and is covered by test_base_wrong_type).
     execution = _execution()
-    with pytest.raises(TypeError):
-        commit_tile_update_plan([()], execution)
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError):
         commit_tile_update_plan(([()],), execution)
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError):
         commit_tile_update_plan(
             (((0, 0, 0, 0, 255, 255, 1, 2.0, 1),),), execution)
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError):
         commit_tile_update_plan(
             (((0, 0, 0, 0, 255, 255, 1.0, 2, 1),),), execution)
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError):
         commit_tile_update_plan(
             (((True, 0, 0, 0, 255, 255, 1.0, 2.0, 1),),), execution)
 
