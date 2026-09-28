@@ -415,10 +415,77 @@ def test_empty_paths_and_equal_paths_rejected(scene, paths):
                         scene["two_batches"])
 
 
-def test_empty_batches_rejected(scene, paths):
+def test_empty_batches_publish_completed_noop_state(scene, paths):
     _write(paths["index"], scene["empty"])
+    text = publish_updates(paths["state"], paths["index"], ())
+    document = json.loads(text)
+    assert list(document) == ["batches", "index", "complete"]
+    assert document["batches"] == []
+    assert document["complete"] is True
+    assert _canonical(document) == text
+    assert " " not in text and not text.endswith("\n")
+    # The no-op never replaces the index file.
+    assert _read(paths["index"]) == scene["empty"]
+
+
+def test_empty_batches_embed_the_current_index(scene, paths):
+    _write(paths["index"], scene["after_zero"])
+    text = publish_updates(paths["state"], paths["index"], ())
+    assert _canonical(json.loads(text)["index"]) == scene["after_zero"]
+    assert _read(paths["index"]) == scene["after_zero"]
+
+
+def test_empty_batches_reentry_is_byte_identical(scene, paths):
+    _write(paths["index"], scene["empty"])
+    first = publish_updates(paths["state"], paths["index"], ())
+    second = publish_updates(paths["state"], paths["index"], ())
+    third = publish_updates(paths["state"], paths["index"], (), limit=0)
+    assert second == first
+    assert third == first
+    assert _read(paths["index"]) == scene["empty"]
+
+
+def test_empty_state_allows_later_batches_to_be_appended(scene, paths):
+    _write(paths["index"], scene["empty"])
+    publish_updates(paths["state"], paths["index"], ())
+    text = publish_updates(paths["state"], paths["index"],
+                           scene["two_batches"])
+    assert json.loads(text)["complete"] is True
+    assert _read(paths["index"]) == scene["after_all"]
+    # Re-entering the completed publication stays byte identical.
+    assert publish_updates(paths["state"], paths["index"],
+                           scene["two_batches"]) == text
+
+
+def test_empty_batches_against_non_empty_state_rejected(scene, paths):
+    _write(paths["index"], scene["empty"])
+    publish_updates(paths["state"], paths["index"], scene["two_batches"])
     with pytest.raises(ValueError):
         publish_updates(paths["state"], paths["index"], ())
+
+
+def test_empty_batches_reject_a_diverged_index(scene, paths):
+    _write(paths["index"], scene["empty"])
+    publish_updates(paths["state"], paths["index"], ())
+    _write(paths["index"], scene["after_zero"])
+    with pytest.raises(ValueError):
+        publish_updates(paths["state"], paths["index"], ())
+
+
+def test_appending_to_empty_state_rejects_a_diverged_index(scene, paths):
+    _write(paths["index"], scene["empty"])
+    publish_updates(paths["state"], paths["index"], ())
+    _write(paths["index"], scene["after_zero"])
+    with pytest.raises(ValueError):
+        publish_updates(paths["state"], paths["index"],
+                        scene["two_batches"])
+
+
+def test_empty_batches_validate_index_before_writing_state(scene, paths):
+    _write(paths["index"], "{not json")
+    with pytest.raises(ValueError):
+        publish_updates(paths["state"], paths["index"], ())
+    assert not os.path.exists(paths["state"])
 
 
 # ---------------------------------------------------------------------------

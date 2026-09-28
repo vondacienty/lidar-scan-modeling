@@ -15932,12 +15932,14 @@ def _decode_publish_updates_state(text: str) -> list:
     ``before``/``after`` indexes.
 
     :raises ValueError: the state is not a single JSON object document with
-        exactly the keys ``batches``, ``index`` and ``complete``, the
-        batch array is empty, a batch record has the wrong shape, an id is
-        missing or repeats, an index slot is not an object, a count is
-        invalid, a receipt is neither null nor a three-item array of
-        integers, the flag and receipt disagree, the records do not chain,
-        or the text is not its canonical encoding.
+        exactly the keys ``batches``, ``index`` and ``complete``, a batch
+        record has the wrong shape, an id is missing or repeats, an index
+        slot is not an object, a count is invalid, a receipt is neither
+        null nor a three-item array of integers, the flag and receipt
+        disagree, the records do not chain, or the text is not its
+        canonical encoding. A state with an empty ``batches`` array is the
+        completed no-op publication ``{"batches":[],"index":...,"complete":
+        true}``.
     """
     try:
         node = _parse_json_node(text, _skip_json_ws(text, 0))
@@ -15952,8 +15954,8 @@ def _decode_publish_updates_state(text: str) -> list:
         raise ValueError("state must be a JSON object with exactly the keys "
                          '"batches", "index" and "complete"')
     batch_nodes = top["batches"][0]
-    if not isinstance(batch_nodes, list) or not batch_nodes:
-        raise ValueError('state "batches" must be a non-empty array')
+    if not isinstance(batch_nodes, list):
+        raise ValueError('state "batches" must be an array')
     batches = []
     seen = set()
     previous_after = None
@@ -16034,6 +16036,15 @@ def _decode_publish_updates_state(text: str) -> list:
     complete = top["complete"][0]
     if not isinstance(complete, bool):
         raise ValueError('state "complete" must be a boolean')
+    if not batches:
+        # The no-op publication: an empty batch array is canonical only as
+        # a completed state embedding the unchanged index document.
+        if not complete:
+            raise ValueError('a state with no batches must be complete')
+        canonical = _format_publish_updates_state([], index, True)
+        if canonical != text:
+            raise ValueError("state is not its canonical encoding")
+        return batches
     if complete != batches[-1]["published"]:
         raise ValueError('state "complete" must agree with its last batch')
     expected_index = batches[-1]["after"] if complete else \
@@ -16080,8 +16091,12 @@ def publish_updates(state, index, batches, limit=None) -> str:
     publication. ``index`` names the published recovery index file, which
     must exist and hold a canonical :func:`update_recovery_index` document.
 
-    ``batches`` must be a non-empty ``tuple`` whose items are each an
-    ``(id, items)`` pair. ``id`` must be a non-empty ``str`` matching
+    ``batches`` must be a ``tuple`` whose items are each an
+    ``(id, items)`` pair. An empty ``batches`` tuple is a valid no-op: the
+    index file is read and validated and, when no state exists yet, a
+    completed state with an empty batch array is atomically written; an
+    empty-batch re-entry with an identical index returns that state byte
+    for byte. Otherwise, ``id`` must be a non-empty ``str`` matching
     ``[A-Za-z0-9._-]+`` and unique within the tuple; ``items`` follows the
     :func:`update_recovery_index` contract (a ``tuple`` of ``(plan,
     history)`` pairs). The first batch's ``before`` index is the current
@@ -16109,7 +16124,9 @@ def publish_updates(state, index, batches, limit=None) -> str:
     leaves a state that simply re-publishes on re-entry. When an existing
     state is present its batch ids must form a prefix of the input tuple,
     in the same order; batches may only be appended, never reordered or
-    replaced.
+    replaced. An empty-batch call against a non-empty state is rejected;
+    an empty state (the completed no-op) allows later batches to be
+    appended as long as the index file still matches its embedded index.
 
     Returns the canonical compact JSON document persisted at ``state``,
     with exactly the three top-level keys ``batches``, ``index`` and
@@ -16135,13 +16152,13 @@ def publish_updates(state, index, batches, limit=None) -> str:
         :func:`update_recovery_index` type contract, or ``limit`` is
         neither ``None`` nor a non-bool ``int``.
     :raises ValueError: either path is empty, the two paths are equal,
-        ``batches`` is empty, an ``id`` is invalid or repeated, ``items``
-        violates the :func:`update_recovery_index` value contract, the
-        existing state is malformed or not its canonical encoding, the
-        state's batches are not a prefix of the inputs (or their inputs
-        changed), the index file content is not valid UTF-8 or no longer
-        matches the recorded publication, or the recorded batches do not
-        chain.
+        an ``id`` is invalid or repeated, ``items`` violates the
+        :func:`update_recovery_index` value contract, the existing state is
+        malformed or not its canonical encoding, ``batches`` is empty while
+        a non-empty state exists, the state's batches are not a prefix of
+        the inputs (or their inputs changed), the index file content is not
+        valid UTF-8 or no longer matches the recorded publication, or the
+        recorded batches do not chain.
     :raises OSError: the index file is missing or cannot be read, or the
         state or index file cannot be written or replaced.
     """
@@ -16162,8 +16179,6 @@ def publish_updates(state, index, batches, limit=None) -> str:
         raise ValueError("index must not be empty")
     if state == index:
         raise ValueError("state and index must differ")
-    if not batches:
-        raise ValueError("batches must not be empty")
 
     parsed = []
     seen_ids = set()
@@ -16215,8 +16230,39 @@ def publish_updates(state, index, batches, limit=None) -> str:
     prior_records = None
     if state_text is not None:
         prior_records = _decode_publish_updates_state(state_text)
+
+    # The index is validated as a canonical recovery index before any state
+    # is initialized or replaced, even when nothing is published.
+    _decode_recovery_index(current)
+
+    if not batches:
+        # An empty input is a no-op. A missing state records the completed
+        # empty publication embedding the current index; the matching empty
+        # state is returned byte for byte on re-entry. Empty batches can
+        # never extend a state that already records batches, and the
+        # embedded index must still match the index file.
+        empty_state = _format_publish_updates_state([], current, True)
+        if state_text is None:
+            _atomic_write_json(state, empty_state)
+            return empty_state
+        if prior_records:
+            raise ValueError("batches must not be empty when the state "
+                             "already records batches")
+        if state_text != empty_state:
+            raise ValueError("the index file does not match the recorded "
+                             "publication")
+        return state_text
+
+    if prior_records:
         start_base = prior_records[0]["before"]
     else:
+        if state_text is not None \
+                and state_text != _format_publish_updates_state(
+                        [], current, True):
+            # Re-entering through the completed empty no-op state is only
+            # possible while the index file still embeds its index.
+            raise ValueError("the index file does not match the recorded "
+                             "publication")
         start_base = current
 
     # Precompute every batch's before/after purely from the inputs,
@@ -16252,9 +16298,11 @@ def publish_updates(state, index, batches, limit=None) -> str:
             state, _format_publish_updates_state(
                 records, published_index, records[-1]["published"]))
 
-    if prior_records is None:
-        # A fresh publication registers the first batch and commits its
-        # confirmed-zero initial state before any publication work.
+    if prior_records is None or not prior_records:
+        # A fresh publication, or the first batches appended after the
+        # completed empty no-op state, registers the first batch and
+        # commits its confirmed-zero initial state before any publication
+        # work.
         records.append(_trailing_record(0))
         _persist()
     else:
@@ -16377,5 +16425,91 @@ def publish_updates(state, index, batches, limit=None) -> str:
 
     complete = all(record["published"] for record in records)
     return _format_publish_updates_state(records, published_index, complete)
+
+
+def build_tile_update_audit(state, batches, cell_size=1.0, tile_cells=256,
+                            levels=3) -> tuple:
+    """Pair a :func:`publish_updates` state with tile pyramids of its inputs.
+
+    ``state`` must be a ``str`` byte-for-byte matching a canonical output of
+    :func:`publish_updates`; it is validated structurally rather than
+    re-applied, so the file system is never touched. ``batches`` must be a
+    ``tuple`` whose items are each an ``(id, points)`` pair with ``id`` a
+    ``str`` and ``points`` a ``tuple``. The batch ids must match the state's
+    batches in state order, both in number and in sequence.
+
+    Each batch's ``points`` is consumed in a single pass by
+    :func:`build_tile_pyramid` with the given ``cell_size``, ``tile_cells``
+    and ``levels``; point validation, raised exceptions, level aggregation
+    and quantization are exactly that function's contract.
+
+    Returns a tuple, in state order, of
+    ``(id, confirmed, total, published, receipt, pyramid)`` six-tuples. The
+    first five values are taken from the state record: ``confirmed`` and
+    ``total`` are non-negative integers, ``published`` is a ``bool`` and
+    ``receipt`` is either ``None`` (an unfinished batch) or a
+    ``(rollback_count, pending_count, total_count)`` tuple. ``pyramid`` is
+    the points' ``levels``-tuple of tile tuples sorted lexicographically by
+    ``(tx, ty)``. A completed no-op state (an empty batch array) paired with
+    an empty ``batches`` tuple returns ``()``. Repeated calls return equal
+    results.
+
+    :raises TypeError: ``state`` is not a ``str``, ``batches`` is not a
+        ``tuple``, a batch is not an ``(id, points)`` tuple, an ``id`` is
+        not a ``str``, ``points`` is not a ``tuple``,
+        ``cell_size``/``tile_cells``/``levels`` have the wrong type, or a
+        point violates the :func:`build_tile_pyramid` type contract.
+    :raises ValueError: the state is malformed or not its canonical
+        encoding, the batch ids do not match the state batches in order, or
+        a point violates the :func:`build_tile_pyramid` value contract.
+    """
+    if not isinstance(state, str):
+        raise TypeError("state must be a str")
+    if not isinstance(batches, tuple):
+        raise TypeError("batches must be a tuple")
+    for entry in batches:
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise TypeError("each batch must be an (id, points) tuple")
+        batch_id, points = entry
+        if not isinstance(batch_id, str):
+            raise TypeError("each batch id must be a str")
+        if not isinstance(points, tuple):
+            raise TypeError("each batch points must be a tuple")
+    if isinstance(cell_size, bool) or not isinstance(cell_size, _NUMERIC_TYPES):
+        raise TypeError("cell_size must be a non-bool int or float")
+    if isinstance(cell_size, float) and not math.isfinite(cell_size):
+        raise ValueError("cell_size must be finite")
+    if cell_size <= 0:
+        raise ValueError("cell_size must be positive")
+    if isinstance(tile_cells, bool) or not isinstance(tile_cells, int):
+        raise TypeError("tile_cells must be a non-bool int")
+    if tile_cells <= 0:
+        raise ValueError("tile_cells must be positive")
+    if isinstance(levels, bool) or not isinstance(levels, int):
+        raise TypeError("levels must be a non-bool int")
+    if levels <= 0:
+        raise ValueError("levels must be positive")
+
+    records = _decode_publish_updates_state(state)
+
+    if not records:
+        if batches:
+            raise ValueError("the batch ids must match the state batches in "
+                             "the same order")
+        return ()
+
+    if len(batches) != len(records) \
+            or any(entry[0] != record["id"]
+                   for entry, record in zip(batches, records)):
+        raise ValueError("the batch ids must match the state batches in the "
+                         "same order")
+
+    results = []
+    for entry, record in zip(batches, records):
+        pyramid = build_tile_pyramid(entry[1], cell_size=cell_size,
+                                    tile_cells=tile_cells, levels=levels)
+        results.append((record["id"], record["confirmed"], record["total"],
+                        record["published"], record["receipt"], pyramid))
+    return tuple(results)
 
 
