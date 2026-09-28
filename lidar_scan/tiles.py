@@ -32,6 +32,29 @@ def _quantize(value: Decimal) -> float:
     return 0.0 if result == 0.0 else result
 
 
+def _validate_pyramid_parameters(cell_size, tile_cells, levels) -> None:
+    """Validate :func:`build_tile_pyramid` shape parameters without points.
+
+    Mirrors the type/value checks :func:`build_tile_pyramid` performs before
+    it walks any point, so callers that may never reach the pyramid builder
+    (e.g. an empty audit state) enforce the same contract.
+    """
+    if isinstance(cell_size, bool) or not isinstance(cell_size, _NUMERIC_TYPES):
+        raise TypeError("cell_size must be a non-bool int or float")
+    if isinstance(cell_size, float) and not math.isfinite(cell_size):
+        raise ValueError("cell_size must be finite")
+    if isinstance(tile_cells, bool) or not isinstance(tile_cells, int):
+        raise TypeError("tile_cells must be a non-bool int")
+    if tile_cells <= 0:
+        raise ValueError("tile_cells must be positive")
+    if isinstance(levels, bool) or not isinstance(levels, int):
+        raise TypeError("levels must be a non-bool int")
+    if levels <= 0:
+        raise ValueError("levels must be positive")
+    if Decimal(str(cell_size)) <= 0:
+        raise ValueError("cell_size must be positive")
+
+
 def build_tile_index(points: Iterable[tuple | list],
                      cell_size: int | float = 1.0,
                      tile_cells: int = 256) -> tuple:
@@ -16471,6 +16494,19 @@ def build_tile_update_audit(state, batches,
         violate the :func:`build_tile_pyramid` value contract, or a
         point violates its value contract.
     """
+    return tuple(_plan_tile_update_rows(
+        state, batches, cell_size, tile_cells, levels, False))
+
+
+def _plan_tile_update_rows(state, batches, cell_size, tile_cells, levels,
+                           with_windows):
+    """Shared validation/aggregation for the audit and window planners.
+
+    Yields, in state order, either the six-item audit row
+    ``(id, confirmed, total, published, receipt, pyramid)`` or the seven-item
+    window row which appends the pyramid's flattened tile windows. Each
+    batch's ``points`` iterable is walked exactly once.
+    """
     if not isinstance(state, str):
         raise TypeError("state must be a str")
     if not isinstance(batches, tuple):
@@ -16480,6 +16516,10 @@ def build_tile_update_audit(state, batches,
             raise TypeError("each batch must be an (id, points) tuple")
         if not isinstance(entry[0], str):
             raise TypeError("each batch id must be a str")
+
+    # Validate the pyramid shape parameters up front so their contract
+    # holds even for states without batches (where no pyramid is built).
+    _validate_pyramid_parameters(cell_size, tile_cells, levels)
 
     records, index_text = _decode_publish_updates_state(state)
 
@@ -16497,7 +16537,7 @@ def build_tile_update_audit(state, batches,
         if batches:
             raise ValueError("batches do not match the state: the state "
                              "records no batches")
-        return ()
+        return
 
     if len(batches) != len(records):
         raise ValueError("batches must match the state batches one for one "
@@ -16508,13 +16548,67 @@ def build_tile_update_audit(state, batches,
                 f"batch id {entry[0]!r} does not match state batch id "
                 f"{record['id']!r}")
 
-    result = []
     for entry, record in zip(batches, records):
         pyramid = build_tile_pyramid(
             entry[1], cell_size=cell_size,
             tile_cells=tile_cells, levels=levels)
-        result.append((record["id"], record["confirmed"], record["total"],
-                       record["published"], record["receipt"], pyramid))
-    return tuple(result)
+        row = [record["id"], record["confirmed"], record["total"],
+               record["published"], record["receipt"], pyramid]
+        if with_windows:
+            # build_tile_pyramid emits levels in level order with tiles
+            # sorted by (tx, ty), so this flattening is already ordered by
+            # level, tx and ty.
+            windows = tuple(
+                (level, tile[2], tile[3], tile[4], tile[5])
+                for level, level_tiles in enumerate(pyramid)
+                for tile in level_tiles
+            )
+            row.append(windows)
+        yield tuple(row)
+
+
+def plan_tile_update_windows(state, batches,
+                             cell_size: int | float = 1.0,
+                             tile_cells: int = 256,
+                             levels: int = 3) -> tuple:
+    """Plan tile windows for published :func:`publish_updates` batches.
+
+    Behaves exactly like :func:`build_tile_update_audit` but appends the
+    pyramid's tile windows to each row. ``state`` must be a ``str``
+    byte-for-byte matching a canonical :func:`publish_updates` output
+    document (including an unfinished trailing batch, whose row then reports
+    ``published`` false and ``receipt`` ``None``). ``batches`` must be a
+    ``tuple`` whose items are each an ``(id, points)`` pair with ``id`` a
+    ``str`` and ``points`` an iterable of five-item
+    ``(x, y, z, intensity, sigma)`` points. The batch ids must match the
+    state's batches one for one, in the state's order. Each ``points``
+    iterable is walked exactly once, and point validation, error reporting,
+    level aggregation and quantization are exactly those of
+    :func:`build_tile_pyramid`.
+
+    Returns a tuple in state order, one seven-item
+    ``(id, confirmed, total, published, receipt, pyramid, windows)`` tuple
+    per state batch. The first six items are exactly the corresponding
+    :func:`build_tile_update_audit` row. ``windows`` converts every tile of
+    ``pyramid`` into a five-item ``(level, ix0, iy0, ix1, iy1)`` tuple of
+    the tile's level and inclusive cell-index bounds, sorted by
+    ``(level, tx, ty)``; a batch with no points contributes ``()``. A
+    completed state without batches paired with an empty ``batches`` tuple
+    returns ``()``. The function is pure: repeated calls with the same
+    arguments return equal results.
+
+    :raises TypeError: ``state`` is not a ``str``, ``batches`` is not a
+        ``tuple``, a batch is not an ``(id, points)`` pair, an ``id`` is
+        not a ``str``, ``cell_size``/``tile_cells``/``levels`` have the
+        wrong type, or a point violates the
+        :func:`build_tile_pyramid` point type contract.
+    :raises ValueError: ``state`` is not a canonical
+        :func:`publish_updates` document, the batches do not match the
+        state batches in number, id or order, the pyramid parameters
+        violate the :func:`build_tile_pyramid` value contract, or a
+        point violates its value contract.
+    """
+    return tuple(_plan_tile_update_rows(
+        state, batches, cell_size, tile_cells, levels, True))
 
 
