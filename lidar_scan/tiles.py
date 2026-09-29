@@ -18631,7 +18631,7 @@ def coordinate_tile_update_generations(path, generations, limit=None,
 
     # Take every job lock of every generation non-blocking in L path
     # order; on contention release every lock already taken.
-    lock_fds = _take_generation_locks(decoded)
+    lock_fds, _missing = _take_generation_locks(decoded)
     try:
         if verify:
             return _verify_coordinate_tile_update_generations(path, decoded)
@@ -18704,14 +18704,16 @@ def _decode_generations_argument(path, generations) -> list:
     return decoded
 
 
-def _take_generation_locks(decoded, create: bool = True) -> list:
+def _take_generation_locks(decoded, create: bool = True) -> tuple:
     """Take every generation's job locks non-blocking in L path order.
 
-    Returns the held lock file descriptors. On contention every lock
-    already taken is released and :class:`BlockingIOError` propagates.
-    With ``create`` false (read-only auditing) a missing lock file is
-    skipped rather than created: it cannot be held by anyone, and the
-    audit must not write any file.
+    Returns ``(lock_fds, missing)`` with the held lock file descriptors
+    and the set of lock paths that did not exist (always empty with
+    ``create`` true). On contention every lock already taken is
+    released and :class:`BlockingIOError` propagates. With ``create``
+    false (read-only auditing) a missing lock file is skipped rather
+    than created: it cannot be held by anyone, and the audit must not
+    write any file.
 
     :raises BlockingIOError: a lock is already held by another process.
     :raises OSError: a lock file cannot be opened.
@@ -18719,6 +18721,7 @@ def _take_generation_locks(decoded, create: bool = True) -> list:
     lock_paths = sorted({spec["paths"][0] for generation in decoded
                          for spec in generation["specs"]})
     lock_fds = []
+    missing = set()
     try:
         for lock_path in lock_paths:
             try:
@@ -18728,6 +18731,7 @@ def _take_generation_locks(decoded, create: bool = True) -> list:
                     fd = os.open(lock_path, os.O_RDWR)
             except FileNotFoundError:
                 if not create:
+                    missing.add(lock_path)
                     continue
                 raise
             try:
@@ -18739,7 +18743,7 @@ def _take_generation_locks(decoded, create: bool = True) -> list:
     except BaseException:
         _release_generation_locks(lock_fds)
         raise
-    return lock_fds
+    return lock_fds, missing
 
 
 def _release_generation_locks(lock_fds) -> None:
@@ -19065,10 +19069,16 @@ def audit_tile_update_generations(path, generations) -> str:
 
     ``path`` and ``generations`` follow the
     :func:`coordinate_tile_update_generations` contract exactly. Every
-    job lock of every generation is taken non-blocking (``flock``) in
-    lock path order before any file is read; contention releases every
-    lock already taken and raises :class:`BlockingIOError`. Nothing is
-    ever written: missing lock files are skipped rather than created.
+    existing job lock of every generation is taken non-blocking
+    (``flock``) in lock path order before any file is read; contention
+    releases every lock already taken and raises
+    :class:`BlockingIOError`. Nothing is ever written: missing lock
+    files are skipped rather than created. A missing lock file is
+    legitimate only while its generation has never started and the
+    job's ``A`` and ``S`` files are both absent; a started generation
+    missing a lock file raises :class:`OSError`, and a missing lock
+    file or unstarted evidence that appears during the read — a
+    concurrent start — raises :class:`BlockingIOError`.
 
     With every lock held, each generation is checked in tuple order. A
     generation whose manifest exists must hold a canonical
@@ -19096,20 +19106,156 @@ def audit_tile_update_generations(path, generations) -> str:
         binding is invalid, a file is not valid UTF-8 or canonical
         JSON, a chain is broken or a binding is wrong.
     :raises BlockingIOError: a job lock is already held by another
-        process.
+        process, or a concurrent start is detected.
     :raises OSError: a required file is missing, or a lock or file
         cannot be read.
     """
     decoded = _decode_generations_argument(path, generations)
-    lock_fds = _take_generation_locks(decoded, create=False)
+    lock_fds, missing_locks = _take_generation_locks(decoded,
+                                                     create=False)
     try:
-        return _audit_coordinate_tile_update_generations(decoded)
+        return _audit_coordinate_tile_update_generations(decoded,
+                                                         missing_locks)
     finally:
         _release_generation_locks(lock_fds)
 
 
-def _audit_coordinate_tile_update_generations(decoded) -> str:
+def _audit_coordinate_tile_update_generations(decoded,
+                                              missing_locks) -> str:
     """The locked read-only body of :func:`audit_tile_update_generations`."""
+    rows = _snapshot_tile_update_generations(decoded, missing_locks)
+    parts = ['{"generations":[']
+    for position, row in enumerate(rows):
+        if position:
+            parts.append(",")
+        parts.append("[" + _json_string(row["id"]) + ",")
+        if row["started"]:
+            committed = sum(job[1] for job in row["jobs"])
+            parts.append("true," + str(len(row["jobs"])) + ","
+                         + str(committed) + ",")
+        else:
+            parts.append("false,0,0,")
+        parts.append("true" if row["complete"] else "false")
+        parts.append("]")
+    parts.append('],"complete":')
+    parts.append(
+        "true}" if all(row["complete"] for row in rows) else "false}")
+    return "".join(parts)
+
+
+def plan_tile_update_generation_recovery(path, generations) -> str:
+    """Plan the recovery of a generations run from a locked snapshot.
+
+    ``path`` and ``generations`` follow the
+    :func:`coordinate_tile_update_generations` contract exactly, and
+    the read-only lock boundary of
+    :func:`audit_tile_update_generations` applies unchanged: every
+    existing job lock is taken non-blocking (``flock``) in lock path
+    order before any file is read, nothing is ever written, a missing
+    lock file is legitimate only while its generation has never started
+    and the job's ``A`` and ``S`` files are both absent, and a missing
+    lock file or unstarted evidence appearing during the read raises
+    :class:`BlockingIOError`.
+
+    The result is compact JSON with the key order ``generations, next,
+    complete``; ``generations`` is an array of ``[id, started, jobs,
+    complete]`` records in tuple order where ``started`` is true once
+    the generation manifest exists and ``jobs`` is the id-sorted array
+    of ``[id, confirmed, total]`` records with ``confirmed`` the job's
+    committed prefix and ``total`` its task count, both non-negative
+    integers; a generation that has never started reports every job as
+    ``[id, 0, total]``. ``next`` is the first incomplete generation's
+    ``[generation_id, job_id]`` naming its first job with
+    ``confirmed < total``; it is ``null`` when that generation needs
+    only generation-level reconciliation and when every generation is
+    complete. The top-level ``complete`` is true only when every
+    generation is complete. The document is compact with canonically
+    escaped strings, decimal integers, lowercase booleans, non-ASCII
+    characters unescaped and no trailing newline.
+
+    :raises TypeError: an argument or member has the wrong type or
+        shape.
+    :raises ValueError: an argument value, ordering, document or
+        binding is invalid, a file is not valid UTF-8 or canonical
+        JSON, a chain is broken or a binding is wrong.
+    :raises BlockingIOError: a job lock is already held by another
+        process, or a concurrent start is detected.
+    :raises OSError: a required file is missing, or a lock or file
+        cannot be read.
+    """
+    decoded = _decode_generations_argument(path, generations)
+    lock_fds, missing_locks = _take_generation_locks(decoded,
+                                                     create=False)
+    try:
+        return _plan_tile_update_generation_recovery(decoded,
+                                                     missing_locks)
+    finally:
+        _release_generation_locks(lock_fds)
+
+
+def _plan_tile_update_generation_recovery(decoded, missing_locks) -> str:
+    """The locked read-only body of
+    :func:`plan_tile_update_generation_recovery`."""
+    rows = _snapshot_tile_update_generations(decoded, missing_locks)
+    parts = ['{"generations":[']
+    for position, row in enumerate(rows):
+        if position:
+            parts.append(",")
+        parts.append("[" + _json_string(row["id"]) + ",")
+        parts.append("true" if row["started"] else "false")
+        parts.append(",[")
+        for job_position, (job_id, confirmed, total) in \
+                enumerate(row["jobs"]):
+            if job_position:
+                parts.append(",")
+            parts.append("[" + _json_string(job_id) + ","
+                         + str(confirmed) + "," + str(total) + "]")
+        parts.append("],")
+        parts.append("true" if row["complete"] else "false")
+        parts.append("]")
+    parts.append('],"next":')
+    next_text = "null"
+    for row in rows:
+        if row["complete"]:
+            continue
+        # The first incomplete generation: name its first job still
+        # short of its task count, or null when only generation-level
+        # reconciliation remains.
+        for job_id, confirmed, total in row["jobs"]:
+            if confirmed < total:
+                next_text = ("[" + _json_string(row["id"]) + ","
+                             + _json_string(job_id) + "]")
+                break
+        break
+    parts.append(next_text)
+    parts.append(',"complete":')
+    parts.append(
+        "true}" if all(row["complete"] for row in rows) else "false}")
+    return "".join(parts)
+
+
+def _snapshot_tile_update_generations(decoded, missing_locks) -> list:
+    """Read the locked generations snapshot shared by the read-only views.
+
+    Runs with every existing job lock held and checks each generation
+    in tuple order exactly as :func:`audit_tile_update_generations`
+    documents, enforcing the lock boundary of a missing lock file: it
+    is legitimate only while its generation has never started and the
+    job's ``A`` and ``S`` files are both absent, a started generation
+    missing a lock file raises :class:`OSError`, and a missing lock
+    file or unstarted evidence appearing during the read — a concurrent
+    start — raises :class:`BlockingIOError`.
+
+    Returns the in-order list of ``{"id", "started", "jobs",
+    "complete"}`` rows with ``jobs`` the id-sorted list of ``(job id,
+    confirmed, total)`` tuples; a generation that has never started
+    reports every job as ``(id, 0, total)``.
+
+    :raises ValueError: a document is malformed, ahead, broken,
+        tampered with or misbound, or generations are out of order.
+    :raises BlockingIOError: a concurrent start is detected.
+    :raises OSError: a required file is missing or unreadable.
+    """
     rows = []
     earlier_incomplete = False
     for generation in decoded:
@@ -19121,22 +19267,20 @@ def _audit_coordinate_tile_update_generations(decoded) -> str:
         except FileNotFoundError:
             sub_text = None
         if sub_text is None:
-            # Never started: no job journal may exist — an orphan
-            # journal with no generation manifest is a broken binding,
-            # not a merely unstarted generation.
-            for spec in specs:
-                if os.path.exists(spec["paths"][1]):
-                    raise ValueError(
-                        f"generation {gen_id!r} has no manifest but a job "
-                        "journal already exists")
-            rows.append((gen_id, False, 0, 0, False))
+            _audit_unstarted_generation(generation, missing_locks)
+            rows.append({
+                "id": gen_id, "started": False,
+                "jobs": sorted((spec["id"], 0, len(spec["tasks"]))
+                               for spec in specs),
+                "complete": False})
             earlier_incomplete = True
             continue
         if earlier_incomplete:
             raise ValueError("a later generation is registered while an "
                              "earlier generation is not complete")
+        _audit_started_generation_locks(generation, missing_locks)
         entries = _decode_coordinate_updates_manifest(sub_text, specs)
-        committed = 0
+        confirmed = {}
         for spec in specs:
             n, complete = _job_terminal_n_complete(spec)
             previous = entries[spec["id"]]
@@ -19144,26 +19288,126 @@ def _audit_coordinate_tile_update_generations(decoded) -> str:
                 raise ValueError("the generation manifest is out of step "
                                  "with the terminal state of job "
                                  f"{spec['id']!r}")
-            committed += _job_prior_committed(spec)
-        gen_complete = all(entry["complete"] for entry in entries.values())
-        rows.append((gen_id, True, len(specs), committed, gen_complete))
+            confirmed[spec["id"]] = _job_prior_committed(spec)
+        gen_complete = all(entry["complete"]
+                           for entry in entries.values())
+        rows.append({
+            "id": gen_id, "started": True,
+            "jobs": sorted((spec["id"], confirmed[spec["id"]],
+                            len(spec["tasks"])) for spec in specs),
+            "complete": gen_complete})
         if not gen_complete:
             earlier_incomplete = True
+    _recheck_missing_locks(decoded, rows, missing_locks)
+    return rows
 
-    all_complete = all(row[4] for row in rows)
-    parts = ['{"generations":[']
-    for position, (gen_id, started, jobs, committed, complete) in \
-            enumerate(rows):
-        if position:
-            parts.append(",")
-        parts.append("[" + _json_string(gen_id) + ",")
-        parts.append("true" if started else "false")
-        parts.append("," + str(jobs) + "," + str(committed) + ",")
-        parts.append("true" if complete else "false")
-        parts.append("]")
-    parts.append('],"complete":')
-    parts.append("true}" if all_complete else "false}")
-    return "".join(parts)
+
+def _audit_unstarted_generation(generation, missing_locks) -> None:
+    """Check a manifest-less generation's unstarted evidence.
+
+    A generation without a manifest has never started: no job journal
+    may exist, and a job whose lock file did not exist at lock time
+    must still have neither a journal nor a state file — and its lock
+    file must not have appeared since, which would mean a run is
+    starting concurrently.
+
+    :raises ValueError: a job journal exists without the generation
+        manifest.
+    :raises BlockingIOError: a missing lock file appeared during the
+        read.
+    :raises OSError: a state file exists while its lock file is
+        missing.
+    """
+    gen_id = generation["id"]
+    specs = generation["specs"]
+    for spec in specs:
+        lock_path = spec["paths"][0]
+        if lock_path in missing_locks and os.path.exists(lock_path):
+            raise BlockingIOError(
+                f"the lock file of job {spec['id']!r} appeared during "
+                "the read: a run is starting concurrently")
+    # Never started: no job journal may exist — an orphan journal with
+    # no generation manifest is a broken binding, not a merely
+    # unstarted generation.
+    for spec in specs:
+        if os.path.exists(spec["paths"][1]):
+            raise ValueError(
+                f"generation {gen_id!r} has no manifest but a job "
+                "journal already exists")
+    # A missing lock file is legitimate only while the job's A and S
+    # files are both absent: a state file proves a run once held the
+    # lock, so the lock file is a required file and its loss an
+    # OSError.
+    for spec in specs:
+        lock_path = spec["paths"][0]
+        if lock_path in missing_locks \
+                and os.path.exists(spec["paths"][2]):
+            raise OSError(
+                f"the lock file of job {spec['id']!r} is missing while "
+                "its state file exists")
+
+
+def _audit_started_generation_locks(generation, missing_locks) -> None:
+    """Enforce the lock boundary of a started generation.
+
+    A started generation's run created every job lock file before any
+    other file, so a lock file missing at lock time is a required file
+    lost after the fact; one that appears during the read is a
+    concurrent start instead.
+
+    :raises BlockingIOError: a missing lock file appeared during the
+        read.
+    :raises OSError: a started generation's lock file is missing.
+    """
+    gen_id = generation["id"]
+    for spec in generation["specs"]:
+        lock_path = spec["paths"][0]
+        if lock_path not in missing_locks:
+            continue
+        if os.path.exists(lock_path):
+            raise BlockingIOError(
+                f"the lock file of job {spec['id']!r} appeared during "
+                "the read: a run is starting concurrently")
+        raise OSError(
+            f"the lock file of job {spec['id']!r} is missing while "
+            f"generation {gen_id!r} has started")
+
+
+def _recheck_missing_locks(decoded, rows, missing_locks) -> None:
+    """Raise if a concurrent start appeared during the read.
+
+    A job whose lock file was missing at lock time was read without its
+    lock, borrowing the unstarted evidence (no lock, manifest, journal
+    or state file); that evidence must still hold once every generation
+    has been read, or a run started concurrently and the snapshot is
+    not a consistent one.
+
+    :raises BlockingIOError: unstarted evidence appeared during the
+        read.
+    """
+    if not missing_locks:
+        return
+    for generation, row in zip(decoded, rows):
+        if row["started"]:
+            continue
+        borrowed = False
+        for spec in generation["specs"]:
+            lock_path = spec["paths"][0]
+            if lock_path not in missing_locks:
+                continue
+            borrowed = True
+            if os.path.exists(lock_path) \
+                    or os.path.exists(spec["paths"][1]) \
+                    or os.path.exists(spec["paths"][2]):
+                raise BlockingIOError(
+                    "a lock, journal or state file of the unstarted "
+                    f"generation {generation['id']!r} appeared during "
+                    "the read: a run is starting concurrently")
+        if borrowed and os.path.exists(generation["manifest"]):
+            raise BlockingIOError(
+                f"the manifest of the unstarted generation "
+                f"{generation['id']!r} appeared during the read: a run "
+                "is starting concurrently")
 
 
 def _decode_tile_pyramid_array_text(text: str) -> tuple:
