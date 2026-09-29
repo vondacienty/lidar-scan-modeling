@@ -162,11 +162,12 @@ def test_shared_budget_holds_later_generation_at_genesis(tmp_path):
     result = coordinate_tile_update_generations(path, generations, limit=2)
     document = json.loads(result)
     assert document["complete"] is False
-    assert document["generations"][0][2] is None
-    assert document["generations"][1][2] is None
-    # g1 holds a partial generation manifest; g2 never starts.
+    # g1 holds a partial generation manifest, embedded as its state even
+    # though it is incomplete; g2 never starts and stays null.
     sub = json.loads(_read(generations[0][1]).decode())
     assert sub["complete"] is False
+    assert document["generations"][0][2] == sub
+    assert document["generations"][1][2] is None
     assert not os.path.exists(generations[1][1])
     assert not os.path.exists(generations[1][2][0][1][1])
 

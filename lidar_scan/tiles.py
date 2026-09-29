@@ -18567,56 +18567,18 @@ def _verify_coordinate_tile_updates(manifest_path: str, specs) -> tuple:
     return (task_count, complete_count, complete_count == task_count)
 
 
-def coordinate_tile_update_generations(path, generations, limit=None,
-                                       verify=False) -> str | tuple:
-    """Coordinate crash-safe tile updates over sequential generations.
+def _decode_coordinate_generations_args(path, generations) -> list:
+    """Validate the shared ``(path, generations)`` arguments.
 
-    ``path`` must be a non-empty ``str`` path to the generations
-    manifest and must differ from every other path involved.
-    ``generations`` must be a tuple of three-item tuples
-    ``(id, manifest, jobs)`` where each ``id`` is a non-empty ``str``
-    strictly increasing in tuple order, ``manifest`` is that
-    generation's non-empty ``str`` :func:`coordinate_tile_updates`
-    manifest path, and ``jobs`` follows the multi-job contract. Every
-    path (the top ``path``, every generation ``manifest`` and every job
-    ``L``/``A``/``S``/``P``) must be globally pairwise distinct.
-    ``limit`` must be ``None`` or a non-bool non-negative ``int`` and
-    ``verify`` a ``bool`` (true forces ``limit=None``).
+    Used by both :func:`coordinate_tile_update_generations` and
+    :func:`audit_tile_update_generations`. Returns the in-order list of
+    ``{"id", "manifest", "jobs", "specs"}`` dicts with every job
+    contract fully decoded.
 
-    The generations are processed strictly in order: a later generation
-    starts only once the previous generation is fully complete, and the
-    ``limit`` task budget is shared across every job of every
-    generation. Every job lock of every generation is taken
-    non-blocking (``flock``) in lock path order before any file is
-    touched; contention releases every lock and raises
-    :class:`BlockingIOError` without writing.
-
-    With ``verify`` false, once all locks are held and before any write
-    the generations manifest, every generation manifest and every job's
-    terminal ``A``/``S``/``P`` state are prevalidated exactly as in
-    :func:`coordinate_tile_updates`: an ahead-of-journal document, a
-    broken chain, tampering or a wrong binding raises
-    :class:`ValueError` before any file is written. Each generation is
-    then published via :func:`coordinate_tile_updates`; its manifest is
-    the generation's state. The generations manifest is compact JSON
-    with the key order ``generations, complete``; ``generations`` is an
-    array of ``[id, manifest, state]`` records in tuple order with
-    ``state`` ``null`` while the generation has not been registered and
-    otherwise the embedded generation-manifest object, and the
-    top-level ``complete`` is true only when every generation is
-    complete. The canonical document is returned.
-
-    With ``verify`` true nothing is written: every file must exist and
-    bind consistently, and ``(generation_count, complete_count,
-    all_complete)`` is returned.
-
-    :raises TypeError: an argument has the wrong type or shape.
-    :raises ValueError: an argument value, ordering, document or binding
-        is invalid.
-    :raises BlockingIOError: a job lock is already held by another
-        process.
-    :raises OSError: a required file is missing, or a lock or file
-        cannot be read, written or replaced.
+    :raises TypeError: an argument or member has the wrong type or
+        shape.
+    :raises ValueError: a path or id is empty, generation ids are not
+        strictly increasing, or the paths are not pairwise distinct.
     """
     if not isinstance(path, str):
         raise TypeError("path must be a str")
@@ -18661,6 +18623,65 @@ def coordinate_tile_update_generations(path, generations, limit=None,
                                  f"must be pairwise distinct ({candidate!r} "
                                  "repeats)")
             seen_paths.add(candidate)
+    return decoded
+
+
+def coordinate_tile_update_generations(path, generations, limit=None,
+                                       verify=False) -> str | tuple:
+    """Coordinate crash-safe tile updates over sequential generations.
+
+    ``path`` must be a non-empty ``str`` path to the generations
+    manifest and must differ from every other path involved.
+    ``generations`` must be a tuple of three-item tuples
+    ``(id, manifest, jobs)`` where each ``id`` is a non-empty ``str``
+    strictly increasing in tuple order, ``manifest`` is that
+    generation's non-empty ``str`` :func:`coordinate_tile_updates`
+    manifest path, and ``jobs`` follows the multi-job contract. Every
+    path (the top ``path``, every generation ``manifest`` and every job
+    ``L``/``A``/``S``/``P``) must be globally pairwise distinct.
+    ``limit`` must be ``None`` or a non-bool non-negative ``int`` and
+    ``verify`` a ``bool`` (true forces ``limit=None``).
+
+    The generations are processed strictly in order: a later generation
+    starts only once the previous generation is fully complete, and the
+    ``limit`` task budget is shared across every job of every
+    generation. Every job lock of every generation is taken
+    non-blocking (``flock``) in lock path order before any file is
+    touched; contention releases every lock and raises
+    :class:`BlockingIOError` without writing.
+
+    With ``verify`` false, once all locks are held and before any write
+    the generations manifest, every generation manifest and every job's
+    terminal ``A``/``S``/``P`` state are prevalidated exactly as in
+    :func:`coordinate_tile_updates`: an ahead-of-journal document, a
+    broken chain, tampering or a wrong binding raises
+    :class:`ValueError` before any file is written. Each generation is
+    then published via :func:`coordinate_tile_updates`; its manifest is
+    the generation's state. The generations manifest is compact JSON
+    with the key order ``generations, complete``; ``generations`` is an
+    array of ``[id, manifest, state]`` records in tuple order with
+    ``state`` ``null`` only while the generation has not started (its
+    manifest not yet created) and otherwise the embedded current
+    generation-manifest object, complete or not; the top-level
+    ``complete`` is true only when every generation is complete. A
+    top-level state merely lagging its generation manifest (a crash
+    interrupted the top-level rewrite) is caught up on re-entry, while
+    a state leading its generation manifest is rejected. The canonical
+    document is returned.
+
+    With ``verify`` true nothing is written: every file must exist and
+    bind consistently, and ``(generation_count, complete_count,
+    all_complete)`` is returned.
+
+    :raises TypeError: an argument has the wrong type or shape.
+    :raises ValueError: an argument value, ordering, document or binding
+        is invalid.
+    :raises BlockingIOError: a job lock is already held by another
+        process.
+    :raises OSError: a required file is missing, or a lock or file
+        cannot be read, written or replaced.
+    """
+    decoded = _decode_coordinate_generations_args(path, generations)
 
     if limit is not None:
         if isinstance(limit, bool) or not isinstance(limit, int):
@@ -18726,22 +18747,27 @@ def _decode_coordinate_generations_manifest(text: str, decoded,
     entry's ``sub_text`` is the generation manifest's on-disk text, or
     ``None`` when it does not exist. Returns an ``id`` keyed dict of
     ``{"state_text", "complete"}`` with ``state_text`` ``None`` for a
-    ``null`` state. Registered states form a prefix: once a state is
-    ``null`` no later state may be an object, and an object state must
-    reproduce the on-disk generation manifest byte for byte, decode
-    canonically for that generation's jobs and report it fully
-    complete.
+    ``null`` state. A ``null`` state marks a generation that has not
+    started; once its generation manifest exists the state embeds that
+    manifest's current canonical object, complete or not. Registered
+    states form a prefix: no state may follow a ``null`` state, and an
+    object state may not follow an incomplete object state. An object
+    state must decode canonically for its generation's jobs and may
+    never lead the on-disk generation manifest; a state merely lagging
+    it (a crash interrupted the top-level rewrite) is backfilled on
+    re-entry in publish mode and rejected in verify mode.
 
-    With ``strict`` true (verify mode) every generation manifest must
-    exist; a ``null`` state may only bind an incomplete manifest and an
-    object state must bind a complete byte-equal manifest. With
-    ``strict`` false (publish mode) a complete manifest may trail a
-    ``null`` state after a crash and is backfilled on re-entry.
+    With ``strict`` true (verify mode) every registered state must be
+    byte-for-byte in step with its generation manifest and a ``null``
+    state may only bind a missing manifest. With ``strict`` false
+    (publish mode) a lagging state — a ``null`` state over an existing
+    manifest or an object behind it — is tolerated and backfilled on
+    re-entry.
 
     :raises ValueError: the manifest is malformed, non-canonical, binds
         unknown ids or manifests in the wrong order, carries a state
-        out of step with the generation manifest or an inconsistent
-        completion flag.
+        ahead of its generation manifest, a broken registration chain
+        or an inconsistent completion flag.
     """
     try:
         node = _parse_json_node(text, _skip_json_ws(text, 0))
@@ -18769,6 +18795,7 @@ def _decode_coordinate_generations_manifest(text: str, decoded,
 
     entries = {}
     null_seen = False
+    incomplete_seen = False
     for record_node, generation in zip(record_nodes, decoded):
         items = record_node[0]
         if not isinstance(items, list) or len(items) != 3:
@@ -18793,19 +18820,17 @@ def _decode_coordinate_generations_manifest(text: str, decoded,
         sub_text = generation["sub_text"]
         if state_node[0] is None:
             if text[state_node[1]:state_node[2]] != "null":
-                raise ValueError("an unregistered generation state must be "
+                raise ValueError("an unstarted generation state must be "
                                  "the literal null")
-            # A null state means "not complete": its generation manifest
-            # may be missing or hold a partial publication. A complete
-            # manifest under a null state makes the top document lag the
-            # generation; verify rejects it outright while publish mode
-            # tolerates and backfills it on re-entry, exactly as a
-            # lagging plural manifest.
-            if sub_text is not None and \
-                    _sub_manifest_complete(sub_text) and strict:
+            # A null state means the generation has not started, so its
+            # generation manifest must not exist; one that does is a top
+            # document lagging the generation (a crash interrupted the
+            # top-level rewrite), which publish mode tolerates and
+            # backfills on re-entry while verify mode rejects it.
+            if sub_text is not None and strict:
                 raise ValueError(
                     f"the null state of generation {gen_id!r} lags its "
-                    "complete generation manifest")
+                    "generation manifest")
             state_text = None
             null_seen = True
             complete = False
@@ -18813,6 +18838,9 @@ def _decode_coordinate_generations_manifest(text: str, decoded,
             if null_seen:
                 raise ValueError("a registered generation state may not "
                                  "follow a null state")
+            if incomplete_seen:
+                raise ValueError("a registered generation state may not "
+                                 "follow an incomplete generation state")
             if not isinstance(state_node[0], dict):
                 raise ValueError("a registered generation state must embed "
                                  "a generation manifest object")
@@ -18821,16 +18849,41 @@ def _decode_coordinate_generations_manifest(text: str, decoded,
                 raise OSError(
                     f"the state of generation {gen_id!r} binds a missing "
                     "generation manifest")
-            if state_text != sub_text:
-                raise ValueError(f"the state of generation {gen_id!r} is out "
-                                 "of step with its generation manifest")
+            # The embedded state must decode canonically for the
+            # generation's jobs and may never lead the on-disk generation
+            # manifest; a state merely lagging it (a crash interrupted
+            # the top-level rewrite) is backfilled on re-entry in publish
+            # mode and rejected in verify mode.
+            state_entries = _decode_coordinate_updates_manifest(
+                state_text, generation["specs"])
             sub_entries = _decode_coordinate_updates_manifest(
                 sub_text, generation["specs"])
+            lagging = False
+            for job_id, state_entry in state_entries.items():
+                sub_entry = sub_entries[job_id]
+                if state_entry["n"] > sub_entry["n"]:
+                    raise ValueError(
+                        f"the state of generation {gen_id!r} leads its "
+                        "generation manifest")
+                if state_entry["n"] < sub_entry["n"]:
+                    # A complete state can never trail its manifest: a
+                    # completed job's journal is final, so this state
+                    # could not have been written by a genuine run.
+                    if state_entry["complete"]:
+                        raise ValueError(
+                            f"the state of generation {gen_id!r} is "
+                            "tampered with")
+                    lagging = True
+                elif state_entry["complete"] is not sub_entry["complete"]:
+                    raise ValueError(f"the state of generation {gen_id!r} "
+                                     "is tampered with")
+            if lagging and strict:
+                raise ValueError(f"the state of generation {gen_id!r} "
+                                 "lags its generation manifest")
             complete = all(entry["complete"]
-                           for entry in sub_entries.values())
+                           for entry in state_entries.values())
             if not complete:
-                raise ValueError(f"generation {gen_id!r} registers a state "
-                                 "object before every job is complete")
+                incomplete_seen = True
         entries[gen_id] = {"state_text": state_text, "complete": complete}
 
     if overall != all(entries[generation["id"]]["complete"]
@@ -18912,15 +18965,15 @@ def _publish_coordinate_tile_update_generations(path: str, decoded,
 
     budget = limit
     rows = []
+    all_complete = True
     blocked = False
-    for position, generation in enumerate(decoded):
+    for generation in decoded:
         gen_id = generation["id"]
-        if not blocked and position and rows[position - 1][2] is None:
-            # The previous generation has no complete state, so this and
-            # every later generation must not start.
-            blocked = True
         if blocked:
+            # An earlier generation is not complete, so this and every
+            # later generation must not start.
             rows.append((gen_id, generation["manifest"], None))
+            all_complete = False
             continue
 
         specs = generation["specs"]
@@ -18936,13 +18989,16 @@ def _publish_coordinate_tile_update_generations(path: str, decoded,
         after = _generation_committed_total(generation)
         if budget is not None:
             budget -= after - before
-        state = canonical if _sub_manifest_complete(canonical) else None
-        rows.append((gen_id, generation["manifest"], state))
-        if state is None:
+        # Once the generation manifest exists its current canonical
+        # object is the state, complete or not; only a generation that
+        # never started keeps the null state.
+        rows.append((gen_id, generation["manifest"], canonical))
+        if not _sub_manifest_complete(canonical):
             blocked = True
+            all_complete = False
 
-    all_complete = all(state is not None for _id, _manifest, state in rows)
-    canonical_top = _format_coordinate_generations_manifest(rows, all_complete)
+    canonical_top = _format_coordinate_generations_manifest(rows,
+                                                            all_complete)
     if canonical_top != top_text:
         _atomic_write_text(path, canonical_top)
     return canonical_top
@@ -18979,10 +19035,144 @@ def _verify_coordinate_tile_update_generations(path: str, decoded) -> tuple:
 
     complete_count = sum(
         1 for generation in decoded
-        if entries[generation["id"]]["state_text"] is not None)
+        if entries[generation["id"]]["complete"])
     generation_count = len(decoded)
     return (generation_count, complete_count,
             complete_count == generation_count)
+
+
+def audit_tile_update_generations(path, generations) -> str:
+    """Audit the on-disk state of coordinated generations, read-only.
+
+    ``path`` and ``generations`` follow exactly the
+    :func:`coordinate_tile_update_generations` argument contract:
+    ``path`` is the non-empty ``str`` generations manifest path and
+    ``generations`` a tuple of three-item ``(id, manifest, jobs)``
+    tuples with strictly increasing non-empty ``str`` ids, non-empty
+    ``str`` manifest paths and multi-job contracts, every path (the top
+    ``path``, every generation ``manifest`` and every job
+    ``L``/``A``/``S``/``P``) globally pairwise distinct. Every job lock
+    of every generation is taken non-blocking (``flock``) in lock path
+    order before any file is read; contention releases every lock and
+    raises :class:`BlockingIOError`. Nothing is written.
+
+    Each generation is audited in tuple order. A generation whose
+    manifest has never been created is unstarted; an orphan job journal
+    without the generation manifest is a broken binding, not an
+    unstarted generation. A started generation's manifest and every
+    job's terminal ``A``/``S``/``P`` state must bind exactly as in
+    :func:`coordinate_tile_updates` verify mode: the manifest decodes
+    canonically, every journal chain replays and the manifest is in
+    step with every job's terminal state. Registered generations form
+    a prefix: a later generation may not be registered while an earlier
+    generation has no manifest or is not complete.
+
+    Returns the compact JSON audit document with the key order
+    ``generations, complete``: ``generations`` is an array of
+    ``[id, started, jobs, committed, complete]`` records in tuple
+    order — an unstarted generation records ``[id, false, 0, 0,
+    false]`` — with ``jobs`` the generation's job count, ``committed``
+    the sum of its jobs' committed task counts and ``complete`` the
+    generation's completion state; the top-level ``complete`` is true
+    only when every generation is complete. Strings are canonically
+    escaped, integers decimal and booleans lowercase, non-ASCII is not
+    escaped and there is no trailing newline.
+
+    :raises TypeError: an argument has the wrong type or shape.
+    :raises ValueError: an argument value, ordering, document or binding
+        is invalid.
+    :raises BlockingIOError: a job lock is already held by another
+        process.
+    :raises OSError: a required file is missing or cannot be read.
+    """
+    decoded = _decode_coordinate_generations_args(path, generations)
+
+    # Take every job lock of every generation non-blocking in L path
+    # order; on contention release every lock already taken.
+    lock_paths = sorted({spec["paths"][0] for generation in decoded
+                         for spec in generation["specs"]})
+    lock_fds = []
+    try:
+        for lock_path in lock_paths:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                raise
+            lock_fds.append(fd)
+        return _audit_coordinate_tile_update_generations(decoded)
+    finally:
+        for fd in lock_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
+
+def _audit_coordinate_tile_update_generations(decoded) -> str:
+    """The locked read-only body of :func:`audit_tile_update_generations`."""
+    records = []
+    gap_seen = False
+    incomplete_seen = False
+    all_complete = True
+    for generation in decoded:
+        gen_id = generation["id"]
+        specs = generation["specs"]
+        try:
+            sub_text = _read_utf8_file(
+                generation["manifest"], "the generation manifest file")
+        except FileNotFoundError:
+            sub_text = None
+        if sub_text is None:
+            # A generation that never started holds no per-job
+            # publications: an orphan journal with no generation
+            # manifest is a broken binding, not an unstarted generation.
+            for spec in specs:
+                if os.path.exists(spec["paths"][1]):
+                    raise ValueError(
+                        f"generation {gen_id!r} has no manifest but a job "
+                        "journal already exists")
+            records.append((gen_id, False, 0, 0, False))
+            gap_seen = True
+            all_complete = False
+            continue
+        if gap_seen:
+            raise ValueError("a later generation is registered while an "
+                             "earlier generation has no manifest")
+        if incomplete_seen:
+            raise ValueError("a later generation is registered while an "
+                             "earlier generation is not complete")
+        _task_count, _complete_count, generation_complete = \
+            _verify_coordinate_tile_updates(generation["manifest"], specs)
+        committed = _generation_committed_total(generation)
+        records.append((gen_id, True, len(specs), committed,
+                        generation_complete))
+        if not generation_complete:
+            incomplete_seen = True
+            all_complete = False
+    return _format_audit_generations(records, all_complete)
+
+
+def _format_audit_generations(records, complete) -> str:
+    """Serialize the generations audit with ``generations, complete``.
+
+    ``records`` is an in-order iterable of
+    ``(id, started, jobs, committed, complete)``.
+    """
+    parts = ['{"generations":[']
+    for position, (gen_id, started, jobs, committed, gen_complete) in \
+            enumerate(records):
+        if position:
+            parts.append(",")
+        parts.append("[" + _json_string(gen_id) + ","
+                     + ("true" if started else "false") + ","
+                     + str(jobs) + "," + str(committed) + ","
+                     + ("true" if gen_complete else "false") + "]")
+    parts.append('],"complete":')
+    parts.append("true}" if complete else "false}")
+    return "".join(parts)
 
 
 def _decode_tile_pyramid_array_text(text: str) -> tuple:
