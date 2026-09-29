@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -15861,7 +15862,7 @@ def publish_migration_journal(journal_path, index_path, before, after,
     return "".join(parts)
 
 
-def _atomic_write_json(path: str, text: str) -> None:
+def _atomic_write_text(path: str, text: str) -> None:
     """Write ``text`` to ``path`` atomically as UTF-8, without a trailing LF.
 
     The bytes are written to a temporary file in the same directory as
@@ -16241,7 +16242,7 @@ def publish_updates(state, index, batches, limit=None) -> str:
             # the completed batch-less state is then written atomically.
             _decode_recovery_index(current)
             completed = _format_publish_updates_state([], current, True)
-            _atomic_write_json(state, completed)
+            _atomic_write_text(state, completed)
             return completed
         if prior_records:
             raise ValueError("batches must not be empty once the state "
@@ -16295,7 +16296,7 @@ def publish_updates(state, index, batches, limit=None) -> str:
     start_batch = 0
 
     def _persist():
-        _atomic_write_json(
+        _atomic_write_text(
             state, _format_publish_updates_state(
                 records, published_index, records[-1]["published"]))
 
@@ -16417,7 +16418,7 @@ def publish_updates(state, index, batches, limit=None) -> str:
         # Batch complete: atomically replace the index file first, then
         # write the state (carrying the next batch's trailing record when
         # more work remains).
-        _atomic_write_json(index, target["after"])
+        _atomic_write_text(index, target["after"])
         published_index = target["after"]
         if position + 1 < len(planned):
             records.append(_trailing_record(position + 1))
@@ -17726,6 +17727,361 @@ def publish_tile_update_plan(state_path, pyramid_path, base, execution,
             pyramid_path, _commit_state_node_text(advanced, "pyramid"))
         current = advanced
     return current
+
+
+def coordinate_tile_update(paths, base, execution: str, limit=None,
+                           verify: bool = False) -> str | tuple:
+    """Coordinate a chained :func:`publish_tile_update_plan` publication.
+
+    ``paths`` must be exactly a four-item ``tuple`` ``(lock_path,
+    records_path, state_path, pyramid_path)`` (below ``L``, ``A``, ``S``
+    and ``P``) whose members are pairwise distinct non-empty ``str`` file
+    paths. ``base`` and ``execution`` follow the
+    :func:`commit_tile_update_plan` contract: ``base`` is the outer
+    pyramid tuple (only a non-tuple ``base`` itself is a
+    :class:`TypeError`; bad structure, fields or values inside it are a
+    :class:`ValueError`) and ``execution`` a ``str`` byte-for-byte
+    matching a canonical :func:`execute_tile_update_plan` document.
+    ``limit`` must be either ``None`` or a non-bool non-negative
+    ``int``; ``verify`` must be a ``bool``, and when it is true ``limit``
+    must be ``None``.
+
+    A non-blocking, cross-process exclusive lock is taken on ``L`` for
+    the duration of the call; ``L`` is created if it is missing. If the
+    lock is already held by another process, :class:`BlockingIOError`
+    is raised and ``A``, ``S`` and ``P`` are left untouched.
+
+    ``A`` must be either missing or a strict-UTF-8 compact JSON document
+    with no byte order mark, whitespace or trailing newline and exactly
+    the top-level key ``records``. Its value is an array of two-item
+    ``[n, state]`` pairs with the ``n`` values non-bool ints strictly
+    increasing from zero (so the kth pair carries ``k``) and each
+    ``state`` embedded as a canonical :func:`commit_tile_update_plan`
+    document for ``base`` and ``execution`` that commits strictly more
+    results than the previous record (the first record committing at
+    least one). Replaying the states in order through
+    :func:`commit_tile_update_plan`, starting at the canonical
+    zero-step state, must reproduce every recorded state byte for byte;
+    the last state must equal ``S`` byte for byte (a missing or
+    zero-step ``S`` pairs with an empty chain) and that state's pyramid
+    must equal ``P`` byte for byte. A missing ``A`` is accepted only
+    when ``S`` is also missing or holds the canonical zero-step state.
+
+    With ``verify`` false, ``S`` and ``P`` are re-validated and the
+    publication reconciled: if ``A`` crashed behind ``S`` the one
+    replayable state at ``S`` is backfilled into ``A``, a merely
+    lagging ``P`` is caught up, :func:`publish_tile_update_plan` is
+    then called with ``limit`` and the new state appended to ``A`` when
+    it advances the chain. ``A`` is replaced atomically (a fresh
+    zero-step coordination materializes ``{"records":[]}``) and the
+    state published at ``S`` is returned.
+
+    With ``verify`` true nothing is modified: the whole chain is
+    replayed and ``(n, complete)`` is returned with ``n`` the number of
+    records in ``A`` and ``complete`` the completion flag of the final
+    state (the zero-step state when the chain is empty).
+
+    :raises TypeError: ``paths`` is not a four-item tuple, a path member
+        is not a ``str``, ``base`` is not a tuple, ``execution`` is not a
+        str, ``limit`` is neither ``None`` nor a non-bool int, or
+        ``verify`` is not a bool.
+    :raises BlockingIOError: ``L`` is already locked by another process.
+    :raises ValueError: a path is empty or two paths are equal,
+        ``limit`` is negative, ``verify`` is true with a non-``None``
+        limit, the base pyramid or execution is invalid, ``A`` or its
+        records are malformed or not canonically encoded, the recorded
+        chain is broken or does not advance, a recorded state does not
+        replay or is not canonical for ``base`` and ``execution``, or
+        ``S``/``P`` are malformed, tampered with, lag behind ``A`` or are
+        bound to another base or execution.
+    :raises OSError: ``P`` is missing or unreadable, ``S`` is required by
+        an existing non-empty ``A`` but missing, or ``L`` or ``A`` cannot
+        be created, written or replaced.
+    """
+    if not isinstance(paths, tuple) or len(paths) != 4:
+        raise TypeError("paths must be a four-item tuple (L, A, S, P)")
+    lock_path, records_path, state_path, pyramid_path = paths
+    for label, path in (("L", lock_path), ("A", records_path),
+                        ("S", state_path), ("P", pyramid_path)):
+        if not isinstance(path, str):
+            raise TypeError(f"{label} must be a str")
+        if not path:
+            raise ValueError(f"{label} must not be empty")
+    if len({lock_path, records_path, state_path, pyramid_path}) != 4:
+        raise ValueError("the four paths must be pairwise distinct")
+    if not isinstance(base, tuple):
+        raise TypeError("base must be a tuple")
+    if not isinstance(execution, str):
+        raise TypeError("execution must be a str")
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be None or a non-bool int")
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+    if not isinstance(verify, bool):
+        raise TypeError("verify must be a bool")
+    if verify and limit is not None:
+        raise ValueError("limit must be None when verify is true")
+
+    # Fully validate base and execution (and prepare the zero-step anchor)
+    # before the lock file is created or any data file is touched.
+    zero_state = commit_tile_update_plan(base, execution, state=None,
+                                         max_tasks=0)
+    plan, tasks, results = _decode_tile_update_execution_document(execution)
+    base_text = _commit_state_node_text(zero_state, "base")
+
+    # The non-blocking exclusive flock serializes coordinators across
+    # processes. Opening for append creates L when it is missing (an
+    # OSError on a bad path); a contended lock raises BlockingIOError
+    # before any of A, S or P is touched.
+    lock_stream = open(lock_path, "a+b")
+    try:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            return _coordinate_tile_update_locked(
+                records_path, state_path, pyramid_path, base, execution,
+                limit, verify, zero_state, plan, tasks, results, base_text)
+        finally:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_stream.close()
+
+
+def _coordinate_tile_update_locked(
+        records_path, state_path, pyramid_path, base, execution, limit,
+        verify, zero_state, plan, tasks, results, base_text):
+    """Body of :func:`coordinate_tile_update` while the lock is held."""
+
+    # P always exists; S is optional only while the chain is empty.
+    pyramid_text = _read_required_utf8(pyramid_path, "the pyramid file")
+    _decode_tile_pyramid_array_text(pyramid_text)
+    state_text = _read_optional_utf8(state_path)
+    records_text = _read_optional_utf8(records_path)
+
+    record_nodes = []
+    chain_states = []
+    previous_committed = 0
+    if records_text is not None:
+        record_nodes = _decode_coordinate_records_document(records_text)
+        previous = zero_state
+        for index, record_node in enumerate(record_nodes):
+            children = record_node[0]
+            number = children[0][0]
+            if number != index:
+                raise ValueError(
+                    "record numbers must be non-bool ints strictly "
+                    "increasing from zero")
+            recorded_state = records_text[children[1][1]:children[1][2]]
+            committed, _pyramid = _decode_tile_update_commit_state(
+                recorded_state, plan, tasks, results, base, base_text)
+            if committed <= previous_committed:
+                raise ValueError("each record must commit strictly more "
+                                 "results than the previous record")
+            produced = commit_tile_update_plan(
+                base, execution, state=previous,
+                max_tasks=committed - previous_committed)
+            if produced != recorded_state:
+                raise ValueError(
+                    "a recorded state does not replay from its prefix or "
+                    "is not its canonical encoding")
+            chain_states.append(recorded_state)
+            previous = recorded_state
+            previous_committed = committed
+
+    if state_text is None:
+        if records_text is None:
+            # Nothing durable exists: the chain head is the zero state.
+            final_text = zero_state
+            final_committed = 0
+        elif not chain_states:
+            # A present-but-empty without S is simply a fresh publication.
+            final_text = zero_state
+            final_committed = 0
+        else:
+            raise ValueError(
+                "the state file is missing while the records file chains "
+                "states: a broken chain")
+    else:
+        committed_s, _pyramid = _decode_tile_update_commit_state(
+            state_text, plan, tasks, results, base, base_text)
+        if records_text is None and state_text != zero_state:
+            # A missing permits only a missing or zero-step S.
+            raise ValueError(
+                "a missing records file permits only a missing state file "
+                "or the canonical zero-step state")
+        if not chain_states:
+            aligned_state = zero_state
+        else:
+            aligned_state = chain_states[-1]
+        if state_text == aligned_state:
+            final_text = state_text
+            final_committed = committed_s
+        elif committed_s > previous_committed and not verify:
+            # Crash window (non-verify only): S was replaced but the new
+            # record never reached A. Adopt S only when it replays as the
+            # single next state (also the repair for an A left empty);
+            # verify mode never repairs the chain.
+            produced = commit_tile_update_plan(
+                base, execution, state=aligned_state,
+                max_tasks=committed_s - previous_committed)
+            if produced != state_text:
+                raise ValueError(
+                    "the state file does not replay from the recorded "
+                    "chain: a broken or tampered chain")
+            chain_states.append(state_text)
+            final_text = state_text
+            final_committed = committed_s
+        else:
+            raise ValueError(
+                "the state file does not equal the records' final state: "
+                "a broken or tampered chain")
+
+    # P must be the final state's pyramid. In non-verify mode a prefix
+    # pyramid left by a crash between the S and P replacements is accepted
+    # and caught up by publish_tile_update_plan below; verify mode cannot
+    # reconcile, so it demands the strict terminal pyramid.
+    final_pyramid = _commit_state_node_text(final_text, "pyramid")
+    if pyramid_text != final_pyramid and (
+            verify or pyramid_text not in _reachable_prefix_pyramids(
+                base, tasks, results, final_committed)):
+        raise ValueError(
+            "the pyramid file does not equal the final state's pyramid "
+            "and is not a prefix the chain has committed")
+
+    complete = bool(_parse_json_node(
+        final_text, _skip_json_ws(final_text, 0))[0]["complete"][0])
+
+    if verify:
+        return len(record_nodes), complete
+
+    # Reconcile S/P (backfilling a lagging P) and spend the task budget.
+    advanced = publish_tile_update_plan(
+        state_path, pyramid_path, base, execution, max_tasks=limit)
+    advanced_committed, _pyramid = _decode_tile_update_commit_state(
+        advanced, plan, tasks, results, base, base_text)
+
+    if chain_states and advanced != chain_states[-1]:
+        if advanced_committed <= final_committed:
+            raise ValueError(
+                "the published state does not advance the recorded chain")
+        produced = commit_tile_update_plan(
+            base, execution, state=chain_states[-1],
+            max_tasks=advanced_committed - final_committed)
+        if produced != advanced:
+            raise ValueError(
+                "the published state does not replay from the records")
+        chain_states.append(advanced)
+    elif not chain_states and advanced != zero_state:
+        chain_states = [advanced]
+
+    records_text_new = _format_coordinate_records_document(chain_states)
+    if records_text_new != records_text:
+        _atomic_write_text(records_path, records_text_new)
+    return advanced
+
+
+def _reachable_prefix_pyramids(base, tasks, results, committed) -> set:
+    """Collect pyramid texts at every committed prefix up to ``committed``.
+
+    Mirrors the reachability check of :func:`publish_tile_update_plan`:
+    the base pyramid and each pyramid produced by replaying the first
+    ``committed`` confirmed results in order.
+    """
+    level_count = len(base)
+    reachable = {_format_tile_update_pyramid_array(base)}
+    working = base
+    for position in range(committed):
+        working = _commit_tile_update_results(
+            working, tasks, results, position, position + 1, level_count)
+        reachable.add(_format_tile_update_pyramid_array(working))
+    return reachable
+
+
+def _read_required_utf8(path: str, label: str) -> str:
+    """Read an existing file as strict UTF-8.
+
+    :raises OSError: the file is missing or cannot be read.
+    :raises ValueError: the file content is not valid UTF-8.
+    """
+    with open(path, "rb") as stream:
+        data = stream.read()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label} is not valid UTF-8") from exc
+
+
+def _read_optional_utf8(path: str):
+    """Read a file as strict UTF-8, returning ``None`` when it is missing."""
+    try:
+        with open(path, "rb") as stream:
+            data = stream.read()
+    except FileNotFoundError:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("the records or state file is not valid UTF-8") \
+            from exc
+
+
+def _decode_coordinate_records_document(text: str) -> list:
+    """Validate the canonical compact ``{"records":[[n,state],...]}`` file.
+
+    The document must be a single JSON object with exactly the key
+    ``records``, an array of two-item records whose first element is a
+    non-bool int and whose second element embeds a JSON object, with no
+    byte order mark, whitespace, trailing newline or other non-canonical
+    spelling. Each embedded state is kept as its raw source span and
+    validated by the caller through the commit-state replay.
+
+    :raises ValueError: the text is not the canonical records spelling.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(
+            f"the records file is not a valid JSON document ({exc})") \
+            from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("the records file has trailing data after the JSON "
+                         "document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != ["records"]:
+        raise ValueError("the records file must be a JSON object with "
+                         'exactly the key "records"')
+    record_nodes = top["records"][0]
+    if not isinstance(record_nodes, list):
+        raise ValueError('the "records" value must be an array')
+    spans = []
+    for record_node in record_nodes:
+        children = record_node[0]
+        if not isinstance(children, list) or len(children) != 2:
+            raise ValueError("each record must be a two-item [n, state] "
+                             "array")
+        number = children[0][0]
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise ValueError("each record number must be a non-bool int")
+        state_value, state_start, state_end = children[1]
+        if not isinstance(state_value, dict):
+            raise ValueError("each record state must be a JSON object")
+        spans.append("[" + str(number) + ","
+                     + text[state_start:state_end] + "]")
+    if text != '{"records":[' + ",".join(spans) + "]}":
+        raise ValueError("the records file is not its canonical compact "
+                         "encoding")
+    return record_nodes
+
+
+def _format_coordinate_records_document(states) -> str:
+    """Serialize record states as the compact ``{"records":[...]}`` text."""
+    parts = ['{"records":[']
+    for index, state in enumerate(states):
+        if index:
+            parts.append(",")
+        parts.append("[" + str(index) + "," + state + "]")
+    parts.append("]}")
+    return "".join(parts)
 
 
 def _commit_state_node_text(state_text: str, key: str) -> str:
