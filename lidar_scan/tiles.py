@@ -18704,14 +18704,12 @@ def _decode_generations_argument(path, generations) -> list:
     return decoded
 
 
-def _take_generation_locks(decoded, create: bool = True) -> list:
+def _take_generation_locks(decoded) -> list:
     """Take every generation's job locks non-blocking in L path order.
 
-    Returns the held lock file descriptors. On contention every lock
+    Returns the held lock file descriptors, creating a missing lock file
+    (the write-side callers are allowed to). On contention every lock
     already taken is released and :class:`BlockingIOError` propagates.
-    With ``create`` false (read-only auditing) a missing lock file is
-    skipped rather than created: it cannot be held by anyone, and the
-    audit must not write any file.
 
     :raises BlockingIOError: a lock is already held by another process.
     :raises OSError: a lock file cannot be opened.
@@ -18721,15 +18719,68 @@ def _take_generation_locks(decoded, create: bool = True) -> list:
     lock_fds = []
     try:
         for lock_path in lock_paths:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
             try:
-                if create:
-                    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-                else:
-                    fd = os.open(lock_path, os.O_RDWR)
-            except FileNotFoundError:
-                if not create:
-                    continue
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
                 raise
+            lock_fds.append(fd)
+    except BaseException:
+        _release_generation_locks(lock_fds)
+        raise
+    return lock_fds
+
+
+def _take_generation_readonly_locks(decoded) -> list:
+    """Take existing job locks non-blocking in L path order, read-only.
+
+    This is the read-side boundary of the audit/recovery snapshot. It
+    never creates a lock file and never writes anything: an existing
+    ``L`` is opened without ``O_CREAT`` and locked non-blocking, while a
+    missing ``L`` is skipped rather than created. A missing lock means
+    no writer can hold the job, which is only a sound conclusion for a
+    generation that has not started. The lock existence test and the
+    generation's start evidence are therefore one boundary decision:
+
+    * a missing ``L`` whose generation manifest already exists means the
+      generation has started without a holdable lock and raises
+      :class:`OSError`;
+    * a missing ``L`` of an unstarted generation is recorded together
+      with the boundary presence of its ``A``/``S`` files, so the
+      snapshot can tell a pre-existing orphan journal (a
+      :class:`ValueError` binding error) from a concurrent start
+      (:class:`BlockingIOError`).
+
+    :returns: the held lock file descriptors. Missing locks are recorded
+        on the owning spec dicts instead of descriptors.
+    :raises BlockingIOError: a lock is already held by another process.
+    :raises OSError: a started generation's lock file is missing, or a
+        lock file cannot be opened.
+    """
+    owners = {}
+    for generation in decoded:
+        for spec in generation["specs"]:
+            owners.setdefault(spec["paths"][0], []).append(
+                (generation, spec))
+    lock_fds = []
+    try:
+        for lock_path in sorted(owners):
+            try:
+                fd = os.open(lock_path, os.O_RDWR)
+            except FileNotFoundError:
+                for generation, spec in owners[lock_path]:
+                    spec["_readonly_lock_missing"] = True
+                    if os.path.exists(generation["manifest"]):
+                        raise OSError(
+                            f"the lock file of job {spec['id']!r} is "
+                            "missing while its generation manifest "
+                            "already exists")
+                    spec["_boundary_journal"] = os.path.exists(
+                        spec["paths"][1])
+                    spec["_boundary_state"] = os.path.exists(
+                        spec["paths"][2])
+                continue
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -19065,10 +19116,23 @@ def audit_tile_update_generations(path, generations) -> str:
 
     ``path`` and ``generations`` follow the
     :func:`coordinate_tile_update_generations` contract exactly. Every
-    job lock of every generation is taken non-blocking (``flock``) in
-    lock path order before any file is read; contention releases every
-    lock already taken and raises :class:`BlockingIOError`. Nothing is
-    ever written: missing lock files are skipped rather than created.
+    existing job lock of every generation is taken non-blocking
+    (``flock``) in lock path order before any file is read; contention
+    releases every lock already taken and raises
+    :class:`BlockingIOError`. Nothing is ever written, not even a lock
+    file: a missing ``L`` is opened never, only locked when it already
+    exists.
+
+    A missing lock file cannot be held by anyone; it is legal only for a
+    generation that has not started (its manifest does not exist) and
+    whose job owns neither a journal ``A`` nor a state file ``S``. A
+    missing ``L`` of a generation that has already started raises
+    :class:`OSError`, and a pre-existing orphan journal (``A`` with no
+    generation manifest) remains a broken-binding :class:`ValueError`.
+    While the snapshot is read, the appearance of any start evidence for
+    a job whose ``L`` was missing at the boundary — the lock itself, the
+    generation manifest, a journal or a state file — means a concurrent
+    start slipped the boundary and raises :class:`BlockingIOError`.
 
     With every lock held, each generation is checked in tuple order. A
     generation whose manifest exists must hold a canonical
@@ -19096,73 +19160,267 @@ def audit_tile_update_generations(path, generations) -> str:
         binding is invalid, a file is not valid UTF-8 or canonical
         JSON, a chain is broken or a binding is wrong.
     :raises BlockingIOError: a job lock is already held by another
-        process.
-    :raises OSError: a required file is missing, or a lock or file
-        cannot be read.
+        process, or a concurrent start appears while the snapshot is
+        read.
+    :raises OSError: a required file is missing (including a started
+        generation's missing lock file), or a lock or file cannot be
+        read.
     """
     decoded = _decode_generations_argument(path, generations)
-    lock_fds = _take_generation_locks(decoded, create=False)
+    lock_fds = _take_generation_readonly_locks(decoded)
     try:
-        return _audit_coordinate_tile_update_generations(decoded)
+        snapshot = _snapshot_tile_update_generations(decoded)
+        return _format_generations_audit(snapshot)
     finally:
         _release_generation_locks(lock_fds)
 
 
-def _audit_coordinate_tile_update_generations(decoded) -> str:
-    """The locked read-only body of :func:`audit_tile_update_generations`."""
+def plan_tile_update_generation_recovery(path, generations) -> str:
+    """Plan the recovery of a generations run from a read-only snapshot.
+
+    ``path`` and ``generations`` follow the
+    :func:`coordinate_tile_update_generations` contract exactly and the
+    read-only locking boundary is identical to
+    :func:`audit_tile_update_generations`: every existing job lock is
+    taken non-blocking in ``L`` path order, missing lock files are
+    never created, a missing ``L`` is legal only for an unstarted
+    generation whose jobs own neither ``A`` nor ``S``, a started
+    generation without its lock raises :class:`OSError`, and start
+    evidence appearing during the read raises
+    :class:`BlockingIOError`. Nothing is ever written.
+
+    The result is compact JSON with the key order
+    ``generations, next, complete``. ``generations`` is an array of
+    ``[id, started, jobs, complete]`` records in tuple order; ``jobs``
+    is an array of ``[id, confirmed, total]`` records sorted by job id,
+    with ``confirmed`` the job's committed prefix at its state file
+    ``S`` (zero for a job of a generation that has never started) and
+    ``total`` the number of tasks of the job's plan; both numbers are
+    non-bool non-negative integers. ``next`` is the ``[generation_id,
+    job_id]`` of the first incomplete generation's first job (in job id
+    order) with ``confirmed < total``; it is ``null`` when the first
+    incomplete generation only needs generation-level reconciliation
+    (every job is already at its total), and when every generation is
+    complete. ``complete`` is true only when every generation is
+    complete. The document is compact with canonically escaped strings,
+    decimal integers, lowercase booleans, non-ASCII characters
+    unescaped and no trailing newline.
+
+    :raises TypeError: an argument or member has the wrong type or
+        shape.
+    :raises ValueError: an argument value, ordering, document or
+        binding is invalid, a file is not valid UTF-8 or canonical
+        JSON, a chain is broken or a binding is wrong.
+    :raises BlockingIOError: a job lock is already held by another
+        process, or a concurrent start appears while the snapshot is
+        read.
+    :raises OSError: a required file is missing (including a started
+        generation's missing lock file), or a lock or file cannot be
+        read.
+    """
+    decoded = _decode_generations_argument(path, generations)
+    lock_fds = _take_generation_readonly_locks(decoded)
+    try:
+        snapshot = _snapshot_tile_update_generations(decoded)
+        return _format_generation_recovery_plan(snapshot)
+    finally:
+        _release_generation_locks(lock_fds)
+
+
+def _readonly_generation_manifest(generation) -> str | None:
+    """Read a generation manifest under the read-only lock boundary.
+
+    A missing manifest means the generation has not started. When any of
+    the generation's job locks was missing at the boundary the manifest
+    was necessarily absent too (a started generation with a missing lock
+    fails the boundary with :class:`OSError`); its appearance during the
+    read is a concurrent start and raises :class:`BlockingIOError`.
+    """
+    try:
+        sub_text = _read_utf8_file(generation["manifest"],
+                                   "the generation manifest file")
+    except FileNotFoundError:
+        sub_text = None
+    if sub_text is not None and any(
+            spec.get("_readonly_lock_missing")
+            for spec in generation["specs"]):
+        raise BlockingIOError(
+            f"the manifest of generation {generation['id']!r} appeared "
+            "while the read-only snapshot was taken: a concurrent start "
+            "is in progress")
+    return sub_text
+
+
+def _readonly_unstarted_job_evidence(spec) -> tuple:
+    """Return ``(journal_exists, state_exists)`` for an unstarted job.
+
+    For a job whose lock exists and is held no writer can touch the job,
+    so the presence test needs no race handling. A job whose lock was
+    missing at the boundary is unprotected: the lock itself and the
+    ``A``/``S`` files are re-tested and any evidence that appeared after
+    the boundary is a concurrent start
+    (:class:`BlockingIOError`). ``A``/``S`` evidence already present at
+    the boundary with neither a lock nor a generation manifest is left
+    for the caller to reject as a broken binding.
+    """
+    if not spec.get("_readonly_lock_missing"):
+        return (os.path.exists(spec["paths"][1]),
+                os.path.exists(spec["paths"][2]))
+    job_id = spec["id"]
+    if os.path.exists(spec["paths"][0]):
+        raise BlockingIOError(
+            f"the missing lock file of job {job_id!r} appeared while the "
+            "read-only snapshot was taken: a concurrent start is in "
+            "progress")
+    journal_exists = os.path.exists(spec["paths"][1])
+    if journal_exists and not spec["_boundary_journal"]:
+        raise BlockingIOError(
+            f"the journal of job {job_id!r} appeared while the read-only "
+            "snapshot was taken: a concurrent start is in progress")
+    state_exists = os.path.exists(spec["paths"][2])
+    if state_exists and not spec["_boundary_state"]:
+        raise BlockingIOError(
+            f"the state file of job {job_id!r} appeared while the "
+            "read-only snapshot was taken: a concurrent start is in "
+            "progress")
+    return journal_exists, state_exists
+
+
+def _snapshot_tile_update_generations(decoded) -> list:
+    """Build the shared locked read-only snapshot of every generation.
+
+    Returns generation rows in tuple order, each a dict with ``id``,
+    ``started``, ``jobs`` (an id-sorted tuple of
+    ``(id, confirmed, total)``), ``job_count``, ``committed`` and
+    ``complete``. Locking and all boundary checks happen in the callers;
+    this body only reads under the held read-only locks.
+
+    :raises ValueError: a registered generation is out of order, its
+        manifest or a job's terminal documents are malformed, broken,
+        tampered with or misbound, or an unstarted generation owns a
+        journal or an unowned state file.
+    :raises BlockingIOError: start evidence appears for a job whose lock
+        was missing at the boundary.
+    :raises OSError: a required registered file is missing or unreadable.
+    """
     rows = []
     earlier_incomplete = False
     for generation in decoded:
         gen_id = generation["id"]
         specs = generation["specs"]
-        try:
-            sub_text = _read_utf8_file(generation["manifest"],
-                                       "the generation manifest file")
-        except FileNotFoundError:
-            sub_text = None
+        sub_text = _readonly_generation_manifest(generation)
         if sub_text is None:
-            # Never started: no job journal may exist — an orphan
-            # journal with no generation manifest is a broken binding,
-            # not a merely unstarted generation.
+            # Never started. A job whose lock is held cannot change
+            # underfoot: only an orphan journal A with no generation
+            # manifest is a broken binding (a zero-step S left by a
+            # crash between the state write and the journal write is a
+            # tolerated pre-journal state). A job whose lock was missing
+            # at the boundary is unprotected: the evidence re-test both
+            # rejects a boundary-present orphan A/S as a broken binding
+            # and closes the concurrent-start window.
             for spec in specs:
-                if os.path.exists(spec["paths"][1]):
+                if spec.get("_readonly_lock_missing"):
+                    journal_exists, state_exists = \
+                        _readonly_unstarted_job_evidence(spec)
+                    if journal_exists:
+                        raise ValueError(
+                            f"generation {gen_id!r} has no manifest but job "
+                            f"{spec['id']!r} owns no lock and a journal "
+                            "already exists")
+                    if state_exists:
+                        raise ValueError(
+                            f"generation {gen_id!r} has no manifest but job "
+                            f"{spec['id']!r} owns no lock, yet a state file "
+                            "already exists")
+                elif os.path.exists(spec["paths"][1]):
                     raise ValueError(
                         f"generation {gen_id!r} has no manifest but a job "
                         "journal already exists")
-            rows.append((gen_id, False, 0, 0, False))
+            jobs = tuple((spec["id"], 0, len(spec["tasks"]))
+                         for spec in sorted(specs,
+                                            key=lambda item: item["id"]))
+            rows.append({"id": gen_id, "started": False, "jobs": jobs,
+                         "job_count": len(specs), "committed": 0,
+                         "complete": False})
             earlier_incomplete = True
             continue
         if earlier_incomplete:
             raise ValueError("a later generation is registered while an "
                              "earlier generation is not complete")
         entries = _decode_coordinate_updates_manifest(sub_text, specs)
+        jobs = []
         committed = 0
-        for spec in specs:
+        for spec in sorted(specs, key=lambda item: item["id"]):
             n, complete = _job_terminal_n_complete(spec)
             previous = entries[spec["id"]]
             if previous["n"] != n or previous["complete"] is not complete:
                 raise ValueError("the generation manifest is out of step "
                                  "with the terminal state of job "
                                  f"{spec['id']!r}")
-            committed += _job_prior_committed(spec)
+            confirmed = _job_prior_committed(spec)
+            committed += confirmed
+            jobs.append((spec["id"], confirmed, len(spec["tasks"])))
         gen_complete = all(entry["complete"] for entry in entries.values())
-        rows.append((gen_id, True, len(specs), committed, gen_complete))
+        rows.append({"id": gen_id, "started": True, "jobs": tuple(jobs),
+                     "job_count": len(specs), "committed": committed,
+                     "complete": gen_complete})
         if not gen_complete:
             earlier_incomplete = True
+    return rows
 
-    all_complete = all(row[4] for row in rows)
+
+def _format_generations_audit(rows) -> str:
+    """Serialize a read-only snapshot as the audit generations document."""
     parts = ['{"generations":[']
-    for position, (gen_id, started, jobs, committed, complete) in \
-            enumerate(rows):
+    for position, row in enumerate(rows):
         if position:
             parts.append(",")
-        parts.append("[" + _json_string(gen_id) + ",")
-        parts.append("true" if started else "false")
-        parts.append("," + str(jobs) + "," + str(committed) + ",")
-        parts.append("true" if complete else "false")
+        parts.append("[" + _json_string(row["id"]) + ",")
+        parts.append("true" if row["started"] else "false")
+        parts.append("," + str(row["job_count"] if row["started"] else 0)
+                     + "," + str(row["committed"]) + ",")
+        parts.append("true" if row["complete"] else "false")
         parts.append("]")
     parts.append('],"complete":')
-    parts.append("true}" if all_complete else "false}")
+    parts.append("true}" if all(row["complete"] for row in rows) else "false}")
+    return "".join(parts)
+
+
+def _format_generation_recovery_plan(rows) -> str:
+    """Serialize a read-only snapshot as a generation recovery plan."""
+    parts = ['{"generations":[']
+    for position, row in enumerate(rows):
+        if position:
+            parts.append(",")
+        parts.append("[" + _json_string(row["id"]) + ",")
+        parts.append("true" if row["started"] else "false")
+        parts.append(",[")
+        for job_position, (job_id, confirmed, total) in enumerate(
+                row["jobs"]):
+            if job_position:
+                parts.append(",")
+            parts.append("[" + _json_string(job_id) + ","
+                         + str(confirmed) + "," + str(total) + "]")
+        parts.append("],")
+        parts.append("true" if row["complete"] else "false")
+        parts.append("]")
+    parts.append('],"next":')
+    next_pointer = None
+    for row in rows:
+        if row["complete"]:
+            continue
+        for job_id, confirmed, total in row["jobs"]:
+            if confirmed < total:
+                next_pointer = (row["id"], job_id)
+                break
+        break
+    if next_pointer is None:
+        parts.append("null")
+    else:
+        parts.append("[" + _json_string(next_pointer[0]) + ","
+                     + _json_string(next_pointer[1]) + "]")
+    parts.append(',"complete":')
+    parts.append("true}" if all(row["complete"] for row in rows) else "false}")
     return "".join(parts)
 
 

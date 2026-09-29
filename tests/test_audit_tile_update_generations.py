@@ -266,3 +266,97 @@ def test_lock_contention_raises_without_writing(tmp_path):
         for job in jobs:
             assert not os.path.exists(job[1][1])
             assert not os.path.exists(job[1][2])
+
+
+# ---------------------------------------------------------------------------
+# read-only lock boundary
+# ---------------------------------------------------------------------------
+
+def test_missing_lock_of_started_generation_is_os_error(tmp_path):
+    generations = (_generation(tmp_path, "g1"),)
+    path = _top_path(tmp_path)
+    coordinate_tile_update_generations(path, generations)
+    for job in generations[0][2]:
+        os.unlink(job[1][0])
+    with pytest.raises(OSError):
+        audit_tile_update_generations(path, generations)
+    # The read-only audit never recreates the missing locks.
+    for job in generations[0][2]:
+        assert not os.path.exists(job[1][0])
+
+
+def test_missing_lock_of_unstarted_generation_with_no_files_is_legal(tmp_path):
+    # The seeded pyramid P is the only file on disk; the absent L of an
+    # unstarted generation with neither A nor S is a legal empty state.
+    generations = (_generation(tmp_path, "g1"),)
+    result = audit_tile_update_generations(_top_path(tmp_path), generations)
+    assert result == '{"generations":[["g1",false,0,0,false]],"complete":false}'
+
+
+def _one_job_generation(root, gen_id="g1", job_id="solo"):
+    from test_coordinate_tile_updates import _make_job
+    directory = root / gen_id
+    job = _make_job(directory, job_id)
+    return (gen_id, str(directory / "manifest.json"), (job,)), job
+
+
+def test_lock_appearing_during_read_is_concurrent_start(tmp_path,
+                                                        monkeypatch):
+    generation, job = _one_job_generation(tmp_path)
+    lock_path = job[1][0]
+    original_exists = os.path.exists
+
+    def watching_exists(candidate):
+        if candidate == lock_path and not original_exists(lock_path):
+            open(lock_path, "wb").close()
+        return original_exists(candidate)
+
+    monkeypatch.setattr(tiles_module.os.path, "exists", watching_exists)
+    with pytest.raises(BlockingIOError):
+        audit_tile_update_generations(_top_path(tmp_path), (generation,))
+
+
+def test_journal_appearing_during_read_is_concurrent_start(tmp_path,
+                                                           monkeypatch):
+    generation, job = _one_job_generation(tmp_path)
+    journal_path = job[1][1]
+    original_exists = os.path.exists
+    seen = {"journal": False}
+
+    def watching_exists(candidate):
+        if candidate == journal_path:
+            if seen["journal"]:
+                _write(journal_path, '{"records":[]}')
+            seen["journal"] = True
+        return original_exists(candidate)
+
+    monkeypatch.setattr(tiles_module.os.path, "exists", watching_exists)
+    with pytest.raises(BlockingIOError):
+        audit_tile_update_generations(_top_path(tmp_path), (generation,))
+
+
+def test_manifest_appearing_during_read_is_concurrent_start(tmp_path,
+                                                            monkeypatch):
+    generation, job = _one_job_generation(tmp_path)
+    manifest_path = generation[1]
+    original_read = tiles_module._read_utf8_file
+
+    def manifest_appears(candidate, label):
+        if candidate == manifest_path:
+            _write(manifest_path, "{}")
+        return original_read(candidate, label)
+
+    monkeypatch.setattr(tiles_module, "_read_utf8_file", manifest_appears)
+    with pytest.raises(BlockingIOError):
+        audit_tile_update_generations(_top_path(tmp_path), (generation,))
+
+
+def test_journal_present_before_boundary_is_a_binding_error(tmp_path,
+                                                            monkeypatch):
+    # An orphan journal already on disk when the boundary is taken is a
+    # broken binding (ValueError), not a concurrent start: its presence
+    # must be visible to the boundary test before any read happens.
+    generation, job = _one_job_generation(tmp_path)
+    _write(job[1][1], '{"records":[]}')
+    with pytest.raises(ValueError):
+        audit_tile_update_generations(_top_path(tmp_path), (generation,))
