@@ -17784,14 +17784,14 @@ def coordinate_tile_update(paths, base, execution, limit=None,
         negative, ``verify`` is true with a non-``None`` ``limit``, the
         base pyramid or execution is invalid, a file is not valid UTF-8
         or not its canonical compact encoding, the journal chain is
-        broken or missing on verify, ``S`` is missing while ``A``
-        exists, ``S`` exists without ``A`` outside the zero-step
+        broken, ``S`` exists without ``A`` outside the zero-step
         genesis, or ``S``/``P`` are tampered with or bound to another
         base or prefix.
     :raises BlockingIOError: another process holds the lock on ``L``.
-    :raises OSError: ``P`` is missing or a required file cannot be read,
-        the lock cannot be taken, or any file cannot be written or
-        replaced.
+    :raises OSError: ``P`` is missing, ``S`` is missing while ``A``
+        already records publications, the journal is missing on verify,
+        the lock cannot be taken, or any required file cannot be read,
+        written or replaced.
     """
     if not isinstance(paths, tuple):
         raise TypeError("paths must be a tuple")
@@ -17980,8 +17980,8 @@ def _publish_tile_update_coordination(journal_path, state_path, pyramid_path,
             journal_text, plan, tasks, results, base, base_text)
         last_n, last_state, last_committed = records[-1]
         if state_text is None:
-            raise ValueError("the state file is missing while the journal "
-                             "already records publications")
+            raise OSError("the state file is missing while the journal "
+                          "already records publications")
         state_committed, _pyramid = _decode_tile_update_commit_state(
             state_text, plan, tasks, results, base, base_text)
         before_state = last_state
@@ -18054,6 +18054,364 @@ def _commit_state_node_text(state_text: str, key: str) -> str:
     node = _parse_json_node(state_text, _skip_json_ws(state_text, 0))
     value, start, end = node[0][key]
     return state_text[start:end]
+
+
+def coordinate_tile_updates(manifest, jobs, limit=None,
+                            verify=False) -> str | tuple:
+    """Coordinate crash-safe tile updates for several independent jobs.
+
+    ``manifest`` must be a non-empty ``str`` path to the coordination
+    manifest shared by every job. ``jobs`` must be a tuple of four-item
+    tuples ``(id, paths, base, execution)`` where ``id`` is a unique
+    non-empty ``str`` and ``paths``, ``base`` and ``execution`` follow
+    the :func:`coordinate_tile_update` contract: ``paths`` is the
+    four-item tuple ``(L, A, S, P)`` and every path of every job must be
+    pairwise distinct. ``limit`` must be ``None`` or a non-bool
+    non-negative ``int``; it is the *total* task budget shared across
+    every job, consumed in ``jobs`` order. ``verify`` must be a ``bool``
+    and, when true, ``limit`` must be ``None``.
+
+    Every job's ``L`` lock is taken non-blocking (``flock``) before any
+    file is touched, in the lexicographic order of the lock paths. If a
+    lock is already held, every lock already taken is released and
+    :class:`BlockingIOError` is raised without writing a file.
+
+    With ``verify`` false the jobs are processed by id (in ascending id
+    order), each recovering and publishing exactly as
+    :func:`coordinate_tile_update` while drawing on the shared budget.
+    A missing ``manifest`` is initialized; an existing manifest is
+    decoded canonically and must bind the terminal ``A``/``S``/``P``
+    state of every job: a manifest merely lagging behind the journals is
+    caught up, while a manifest that leads a journal, records a broken
+    chain or has been tampered with is rejected. The manifest is then
+    atomically written as compact JSON with the key order
+    ``jobs, complete``; ``jobs`` is an id-sorted array of
+    ``[id, [L, A, S, P], n, complete]`` records with ``n`` the terminal
+    journal sequence number and the top-level ``complete`` true only
+    when every job is complete. The canonical manifest document is
+    returned.
+
+    With ``verify`` true nothing is written: every file must exist and
+    be consistent with the manifest, and ``(task_count, complete_count,
+    all_complete)`` is returned.
+
+    :raises TypeError: an argument has the wrong type.
+    :raises ValueError: an argument value or contract is invalid, a file
+        is not valid UTF-8 or canonical JSON, or the manifest is broken,
+        ahead of a journal or tampered with.
+    :raises BlockingIOError: a job lock is already held by another
+        process.
+    :raises OSError: a required file is missing, or a lock or file
+        cannot be read, written or replaced.
+    """
+    if not isinstance(manifest, str):
+        raise TypeError("manifest must be a str")
+    if not manifest:
+        raise ValueError("manifest must not be empty")
+    if not isinstance(jobs, tuple):
+        raise TypeError("jobs must be a tuple")
+
+    for job in jobs:
+        if not isinstance(job, tuple) or len(job) != 4:
+            raise TypeError("each job must be a four-item tuple "
+                            "(id, paths, base, execution)")
+        job_id, paths, base, execution = job
+        if not isinstance(job_id, str):
+            raise TypeError("job id must be a str")
+        if not isinstance(paths, tuple) or len(paths) != 4:
+            raise TypeError("each job paths must be a four-item tuple "
+                            "(L, A, S, P)")
+        for path in paths:
+            if not isinstance(path, str):
+                raise TypeError("each L, A, S and P path must be a str")
+        if not isinstance(base, tuple):
+            raise TypeError("each base must be a tuple")
+        if not isinstance(execution, str):
+            raise TypeError("each execution must be a str")
+
+    seen_ids = set()
+    seen_paths = set()
+    for job_id, paths, _base, _execution in jobs:
+        if not job_id:
+            raise ValueError("each job id must not be empty")
+        if job_id in seen_ids:
+            raise ValueError(f"job id {job_id!r} is repeated")
+        seen_ids.add(job_id)
+        for label, path in zip(("L", "A", "S", "P"), paths):
+            if not path:
+                raise ValueError(f"the {label} path of job {job_id!r} must "
+                                 "not be empty")
+            if path in seen_paths:
+                raise ValueError("the L, A, S and P paths of every job must "
+                                 f"be pairwise distinct ({path!r} repeats)")
+            seen_paths.add(path)
+
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be None or a non-bool int")
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+    if not isinstance(verify, bool):
+        raise TypeError("verify must be a bool")
+    if verify and limit is not None:
+        raise ValueError("limit must be None when verify is true")
+
+    # Fully validate every base and execution before the file system is
+    # touched; the zero-step states supply each base's embedded text.
+    specs = []
+    for job_id, paths, base, execution in jobs:
+        plan, tasks, results = _decode_tile_update_execution_document(
+            execution)
+        zero_state = commit_tile_update_plan(base, execution, state=None,
+                                             max_tasks=0)
+        base_text = _commit_state_node_text(zero_state, "base")
+        specs.append({"id": job_id, "paths": paths, "base": base,
+                      "execution": execution, "plan": plan, "tasks": tasks,
+                      "results": results, "base_text": base_text,
+                      "zero_state": zero_state})
+
+    # Take every job lock non-blocking in L path order; on contention
+    # release every lock already taken and fail before writing anything.
+    lock_paths = sorted({spec["paths"][0] for spec in specs})
+    lock_fds = []
+    try:
+        for lock_path in lock_paths:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                # Contention raises BlockingIOError; either way release
+                # this freshly opened descriptor (the finally block
+                # releases every lock already taken) and propagate.
+                os.close(fd)
+                raise
+            lock_fds.append(fd)
+        if verify:
+            return _verify_coordinate_tile_updates(manifest, specs)
+        return _publish_coordinate_tile_updates(manifest, specs, limit)
+    finally:
+        for fd in lock_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
+
+def _format_coordinate_updates_manifest(rows, complete) -> str:
+    """Serialize the multi-job manifest with the ``jobs, complete`` keys.
+
+    ``rows`` is an id-sorted iterable of
+    ``(id, (L, A, S, P), n, complete)``.
+    """
+    parts = ['{"jobs":[']
+    for position, (job_id, paths, n, job_complete) in enumerate(rows):
+        if position:
+            parts.append(",")
+        parts.append("[" + _json_string(job_id) + ",["
+                     + ",".join(_json_string(path) for path in paths)
+                     + "]," + str(n) + ",")
+        parts.append("true" if job_complete else "false")
+        parts.append("]")
+    parts.append('],"complete":')
+    parts.append("true}" if complete else "false}")
+    return "".join(parts)
+
+
+def _decode_coordinate_updates_manifest(text: str, specs) -> dict:
+    """Validate a canonical multi-job manifest against ``specs``.
+
+    Returns an ``id`` keyed dict of ``{"paths", "n", "complete"}``
+    entries. The manifest must be compact UTF-8 JSON with exactly the
+    top-level keys ``jobs`` and ``complete``; ``jobs`` is an array of
+    four-item ``[id, [L, A, S, P], n, complete]`` records sorted by id,
+    one per coordinated job, whose stored paths match the job's paths,
+    whose ``n`` is a non-bool non-negative integer and whose
+    ``complete`` flags are consistent with the top-level flag.
+
+    :raises ValueError: the manifest is malformed, non-canonical, binds
+        unknown or missing jobs or different paths, is unsorted, or
+        carries an inconsistent completion flag.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(
+            f"the manifest is not a valid JSON document ({exc})") from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("the manifest has trailing data after the JSON "
+                         "document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != ["jobs", "complete"]:
+        raise ValueError('the manifest must be a JSON object with exactly '
+                         'the keys "jobs" and "complete"')
+    jobs_nodes = top["jobs"][0]
+    overall = top["complete"][0]
+    if not isinstance(jobs_nodes, list):
+        raise ValueError('the manifest "jobs" value must be an array')
+    if not isinstance(overall, bool):
+        raise ValueError('the manifest "complete" value must be a bool')
+
+    spec_by_id = {spec["id"]: spec for spec in specs}
+    entries = {}
+    previous_id = None
+    for record_node in jobs_nodes:
+        items = record_node[0]
+        if not isinstance(items, list) or len(items) != 4:
+            raise ValueError("each manifest job must be a four-item "
+                             "[id, [L, A, S, P], n, complete] record")
+        job_id = items[0][0]
+        path_nodes = items[1][0]
+        n = items[2][0]
+        job_complete = items[3][0]
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("each manifest job id must be a non-empty str")
+        if previous_id is not None and job_id <= previous_id:
+            raise ValueError("the manifest jobs must be sorted by id")
+        previous_id = job_id
+        if not isinstance(path_nodes, list) or len(path_nodes) != 4:
+            raise ValueError("each manifest job must carry a four-item "
+                             "[L, A, S, P] path array")
+        paths = tuple(path_node[0] for path_node in path_nodes)
+        for path in paths:
+            if not isinstance(path, str) or not path:
+                raise ValueError("each manifest job path must be a non-empty "
+                                 "str")
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise ValueError("each manifest n must be a non-bool "
+                             "non-negative integer")
+        if not isinstance(job_complete, bool):
+            raise ValueError("each manifest complete flag must be a bool")
+        if job_id not in spec_by_id:
+            raise ValueError(f"the manifest binds an unknown job {job_id!r}")
+        if paths != spec_by_id[job_id]["paths"]:
+            raise ValueError(f"the manifest binds job {job_id!r} to "
+                             "different L, A, S and P paths")
+        entries[job_id] = {"paths": paths, "n": n,
+                           "complete": job_complete}
+
+    if set(entries) != set(spec_by_id):
+        raise ValueError("the manifest jobs must match the coordinated job "
+                         "ids one for one")
+    if overall != all(
+            entries[spec["id"]]["complete"] for spec in specs):
+        raise ValueError('the manifest "complete" flag must be true exactly '
+                         "when every job is complete")
+
+    rows = sorted(
+        ((job_id, entry["paths"], entry["n"], entry["complete"])
+         for job_id, entry in entries.items()),
+        key=lambda row: row[0])
+    if _format_coordinate_updates_manifest(rows, overall) != text:
+        raise ValueError("the manifest is not its canonical compact UTF-8 "
+                         "encoding")
+    return entries
+
+
+def _job_prior_committed(spec) -> int:
+    """Return the committed prefix at a job's state file ``S`` on entry.
+
+    This is the budget baseline: a singular publication backfills a
+    lagging pyramid and a journal trailing ``S`` for free and only draws
+    on the budget for results committed beyond the state on disk. A
+    missing ``S`` means genesis (zero committed).
+    """
+    state_path = spec["paths"][2]
+    try:
+        state_text = _read_utf8_file(state_path, "the state file")
+    except FileNotFoundError:
+        return 0
+    committed, _pyramid = _decode_tile_update_commit_state(
+        state_text, spec["plan"], spec["tasks"], spec["results"],
+        spec["base"], spec["base_text"])
+    return committed
+
+
+def _job_terminal_n_complete(spec) -> tuple:
+    """Return ``(n, complete)`` at a job's terminal journal after publish.
+
+    Re-decodes the journal and enforces byte-for-byte binding of ``S``
+    and ``P`` to its terminal state.
+    """
+    _L, journal_path, state_path, pyramid_path = spec["paths"]
+    return _verify_tile_update_coordination(
+        journal_path, state_path, pyramid_path, spec["plan"], spec["tasks"],
+        spec["results"], spec["base"], spec["base_text"])
+
+
+def _publish_coordinate_tile_updates(manifest_path: str, specs,
+                                     limit) -> str:
+    """The ``verify=False`` body of :func:`coordinate_tile_updates`."""
+    try:
+        manifest_text = _read_utf8_file(manifest_path, "the manifest file")
+    except FileNotFoundError:
+        manifest_text = None
+    existing = None
+    if manifest_text is not None:
+        existing = _decode_coordinate_updates_manifest(manifest_text, specs)
+
+    budget = limit
+    collected = {}
+    for spec in sorted(specs, key=lambda item: item["id"]):
+        job_id = spec["id"]
+        _lock_path, journal_path, _state_path, _pyramid_path = spec["paths"]
+        # A registered journal cannot vanish under an existing manifest;
+        # singular publish would otherwise silently restart genesis.
+        if existing is not None and not os.path.exists(journal_path):
+            raise OSError("the journal file is missing while the manifest "
+                          f"already registers job {job_id!r}")
+
+        before_committed = _job_prior_committed(spec)
+        # The job locks are already held by this call, so reuse the
+        # lock-free singular body rather than re-locking (a second
+        # flock on the same file would self-block in this process).
+        advanced = _publish_tile_update_coordination(
+            journal_path, spec["paths"][2], spec["paths"][3],
+            spec["execution"], spec["plan"], spec["tasks"], spec["results"],
+            spec["base"], spec["base_text"], spec["zero_state"], budget)
+        after_committed = _commit_state_committed(advanced)
+        if budget is not None:
+            budget -= after_committed - before_committed
+
+        n, complete = _job_terminal_n_complete(spec)
+        if existing is not None:
+            previous = existing[job_id]
+            if previous["n"] > n:
+                raise ValueError("the manifest leads the journal of job "
+                                 f"{job_id!r}")
+            if previous["n"] == n and previous["complete"] is not complete:
+                raise ValueError("the manifest completion flag for job "
+                                 f"{job_id!r} is tampered with")
+        collected[job_id] = (spec["paths"], n, complete)
+
+    rows = sorted(
+        ((job_id, payload[0], payload[1], payload[2])
+         for job_id, payload in collected.items()),
+        key=lambda row: row[0])
+    all_complete = all(row[3] for row in rows)
+    canonical = _format_coordinate_updates_manifest(rows, all_complete)
+    if manifest_text != canonical:
+        _atomic_write_text(manifest_path, canonical)
+    return canonical
+
+
+def _verify_coordinate_tile_updates(manifest_path: str, specs) -> tuple:
+    """The ``verify=True`` body of :func:`coordinate_tile_updates`."""
+    # The manifest and every per-job file are mandatory on verify.
+    manifest_text = _read_utf8_file(manifest_path, "the manifest file")
+    entries = _decode_coordinate_updates_manifest(manifest_text, specs)
+
+    complete_count = 0
+    for spec in specs:
+        n, complete = _job_terminal_n_complete(spec)
+        previous = entries[spec["id"]]
+        if previous["n"] != n or previous["complete"] is not complete:
+            raise ValueError("the manifest is out of step with the terminal "
+                             f"state of job {spec['id']!r}")
+        if complete:
+            complete_count += 1
+    task_count = len(specs)
+    return (task_count, complete_count, complete_count == task_count)
 
 
 def _decode_tile_pyramid_array_text(text: str) -> tuple:

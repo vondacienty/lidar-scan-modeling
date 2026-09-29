@@ -364,7 +364,7 @@ def test_state_lagging_the_journal_is_rejected(tmp_path):
         coordinate_tile_update(paths, base, execution)
 
 
-def test_missing_state_with_journal_is_value_error(tmp_path):
+def test_missing_state_with_journal_is_os_error(tmp_path):
     paths = _paths(tmp_path)
     L, A, S, P = paths
     base = _base_pyramid()
@@ -372,7 +372,7 @@ def test_missing_state_with_journal_is_value_error(tmp_path):
     _seed_base_pyramid(paths, base, execution)
     coordinate_tile_update(paths, base, execution, limit=1)
     os.unlink(S)
-    with pytest.raises(ValueError):
+    with pytest.raises(OSError):
         coordinate_tile_update(paths, base, execution)
 
 
