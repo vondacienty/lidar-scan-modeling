@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -15861,7 +15862,7 @@ def publish_migration_journal(journal_path, index_path, before, after,
     return "".join(parts)
 
 
-def _atomic_write_json(path: str, text: str) -> None:
+def _atomic_write_text(path: str, text: str) -> None:
     """Write ``text`` to ``path`` atomically as UTF-8, without a trailing LF.
 
     The bytes are written to a temporary file in the same directory as
@@ -16241,7 +16242,7 @@ def publish_updates(state, index, batches, limit=None) -> str:
             # the completed batch-less state is then written atomically.
             _decode_recovery_index(current)
             completed = _format_publish_updates_state([], current, True)
-            _atomic_write_json(state, completed)
+            _atomic_write_text(state, completed)
             return completed
         if prior_records:
             raise ValueError("batches must not be empty once the state "
@@ -16295,7 +16296,7 @@ def publish_updates(state, index, batches, limit=None) -> str:
     start_batch = 0
 
     def _persist():
-        _atomic_write_json(
+        _atomic_write_text(
             state, _format_publish_updates_state(
                 records, published_index, records[-1]["published"]))
 
@@ -16417,7 +16418,7 @@ def publish_updates(state, index, batches, limit=None) -> str:
         # Batch complete: atomically replace the index file first, then
         # write the state (carrying the next batch's trailing record when
         # more work remains).
-        _atomic_write_json(index, target["after"])
+        _atomic_write_text(index, target["after"])
         published_index = target["after"]
         if position + 1 < len(planned):
             records.append(_trailing_record(position + 1))
@@ -17726,6 +17727,326 @@ def publish_tile_update_plan(state_path, pyramid_path, base, execution,
             pyramid_path, _commit_state_node_text(advanced, "pyramid"))
         current = advanced
     return current
+
+
+def coordinate_tile_update(paths, base, execution, limit=None,
+                           verify=False) -> str | tuple:
+    """Coordinate crash-safe :func:`publish_tile_update_plan` publications.
+
+    ``paths`` must be a four-item tuple ``(L, A, S, P)`` of pairwise
+    distinct, non-empty ``str`` paths: ``L`` is the coordination lock
+    file, ``A`` the append-only coordination journal, and ``S`` and
+    ``P`` are exactly the state and pyramid paths of
+    :func:`publish_tile_update_plan`. ``base`` and ``execution`` follow
+    that function's contract (only a non-tuple ``base`` is a
+    :class:`TypeError`; every structural problem inside it is a
+    :class:`ValueError`). ``limit`` must be ``None`` or a non-bool
+    non-negative ``int`` and ``verify`` a ``bool``.
+
+    A non-blocking exclusive cross-process lock (``flock``) is held on
+    ``L`` for the whole call; ``L`` is created empty if it does not yet
+    exist. If another process already holds the lock,
+    :class:`BlockingIOError` is raised.
+
+    When ``A`` exists it must be UTF-8 compact JSON with no byte order
+    mark, whitespace or trailing newline and exactly the top-level key
+    ``records``; its value is ``[[n, state], ...]`` with ``n`` a
+    non-bool non-negative integer starting at zero and strictly
+    increasing, and each ``state`` an embedded canonical
+    :func:`commit_tile_update_plan` document for ``base`` and
+    ``execution`` whose committed prefix strictly extends the previous
+    record's. Every state replays from the base and the execution's
+    confirmed prefix, the journal's terminal state is byte-for-byte the
+    file at ``S``, and ``P`` is byte-for-byte that state's embedded
+    pyramid.
+
+    With ``verify`` false, a missing ``A`` only permits a missing ``S``
+    or the canonical zero-step state at ``S``. ``S`` and ``P`` are
+    revalidated; if ``A`` merely lags behind ``S`` after a crash, the
+    replayable ``S`` is the sole record backfilled into the journal
+    (an ``S`` behind the journal or bound to another prefix is rejected).
+    :func:`publish_tile_update_plan` is then called with ``limit`` as
+    its task budget, the journal is atomically updated with every newly
+    published state and the resulting state document at ``S`` is
+    returned.
+
+    With ``verify`` true, ``limit`` must be ``None``; none of ``A``,
+    ``S`` or ``P`` is modified, the whole journal chain is replayed and
+    checked against ``S`` and ``P``, and ``(n, complete)`` is returned
+    with ``n`` the terminal record's sequence number and ``complete``
+    the terminal state's completion flag.
+
+    :raises TypeError: ``paths`` is not a tuple or not a four-item tuple,
+        a path is not a ``str``, ``base`` is not a ``tuple``,
+        ``execution`` is not a ``str``, ``limit`` is neither ``None`` nor
+        a non-bool ``int``, or ``verify`` is not a ``bool``.
+    :raises ValueError: a path is empty or repeated, ``limit`` is
+        negative, ``verify`` is true with a non-``None`` ``limit``, the
+        base pyramid or execution is invalid, a file is not valid UTF-8
+        or not its canonical compact encoding, the journal chain is
+        broken or missing on verify, ``S`` is missing while ``A``
+        exists, ``S`` exists without ``A`` outside the zero-step
+        genesis, or ``S``/``P`` are tampered with or bound to another
+        base or prefix.
+    :raises BlockingIOError: another process holds the lock on ``L``.
+    :raises OSError: ``P`` is missing or a required file cannot be read,
+        the lock cannot be taken, or any file cannot be written or
+        replaced.
+    """
+    if not isinstance(paths, tuple):
+        raise TypeError("paths must be a tuple")
+    if len(paths) != 4:
+        raise TypeError("paths must be a four-item tuple (L, A, S, P)")
+    lock_path, journal_path, state_path, pyramid_path = paths
+    for label, path in (("L", lock_path), ("A", journal_path),
+                        ("S", state_path), ("P", pyramid_path)):
+        if not isinstance(path, str):
+            raise TypeError(f"{label} path must be a str")
+        if not path:
+            raise ValueError(f"{label} path must not be empty")
+    if len({lock_path, journal_path, state_path, pyramid_path}) != 4:
+        raise ValueError("the L, A, S and P paths must be pairwise distinct")
+    if not isinstance(base, tuple):
+        raise TypeError("base must be a tuple")
+    if not isinstance(execution, str):
+        raise TypeError("execution must be a str")
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be None or a non-bool int")
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+    if not isinstance(verify, bool):
+        raise TypeError("verify must be a bool")
+    if verify and limit is not None:
+        raise ValueError("limit must be None when verify is true")
+
+    # Validate base and execution in full before the file system is
+    # touched; the zero-step state supplies the embedded base text every
+    # journal state is compared against.
+    plan, tasks, results = _decode_tile_update_execution_document(execution)
+    zero_state = commit_tile_update_plan(base, execution, state=None,
+                                         max_tasks=0)
+    base_text = _commit_state_node_text(zero_state, "base")
+
+    # A non-blocking exclusive flock serializes coordinators across
+    # processes; the lock file itself never carries payload.
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if verify:
+                return _verify_tile_update_coordination(
+                    journal_path, state_path, pyramid_path, plan, tasks,
+                    results, base, base_text)
+            return _publish_tile_update_coordination(
+                journal_path, state_path, pyramid_path, execution, plan,
+                tasks, results, base, base_text, zero_state, limit)
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(lock_fd)
+
+
+def _read_utf8_file(path: str, label: str) -> str:
+    """Read ``path`` and decode strict UTF-8, turning encoding errors into
+    :class:`ValueError` while a missing or unreadable file stays an
+    :class:`OSError`.
+    """
+    with open(path, "rb") as stream:
+        data = stream.read()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label} is not valid UTF-8") from exc
+
+
+def _format_coordinate_journal(records) -> str:
+    """Serialize coordination records as the compact journal document."""
+    parts = ['{"records":[']
+    for index, (n, state_text) in enumerate(records):
+        if index:
+            parts.append(",")
+        parts.append("[" + str(n) + "," + state_text + "]")
+    parts.append("]}")
+    return "".join(parts)
+
+
+def _decode_coordinate_journal(text: str, plan: str, tasks, results, base,
+                               base_text: str) -> list:
+    """Validate a canonical coordination journal document.
+
+    The document must be compact JSON with exactly the top-level key
+    ``records``; each record is a two-item ``[n, state]`` array whose
+    ``n`` starts at zero and strictly increases and whose embedded
+    ``state`` is a canonical :func:`commit_tile_update_plan` document
+    for ``base`` and ``execution`` advancing the committed prefix.
+
+    Returns a list of ``(n, state_text, committed)`` records.
+
+    :raises ValueError: the journal is malformed, not its canonical
+        compact spelling, empty, or carries a bad sequence or state.
+    """
+    try:
+        node = _parse_json_node(text, _skip_json_ws(text, 0))
+    except ValueError as exc:
+        raise ValueError(
+            f"the journal is not a valid JSON document ({exc})") from exc
+    if _skip_json_ws(text, node[2]) != len(text):
+        raise ValueError("the journal has trailing data after the JSON "
+                         "document")
+    top = node[0]
+    if not isinstance(top, dict) or list(top) != ["records"]:
+        raise ValueError('the journal must be a JSON object with exactly '
+                         'the key "records"')
+    record_nodes = top["records"][0]
+    if not isinstance(record_nodes, list):
+        raise ValueError('the journal "records" value must be an array')
+
+    records = []
+    previous_n = None
+    previous_committed = None
+    for record_node in record_nodes:
+        items = record_node[0]
+        if not isinstance(items, list) or len(items) != 2:
+            raise ValueError("each journal record must be a two-item "
+                             "[n, state] array")
+        n = items[0][0]
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise ValueError("each journal n must be a non-bool "
+                             "non-negative integer")
+        if previous_n is None:
+            if n != 0:
+                raise ValueError("the journal n values must start at zero")
+        elif n <= previous_n:
+            raise ValueError("the journal n values must be strictly "
+                             "increasing")
+        previous_n = n
+        state_node = items[1]
+        if not isinstance(state_node[0], dict):
+            raise ValueError("each journal state must embed a commit state "
+                             "object")
+        state_text = text[state_node[1]:state_node[2]]
+        committed, _pyramid = _decode_tile_update_commit_state(
+            state_text, plan, tasks, results, base, base_text)
+        if previous_committed is not None \
+                and committed <= previous_committed:
+            raise ValueError("each journal state must advance the "
+                             "committed prefix of the previous one")
+        previous_committed = committed
+        records.append((n, state_text, committed))
+
+    if not records:
+        raise ValueError('the journal "records" array must not be empty')
+    canonical = _format_coordinate_journal(
+        [(n, state_text) for n, state_text, _committed in records])
+    if canonical != text:
+        raise ValueError("the journal is not its canonical compact UTF-8 "
+                         "encoding")
+    return records
+
+
+def _publish_tile_update_coordination(journal_path, state_path, pyramid_path,
+                                      execution, plan, tasks, results, base,
+                                      base_text, zero_state, limit) -> str:
+    """The ``verify=False`` body of :func:`coordinate_tile_update`."""
+    try:
+        journal_text = _read_utf8_file(journal_path, "the journal file")
+    except FileNotFoundError:
+        journal_text = None
+    try:
+        state_text = _read_utf8_file(state_path, "the state file")
+    except FileNotFoundError:
+        state_text = None
+
+    if journal_text is None:
+        # Genesis: the journal has never registered a publication, so S
+        # may only be absent or the canonical zero-step state. The
+        # zero-step state is record n=0, registered before any result is
+        # committed, mirroring publish_tile_update_plan.
+        records = [(0, zero_state, 0)]
+        journal_dirty = True
+        if state_text is not None:
+            committed, _pyramid = _decode_tile_update_commit_state(
+                state_text, plan, tasks, results, base, base_text)
+            if committed != 0:
+                raise ValueError("without a journal the state file may only "
+                                 "be missing or hold the zero-step state")
+        before_state = zero_state
+    else:
+        records = _decode_coordinate_journal(
+            journal_text, plan, tasks, results, base, base_text)
+        last_n, last_state, last_committed = records[-1]
+        if state_text is None:
+            raise ValueError("the state file is missing while the journal "
+                             "already records publications")
+        state_committed, _pyramid = _decode_tile_update_commit_state(
+            state_text, plan, tasks, results, base, base_text)
+        before_state = last_state
+        if state_text != last_state:
+            # The only tolerated divergence is S leading A after a crash
+            # between the publication and the journal replacement; the
+            # replayable S is the sole record backfilled (intermediate
+            # states are never invented).
+            if state_committed <= last_committed:
+                raise ValueError("the state file has diverged from the "
+                                 "journal: it may only lead it after a "
+                                 "crash, never lag or bind another prefix")
+            records.append((last_n + 1, state_text, state_committed))
+            before_state = state_text
+            journal_dirty = True
+        else:
+            journal_dirty = False
+
+    # publish_tile_update_plan revalidates S and P, backfills a lagging P
+    # without spending the budget, persists S then P atomically and
+    # returns the state document now byte-for-byte at S.
+    advanced = publish_tile_update_plan(
+        state_path, pyramid_path, base, execution, max_tasks=limit)
+
+    if advanced != before_state:
+        records.append((records[-1][0] + 1, advanced,
+                        _commit_state_committed(advanced)))
+        journal_dirty = True
+
+    if journal_dirty:
+        _atomic_write_text(
+            journal_path,
+            _format_coordinate_journal(
+                [(n, text) for n, text, _committed in records]))
+    return advanced
+
+
+def _commit_state_committed(state_text: str) -> int:
+    """Read the ``committed`` count of a canonical commit state text."""
+    node = _parse_json_node(state_text, _skip_json_ws(state_text, 0))
+    return node[0]["committed"][0]
+
+
+def _verify_tile_update_coordination(journal_path, state_path, pyramid_path,
+                                     plan, tasks, results, base,
+                                     base_text) -> tuple:
+    """The ``verify=True`` body of :func:`coordinate_tile_update`."""
+    # A, S and P are all mandatory for verification; their absence is an
+    # OSError, exactly as for any other unreadable required file.
+    journal_text = _read_utf8_file(journal_path, "the journal file")
+    state_text = _read_utf8_file(state_path, "the state file")
+    pyramid_text = _read_utf8_file(pyramid_path, "the pyramid file")
+    _decode_tile_pyramid_array_text(pyramid_text)
+    records = _decode_coordinate_journal(
+        journal_text, plan, tasks, results, base, base_text)
+    last_n, last_state, _committed = records[-1]
+    if last_state != state_text:
+        raise ValueError("the state file must be byte-for-byte equal to the "
+                         "journal's terminal state")
+    if _commit_state_node_text(last_state, "pyramid") != pyramid_text:
+        raise ValueError("the pyramid file must be byte-for-byte equal to "
+                         "the terminal state's pyramid")
+    node = _parse_json_node(last_state, _skip_json_ws(last_state, 0))
+    complete = node[0]["complete"][0]
+    return (last_n, complete)
 
 
 def _commit_state_node_text(state_text: str, key: str) -> str:
