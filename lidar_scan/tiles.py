@@ -19227,6 +19227,84 @@ def plan_tile_update_generation_recovery(path, generations) -> str:
         _release_generation_locks(lock_fds)
 
 
+def resume_tile_update_generations(path, generations, plan,
+                                   limit=None) -> str:
+    """Resume a generations run validated against its recovery plan.
+
+    ``path`` and ``generations`` follow the
+    :func:`coordinate_tile_update_generations` contract exactly.
+    ``plan`` must be a ``str`` byte-for-byte equal to the current
+    :func:`plan_tile_update_generation_recovery` result for the same
+    ``path`` and ``generations``; a stale, reordered, respaced or
+    otherwise non-current text is rejected. ``limit`` must be ``None``
+    or a non-bool non-negative ``int`` and is the *total* task budget
+    shared across every job of every generation.
+
+    Every job lock of every generation is taken non-blocking (``flock``)
+    in lock path order before any file is touched; contention releases
+    every lock already taken and raises :class:`BlockingIOError` without
+    writing. With every lock held the recovery plan is recomputed from
+    the on-disk state and must equal ``plan`` byte for byte. The run is
+    then resumed exactly as :func:`coordinate_tile_update_generations`
+    with the same ``limit``: starting at the first incomplete generation
+    and the job the plan's ``next`` pointer names, generations are
+    processed in tuple order, jobs in ascending id order and tasks in
+    plan order, all drawing on the one shared budget, and a later
+    generation never starts while an earlier generation is incomplete.
+    Before any write the generations manifest, every generation manifest
+    and every job's terminal ``A``/``S``/``P`` state are prevalidated
+    exactly as in :func:`coordinate_tile_update_generations`: an
+    ahead-of-journal document, a broken chain, tampering or a wrong
+    binding raises :class:`ValueError` before any file is written. A
+    ``limit`` of zero confirms no further task but still backfills every
+    recoverable lagging manifest. When the plan already reports
+    ``complete`` nothing is written at all.
+
+    Returns the canonical :func:`plan_tile_update_generation_recovery`
+    document recomputed after the resume; a re-entry that makes no
+    progress and a re-entered completed run both return ``plan`` byte
+    for byte.
+
+    :raises TypeError: an argument has the wrong type or shape.
+    :raises ValueError: an argument value, ordering, document or binding
+        is invalid, ``plan`` is not the current canonical recovery plan,
+        or a document is ahead, broken, tampered with or misbound.
+    :raises BlockingIOError: a job lock is already held by another
+        process.
+    :raises OSError: a required file is missing, or a lock or file
+        cannot be read, written or replaced.
+    """
+    decoded = _decode_generations_argument(path, generations)
+    if not isinstance(plan, str):
+        raise TypeError("plan must be a str")
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be None or a non-bool int")
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+
+    # Take every job lock of every generation non-blocking in L path
+    # order; on contention release every lock already taken.
+    lock_fds = _take_generation_locks(decoded)
+    try:
+        # Recompute the current recovery plan under the held locks; the
+        # plan argument must match it byte for byte.
+        snapshot = _snapshot_tile_update_generations(decoded)
+        current = _format_generation_recovery_plan(snapshot)
+        if plan != current:
+            raise ValueError("plan must byte-for-byte equal the current "
+                             "plan_tile_update_generation_recovery result")
+        if all(row["complete"] for row in snapshot):
+            # A completed plan is re-entered byte for byte and writes
+            # nothing at all.
+            return current
+        _publish_coordinate_tile_update_generations(path, decoded, limit)
+        snapshot = _snapshot_tile_update_generations(decoded)
+        return _format_generation_recovery_plan(snapshot)
+    finally:
+        _release_generation_locks(lock_fds)
+
+
 def _readonly_generation_manifest(generation) -> str | None:
     """Read a generation manifest under the read-only lock boundary.
 
