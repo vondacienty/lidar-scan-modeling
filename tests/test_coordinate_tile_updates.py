@@ -170,6 +170,13 @@ def test_paths_must_be_pairwise_distinct_across_jobs(tmp_path):
         coordinate_tile_updates(_manifest_path(tmp_path), (a, shared_lock))
 
 
+def test_manifest_path_must_differ_from_every_job_path(tmp_path):
+    job = _make_job(tmp_path, "a")
+    for position in range(4):
+        with pytest.raises(ValueError):
+            coordinate_tile_updates(job[1][position], (job,))
+
+
 def test_base_and_execution_types(tmp_path):
     job = _make_job(tmp_path, "a")
     with pytest.raises(TypeError):
@@ -367,6 +374,25 @@ def test_manifest_with_tampered_complete_flag_is_rejected(tmp_path):
     _write(manifest, forged)
     with pytest.raises(ValueError):
         coordinate_tile_updates(manifest, jobs)
+
+
+def test_preflight_failure_writes_nothing(tmp_path):
+    # beta's journal is corrupted while alpha could still spend the
+    # budget; the preflight under both locks must abort before alpha or
+    # the manifest is touched.
+    jobs = (_make_job(tmp_path, "alpha", _PLAN_THREE),
+            _make_job(tmp_path, "beta", _PLAN_TWO))
+    manifest = _manifest_path(tmp_path)
+    coordinate_tile_updates(manifest, jobs, limit=1)
+    forged_journal = '{"records":[[5,' + \
+        commit_tile_update_plan(jobs[1][2], jobs[1][3], max_tasks=0) + ']]}'
+    _write(jobs[1][1][1], forged_journal)
+    snapshot = {path: _read(path)
+                for path in [manifest] + [p for job in jobs for p in job[1]]}
+    with pytest.raises(ValueError):
+        coordinate_tile_updates(manifest, jobs, limit=5)
+    for path, data in snapshot.items():
+        assert _read(path) == data
 
 
 # ---------------------------------------------------------------------------
